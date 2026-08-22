@@ -27,6 +27,7 @@ const builtin_plugin = hot.PluginDescriptor{
     .generation = 0,
     .systems = &systems,
     .system_count = systems.len,
+    .draw = null,
 };
 
 pub fn descriptor() *const hot.PluginDescriptor {

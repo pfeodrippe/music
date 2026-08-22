@@ -9,6 +9,7 @@ typedef struct ScoreDrawItem {
     float rect[4];
     float color[4];
     float params[4];
+    float uv[4];
 } ScoreDrawItem;
 
 typedef struct ScorePlaybackEvent {
@@ -39,6 +40,9 @@ void score_ios_microphone_pitch(uint8_t pitch, float confidence);
 uint32_t score_ios_detect_pitch(const float *samples, size_t frame_count, float sample_rate, float *confidence);
 const ScoreDrawItem *score_ios_draw_items(void);
 uint32_t score_ios_draw_count(void);
+const uint8_t *score_ios_glyph_atlas_bytes(void);
+uint32_t score_ios_glyph_atlas_width(void);
+uint32_t score_ios_glyph_atlas_height(void);
 const ScoreAccessibilityItem *score_ios_accessibility_items(void);
 uint32_t score_ios_accessibility_count(void);
 void score_ios_accessibility_activate(uint32_t id);
@@ -47,6 +51,7 @@ void score_ios_set_host_status(uint32_t status);
 size_t score_ios_drain_playback(ScorePlaybackEvent *events, size_t capacity);
 uint32_t score_ios_import(const uint8_t *bytes, size_t length, uint32_t kind);
 size_t score_ios_serialize(uint8_t *bytes, size_t capacity);
+size_t score_ios_export_musicxml(uint8_t *bytes, size_t capacity);
 uint32_t score_ios_restore(const uint8_t *bytes, size_t length);
 
 #endif

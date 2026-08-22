@@ -32,6 +32,8 @@ final class ScoreMetalView: UIView {
     private let metalDevice: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    private let glyphTexture: MTLTexture
+    private let glyphSampler: MTLSamplerState
     private var itemBuffer: MTLBuffer
     private var displayLink: CADisplayLink?
     private var previousTimestamp: CFTimeInterval = 0
@@ -42,7 +44,7 @@ final class ScoreMetalView: UIView {
     private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
     override init(frame: CGRect) {
-        guard score_ios_api_version() == 1 else { fatalError("Unsupported Score core ABI") }
+        guard score_ios_api_version() == 2 else { fatalError("Unsupported Score core ABI") }
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             fatalError("Metal is unavailable on this device")
         }
@@ -61,13 +63,28 @@ final class ScoreMetalView: UIView {
         descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
         descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let atlasWidth = Int(score_ios_glyph_atlas_width())
+        let atlasHeight = Int(score_ios_glyph_atlas_height())
+        let atlasDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: atlasWidth, height: atlasHeight, mipmapped: false)
+        atlasDescriptor.usage = .shaderRead
+        let samplerDescriptor = MTLSamplerDescriptor()
+        samplerDescriptor.minFilter = .linear
+        samplerDescriptor.magFilter = .linear
+        samplerDescriptor.sAddressMode = .clampToEdge
+        samplerDescriptor.tAddressMode = .clampToEdge
         guard let pipelineState = try? device.makeRenderPipelineState(descriptor: descriptor),
-              let buffer = device.makeBuffer(length: itemCapacity * MemoryLayout<ScoreDrawItem>.stride, options: .storageModeShared) else {
+              let buffer = device.makeBuffer(length: itemCapacity * MemoryLayout<ScoreDrawItem>.stride, options: .storageModeShared),
+              let atlas = device.makeTexture(descriptor: atlasDescriptor),
+              let sampler = device.makeSamplerState(descriptor: samplerDescriptor),
+              let atlasBytes = score_ios_glyph_atlas_bytes() else {
             fatalError("Score Metal pipeline could not be created")
         }
+        atlas.replace(region: MTLRegionMake2D(0, 0, atlasWidth, atlasHeight), mipmapLevel: 0, withBytes: atlasBytes, bytesPerRow: atlasWidth * 4)
         metalDevice = device
         commandQueue = queue
         pipeline = pipelineState
+        glyphTexture = atlas
+        glyphSampler = sampler
         itemBuffer = buffer
         super.init(frame: frame)
 
@@ -136,6 +153,8 @@ final class ScoreMetalView: UIView {
         encoder.setRenderPipelineState(pipeline)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<ScoreGPUUniforms>.stride, index: 0)
         encoder.setVertexBuffer(itemBuffer, offset: 0, index: 1)
+        encoder.setFragmentTexture(glyphTexture, index: 0)
+        encoder.setFragmentSamplerState(glyphSampler, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: count)
         encoder.endEncoding()
         commandBuffer.present(drawable)

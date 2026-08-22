@@ -112,8 +112,8 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     }
 
     private func presentExporter() {
-        guard let data = serialize() else { score_ios_set_host_status(3); return }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("score-document.score")
+        guard let data = exportMusicXML() else { score_ios_set_host_status(3); return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("score.musicxml")
         do {
             try data.write(to: url, options: .atomic)
             let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
@@ -152,6 +152,17 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         }
         guard length > 0 else { return nil }
         return Data(serializationBuffer.prefix(length))
+    }
+
+    private func exportMusicXML() -> Data? {
+        var data = Data(count: 4 * 1024 * 1024)
+        let length = data.withUnsafeMutableBytes { raw -> Int in
+            guard let pointer = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return score_ios_export_musicxml(pointer, raw.count)
+        }
+        guard length > 0 else { return nil }
+        data.removeSubrange(length..<data.count)
+        return data
     }
 
     private func saveAutosave() {

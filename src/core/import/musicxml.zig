@@ -2,10 +2,13 @@ const std = @import("std");
 const model = @import("../model.zig");
 
 pub const max_import_notes = 4096;
+pub const max_import_lyrics = 1024;
 
 pub const ImportReport = struct {
     notes: [max_import_notes]model.Note = undefined,
     note_count: usize = 0,
+    lyrics: [max_import_lyrics]model.Lyric = undefined,
+    lyric_count: usize = 0,
     divisions: u32 = 1,
     tempo_bpm: f32 = 72,
     title: [96]u8 = [_]u8{0} ** 96,
@@ -55,7 +58,7 @@ pub fn parse(source: []const u8) Error!ImportReport {
     while (findOpenTag(source, part_cursor, "part")) |part_start| {
         const part_open_end = std.mem.indexOfPos(u8, source, part_start, ">") orelse return error.InvalidMusicXml;
         const part_end = std.mem.indexOfPos(u8, source, part_open_end, "</part>") orelse return error.InvalidMusicXml;
-        try parsePart(source[part_open_end + 1 .. part_end], &report, part_index, &stable_id);
+        try parsePart(source[part_open_end + 1 .. part_end], &report, part_index, partIsVocalGuide(source, part_index), &stable_id);
         part_cursor = part_end + "</part>".len;
         part_index += 1;
     }
@@ -68,19 +71,31 @@ pub fn parse(source: []const u8) Error!ImportReport {
     return report;
 }
 
-fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, stable_id: *u64) Error!void {
+fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_guide: bool, stable_id: *u64) Error!void {
     var measure_cursor: usize = 0;
     var measure_start: f32 = 0;
+    var beats: u32 = report.beats_per_measure;
+    var beat_unit: u32 = report.beat_unit;
     while (findOpenTag(source, measure_cursor, "measure")) |measure_open| {
         const open_end = std.mem.indexOfPos(u8, source, measure_open, ">") orelse return error.InvalidMusicXml;
         const measure_end = std.mem.indexOfPos(u8, source, open_end, "</measure>") orelse return error.InvalidMusicXml;
-        const extent = try parseMeasure(source[open_end + 1 .. measure_end], report, measure_start, part_index, stable_id);
-        measure_start += @max(extent, 0.0625);
+        const opening = source[measure_open .. open_end + 1];
+        const body = source[open_end + 1 .. measure_end];
+        if (tagContent(body, "beats")) |value| beats = @max(1, try parseUnsigned(value));
+        if (tagContent(body, "beat-type")) |value| beat_unit = @max(1, try parseUnsigned(value));
+        const extent = try parseMeasure(body, report, measure_start, part_index, vocal_guide, stable_id);
+        // A regular MusicXML measure occupies its declared metrical duration.
+        // Advancing by recognized note extent makes one missing OMR rest shift
+        // every later bar and desynchronize parts. Explicit implicit measures
+        // (normally pickups) intentionally occupy only their encoded extent.
+        const nominal_beats = @as(f32, @floatFromInt(beats * 4)) / @as(f32, @floatFromInt(beat_unit));
+        const implicit = std.mem.indexOf(u8, opening, "implicit=\"yes\"") != null;
+        measure_start += if (implicit) @max(extent, 0.0625) else @max(nominal_beats, 0.0625);
         measure_cursor = measure_end + "</measure>".len;
     }
 }
 
-fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, part_index: u32, stable_id: *u64) Error!f32 {
+fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, part_index: u32, vocal_guide: bool, stable_id: *u64) Error!f32 {
     var divisions = report.divisions;
     if (tagContent(source, "divisions")) |value| {
         divisions = @max(1, try parseUnsigned(value));
@@ -91,6 +106,8 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
             return @as(f32, @floatFromInt(units)) / @as(f32, @floatFromInt(divisor));
         }
     }.convert;
+
+    try parseDirectionLyrics(source, report, measure_start, divisions);
 
     var cursor: usize = 0;
     var local_beat: f32 = 0;
@@ -162,17 +179,72 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                     .velocity = 88,
                     .staff = @intCast(@min(part_index * 8 + staff_value -| 1, 255)),
                     .voice = @intCast(@min(voice_value -| 1, 255)),
+                    .flags = if (vocal_guide or findOpenTag(block, 0, "cue") != null) model.note_flag_vocal_guide else 0,
                 };
                 report.note_count += 1;
                 stable_id.* += 1;
                 if (grace) report.approximations += 1;
             }
+            if (tagContent(block, "text")) |text| try appendLyric(report, measure_start + start_beat, text);
         }
         previous_start = start_beat;
         extent = @max(extent, start_beat + duration);
         if (!chord and !grace) local_beat += duration;
     }
     return @max(extent, local_beat);
+}
+
+fn partIsVocalGuide(source: []const u8, wanted_index: u32) bool {
+    var cursor: usize = 0;
+    var index: u32 = 0;
+    while (findOpenTag(source, cursor, "score-part")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, "</score-part>") orelse return false;
+        if (index == wanted_index) {
+            const name = tagContent(source[start..end], "part-name") orelse return false;
+            return containsAsciiInsensitive(name, "voice") or containsAsciiInsensitive(name, "vocal") or containsAsciiInsensitive(name, "singer");
+        }
+        index += 1;
+        cursor = end + "</score-part>".len;
+    }
+    return false;
+}
+
+fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    for (0..haystack.len - needle.len + 1) |start| {
+        var equal = true;
+        for (needle, 0..) |byte, offset| {
+            if (std.ascii.toLower(haystack[start + offset]) != std.ascii.toLower(byte)) {
+                equal = false;
+                break;
+            }
+        }
+        if (equal) return true;
+    }
+    return false;
+}
+
+fn parseDirectionLyrics(source: []const u8, report: *ImportReport, measure_start: f32, divisions: u32) Error!void {
+    var cursor: usize = 0;
+    while (findOpenTag(source, cursor, "direction")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, "</direction>") orelse return error.InvalidMusicXml;
+        const block = source[start..end];
+        if (tagContent(block, "words")) |words| {
+            const offset_units = if (tagContent(block, "offset")) |value| try parseSigned(value) else 0;
+            const offset_beats = @as(f32, @floatFromInt(offset_units)) / @as(f32, @floatFromInt(divisions));
+            try appendLyric(report, @max(0, measure_start + offset_beats), words);
+        }
+        cursor = end + "</direction>".len;
+    }
+}
+
+fn appendLyric(report: *ImportReport, start_beat: f32, source: []const u8) Error!void {
+    if (source.len == 0) return;
+    if (report.lyric_count == report.lyrics.len) return error.TooManyNotes;
+    var lyric: model.Lyric = .{ .start_beat = start_beat };
+    lyric.setText(source);
+    report.lyrics[report.lyric_count] = lyric;
+    report.lyric_count += 1;
 }
 
 fn smallestPosition(a: ?usize, b: ?usize, c: ?usize) ?usize {
@@ -273,6 +345,29 @@ test "imports a generated MusicXML melody with chords and rests" {
     try std.testing.expectEqualStrings("Generated Study", report.titleSlice());
 }
 
+test "imports timed lyrics and marks named vocal parts as guides" {
+    const fixture =
+        \\<?xml version="1.0"?>
+        \\<score-partwise version="4.0">
+        \\<part-list>
+        \\<score-part id="P1"><part-name>Piano</part-name></score-part>
+        \\<score-part id="P2"><part-name>Vocal guide</part-name></score-part>
+        \\</part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<direction><direction-type><words>Some way</words></direction-type><offset>2</offset></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration></note></measure></part>
+        \\<part id="P2"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration><lyric><text>baby</text></lyric></note></measure></part>
+        \\</score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 2), report.note_count);
+    try std.testing.expectEqual(@as(usize, 2), report.lyric_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), report.lyrics[0].start_beat, 0.001);
+    try std.testing.expectEqualStrings("Some way", report.lyrics[0].textSlice());
+    try std.testing.expect((report.notes[1].flags & model.note_flag_vocal_guide) != 0);
+}
+
 test "MusicXML backup voices and multiple parts share musical time" {
     const fixture =
         \\<score-partwise version="4.0"><part-list>
@@ -295,4 +390,39 @@ test "MusicXML backup voices and multiple parts share musical time" {
     var found_second_part = false;
     for (report.notes[0..report.note_count]) |note| found_second_part = found_second_part or note.staff >= 8;
     try std.testing.expect(found_second_part);
+}
+
+test "declared meter keeps later measures aligned when a measure is underfilled" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list>
+        \\<score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1">
+        \\<measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note></measure>
+        \\<measure number="2"><attributes><time><beats>2</beats><beat-type>4</beat-type></time></attributes>
+        \\<note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration></note></measure>
+        \\<measure number="3"><note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration></note></measure>
+        \\</part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 3), report.note_count);
+    try std.testing.expectEqual(@as(f32, 0), report.notes[0].start_beat);
+    try std.testing.expectEqual(@as(f32, 4), report.notes[1].start_beat);
+    try std.testing.expectEqual(@as(f32, 6), report.notes[2].start_beat);
+}
+
+test "implicit pickup advances by encoded extent" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list>
+        \\<score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1">
+        \\<measure number="0" implicit="yes"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<note><pitch><step>G</step><octave>4</octave></pitch><duration>1</duration></note></measure>
+        \\<measure number="1"><note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note></measure>
+        \\</part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 2), report.note_count);
+    try std.testing.expectEqual(@as(f32, 0), report.notes[0].start_beat);
+    try std.testing.expectEqual(@as(f32, 1), report.notes[1].start_beat);
 }

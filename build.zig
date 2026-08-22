@@ -39,6 +39,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(diagnostic);
 
+    const audio_analyzer = b.addExecutable(.{
+        .name = "score-audio-analyze",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/analyze_audio.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "score", .module = score }},
+        }),
+    });
+    b.installArtifact(audio_analyzer);
+    const audio_analyzer_run = b.addRunArtifact(audio_analyzer);
+    if (b.args) |args| audio_analyzer_run.addArgs(args);
+    const audio_analyzer_step = b.step("audio-analyze", "Analyze a local WAV and optionally compare it with MusicXML/MXL");
+    audio_analyzer_step.dependOn(&audio_analyzer_run.step);
+
     const native = b.addExecutable(.{
         .name = "score",
         .root_module = b.createModule(.{

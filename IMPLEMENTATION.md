@@ -21,11 +21,21 @@ This document started as the architecture plan and now also records the working 
 - A WebGPU-only Wasm/PWA export using Emdawnwebgpu, IndexedDB recovery, Service Worker offline caching, Web MIDI, getUserMedia, MediaRecorder, and a Zig DSP AudioWorklet. No Canvas 2D, WebGL, DOM product controls, or software renderer exists.
 - A stable iOS C ABI plus device and simulator application bundles: CAMetalLayer rendering, AVAudioEngine synthesis/metronome/microphone capture, CoreMIDI, system document import/export, atomic recovery, Pencil/touch/mouse input, and external keyboard commands.
 - MusicXML/XML, compressed MXL, standard MIDI, and versioned `.score` import; multi-part/polyphonic MusicXML timing; note edits with undo/redo; page-anchored pressure ink; pagination; transport looping/count-in/metronome/tempo; synchronized audio/MIDI takes; pitch/timing practice feedback.
+- Standards-based MusicXML 4.0 export, metrical bar alignment even when an OMR
+  measure is underfilled, live MIDI CC64/66/67 pedal state, sustain and
+  sostenuto semantics in the Zig diagnostic synth, and GPU three-pedal status.
 - A shared instanced WGSL renderer with responsive desktop/iPad/phone layout and a generated original PWA/macOS icon.
 - A core-owned semantic accessibility snapshot mirrored through NSAccessibility on macOS, hidden semantic DOM controls in the browser, and UIAccessibilityElement on iOS/iPadOS. Actions route back through the same Zig hit-testing path as pointer input.
 - Native, web, and iOS build gates plus portable unit/integration tests and a pinned macOS CI workflow.
 
 Release gaps are explicit rather than silently approximated: PDF page import/annotation, a full SMuFL atlas and professional engraving breadth, text/lasso annotation tools, optional cloud sync, App Store provisioning, and production content licensing remain follow-on work. The code must not describe those items as complete until their acceptance tests pass.
+
+The private, gitignored Holocene fixture is also explicitly incomplete. Its
+current 12-page OMR-derived MXL is useful for exercising import and playback,
+but the generated structural ledger still fails and the source is a voice/harp
+edition rather than a finished two-hand piano reduction. It must not be called
+professional or accurate until every flagged measure and every musical symbol
+has been reviewed against the user-supplied pages.
 
 ## 1. Product definition
 
@@ -171,6 +181,35 @@ Component schemas, stable document IDs, Flecs world ownership, render resources,
 - GPU resources are addressed by stable logical handles and restored/rebound after renderer or shader reloads. Shader compilation errors are non-destructive.
 - Release builds import the same module descriptors statically. The watcher, dynamic-library loader, developer overlay, and migration diagnostics are removed, and Zig links the application into one platform binary (or one main Wasm module plus required browser packaging files).
 - Reloadable callbacks may not retain Flecs table pointers, iterator pointers, Wasm linear-memory slices, or platform handles beyond the call. Long-lived state must be a registered component or a versioned serialized module block.
+
+### 3.6 Production multi-sampled instrument engine
+
+The existing oscillator synth is a diagnostic renderer only. The production
+audio path is a general instrument engine, with the concert grand as its first
+reference-quality library rather than a piano-only special case.
+
+- Normalize imported SFZ, SF2, and open multisample libraries into a validated
+  internal manifest with lossless assets, content hashes, explicit licenses,
+  missing-file diagnostics, and optional downloadable packs.
+- Support key, velocity, select, round-robin, and articulation zones with
+  crossfades; per-zone root/tuning/gain/pan; note/release/FX chains; envelopes,
+  filters, LFOs, and a polyphonic modulation matrix. The optional GPU editor
+  borrows Bitwig's clarity—search, tagging, visible zone maps, waveform/loop
+  editing, and live voice/streaming meters—without copying its UI or turning
+  the practice surface into a DAW.
+- Stream or preload samples without allocation, locks, disk access, or decoding
+  on the real-time callback. Publish bounded lock-free commands from the Flecs
+  world and expose underrun, memory, I/O, voice, and latency telemetry.
+- For the concert grand, require dense velocity/timbre interpolation,
+  multi-mic perspectives, release/mechanical/pedal samples, half-pedal,
+  repedaling, sostenuto, una corda, sympathetic/string/damper resonance, and
+  high-quality convolution/spatial output. Preserve CC64/66/67 and high-
+  resolution MIDI/per-note expression in recording and replay.
+- Use one Zig musical/DSP implementation on native, Wasm AudioWorklet, and iOS;
+  platform code owns only device/session, decoding/I/O facades, and callback
+  delivery. Quality gates include deterministic offline renders, spectral
+  regression, pedal-state and no-dropout stress tests, latency calibration, and
+  blind listening on monitors/headphones.
 
 ## 4. Repository layout
 
@@ -455,6 +494,22 @@ Support two first-class input sources behind `InputBackend`:
 Both sources can run together. All input is mapped once onto the `AudioContext`/monotonic timeline using a calibration offset. A setup flow measures device latency, background noise, tuning reference, and piano range; it recommends headphones when app playback would leak into the microphone.
 
 Do not attempt blind full-song transcription in the live path. The expected score provides a narrow pitch/time hypothesis window. An online Viterbi/beam-search follower aligns observations to score states while allowing repeats, pauses, restarts, skipped notes, and tempo drift.
+
+For offline authoring, `score-audio-analyze` accepts a lawful local PCM WAV and
+emits a versioned JSON evidence ledger: onset envelope, tempo estimate, bass
+candidate, pitch candidates, normalized chroma, and optional MusicXML/MXL
+alignment. Its deterministic Goertzel-based implementation is deliberately a
+review aid, not a claim of professional automatic transcription. A later
+source-separation/learned transcription stage must preserve confidence and feed
+the same manual correction/audit workflow. Streaming-site ripping is outside
+the content pipeline; private reference recordings must be supplied locally by
+the user and remain ignored.
+
+MusicXML lyric text is modeled independently from notes. A named vocal part or
+cue note is tagged as a vocal guide: it may render as an optional singer cue,
+but it is excluded from instrument playback, keyboard fingering, and piano
+assessment. This lets one document support piano-only practice, piano plus
+lyrics, and a singer guide without doubling the sung melody into the reduction.
 
 Microphone analysis pipeline:
 

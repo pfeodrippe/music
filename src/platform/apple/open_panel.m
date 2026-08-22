@@ -60,10 +60,10 @@ const char *score_save_score_panel(void) {
     selected_path[0] = '\0';
     @autoreleasepool {
         NSSavePanel *panel = [NSSavePanel savePanel];
-        panel.title = @"Export a portable Score document";
-        panel.message = @"The document contains notation and anchored annotations.";
-        panel.nameFieldStringValue = @"score-document.score";
-        panel.allowedFileTypes = @[@"score"];
+        panel.title = @"Export MusicXML score";
+        panel.message = @"MusicXML opens in MuseScore and other notation software.";
+        panel.nameFieldStringValue = @"score.musicxml";
+        panel.allowedFileTypes = @[@"musicxml", @"xml"];
         panel.canCreateDirectories = YES;
         if ([panel runModal] == NSModalResponseOK) {
             const char *path = panel.URL.fileSystemRepresentation;

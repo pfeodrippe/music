@@ -78,6 +78,22 @@ pub export fn score_draw_count() u32 {
     return @intCast(instance.drawItems().len);
 }
 
+pub export fn score_glyph_atlas_bytes() [*]const u8 {
+    return score.glyph_atlas.pixels.ptr;
+}
+
+pub export fn score_glyph_atlas_width() u32 {
+    return score.glyph_atlas.width;
+}
+
+pub export fn score_glyph_atlas_height() u32 {
+    return score.glyph_atlas.height;
+}
+
+pub export fn score_glyph_atlas_size() usize {
+    return score.glyph_atlas.pixels.len;
+}
+
 pub export fn score_accessibility_items() ?[*]const score.accessibility.Item {
     const instance = app orelse return null;
     return instance.accessibilityItems().ptr;
@@ -118,6 +134,11 @@ pub export fn score_import(pointer: [*]const u8, length: usize, kind: u32) u32 {
 pub export fn score_serialize(pointer: [*]u8, capacity: usize) usize {
     const instance = app orelse return 0;
     return instance.serialize(pointer[0..capacity]) catch 0;
+}
+
+pub export fn score_export_musicxml(pointer: [*]u8, capacity: usize) usize {
+    const instance = app orelse return 0;
+    return instance.exportMusicXml(pointer[0..capacity]) catch 0;
 }
 
 pub export fn score_restore(pointer: [*]const u8, length: usize) u32 {

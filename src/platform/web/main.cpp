@@ -11,7 +11,7 @@
 #include <vector>
 
 extern "C" {
-struct ScoreDrawItem { float rect[4]; float color[4]; float params[4]; };
+struct ScoreDrawItem { float rect[4]; float color[4]; float params[4]; float uv[4]; };
 struct ScoreHostEvent { uint8_t pitch; uint8_t velocity; uint8_t channel; uint8_t on; };
 struct ScoreAccessibilityItem { uint32_t id; uint32_t role; float rect[4]; uint32_t label_length; uint32_t flags; uint8_t label[48]; };
 bool score_init(float width, float height, float pixel_ratio);
@@ -27,11 +27,16 @@ void score_host_status(uint32_t status);
 size_t score_drain_playback(ScoreHostEvent* events, size_t capacity);
 const ScoreDrawItem* score_draw_items();
 uint32_t score_draw_count();
+const uint8_t* score_glyph_atlas_bytes();
+uint32_t score_glyph_atlas_width();
+uint32_t score_glyph_atlas_height();
+size_t score_glyph_atlas_size();
 const ScoreAccessibilityItem* score_accessibility_items();
 uint32_t score_accessibility_count();
 void score_accessibility_activate(uint32_t id);
 uint32_t score_import(const uint8_t* bytes, size_t length, uint32_t kind);
 size_t score_serialize(uint8_t* bytes, size_t capacity);
+size_t score_export_musicxml(uint8_t* bytes, size_t capacity);
 uint32_t score_restore(const uint8_t* bytes, size_t length);
 }
 
@@ -49,6 +54,9 @@ struct Runtime {
     wgpu::TextureFormat format = wgpu::TextureFormat::BGRA8Unorm;
     wgpu::Buffer globals;
     wgpu::Buffer items;
+    wgpu::Texture glyph_atlas;
+    wgpu::TextureView glyph_atlas_view;
+    wgpu::Sampler glyph_sampler;
     wgpu::BindGroup bind_group;
     wgpu::RenderPipeline pipeline;
     uint32_t physical_width = 0;
@@ -95,7 +103,7 @@ void processHostRequest() {
         case 3: webEnsureInputs(); break;
         case 4: {
             static std::vector<uint8_t> export_bytes(4 * 1024 * 1024);
-            const size_t export_length = score_serialize(export_bytes.data(), export_bytes.size());
+            const size_t export_length = score_export_musicxml(export_bytes.data(), export_bytes.size());
             if (export_length != 0) webExportSnapshot(export_bytes.data(), export_length);
             break;
         }
@@ -226,10 +234,36 @@ void initialized() {
     runtime.globals = runtime.device.CreateBuffer(&globals_descriptor);
     wgpu::BufferDescriptor items_descriptor{}; items_descriptor.label="score draw items"; items_descriptor.usage=wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst; items_descriptor.size=kMaxItems*sizeof(ScoreDrawItem);
     runtime.items = runtime.device.CreateBuffer(&items_descriptor);
-    wgpu::BindGroupLayoutEntry entries[2]{};
+    const uint32_t atlas_width = score_glyph_atlas_width();
+    const uint32_t atlas_height = score_glyph_atlas_height();
+    wgpu::TextureDescriptor atlas_descriptor{};
+    atlas_descriptor.label = "score Inter and Bravura glyph atlas";
+    atlas_descriptor.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+    atlas_descriptor.dimension = wgpu::TextureDimension::e2D;
+    atlas_descriptor.size = {atlas_width, atlas_height, 1};
+    atlas_descriptor.format = wgpu::TextureFormat::RGBA8Unorm;
+    runtime.glyph_atlas = runtime.device.CreateTexture(&atlas_descriptor);
+    runtime.glyph_atlas_view = runtime.glyph_atlas.CreateView();
+    wgpu::SamplerDescriptor sampler_descriptor{};
+    sampler_descriptor.magFilter = wgpu::FilterMode::Linear;
+    sampler_descriptor.minFilter = wgpu::FilterMode::Linear;
+    sampler_descriptor.addressModeU = wgpu::AddressMode::ClampToEdge;
+    sampler_descriptor.addressModeV = wgpu::AddressMode::ClampToEdge;
+    runtime.glyph_sampler = runtime.device.CreateSampler(&sampler_descriptor);
+    wgpu::TexelCopyTextureInfo atlas_destination{};
+    atlas_destination.texture = runtime.glyph_atlas;
+    atlas_destination.aspect = wgpu::TextureAspect::All;
+    wgpu::TexelCopyBufferLayout atlas_layout{};
+    atlas_layout.bytesPerRow = atlas_width * 4;
+    atlas_layout.rowsPerImage = atlas_height;
+    wgpu::Extent3D atlas_extent{atlas_width, atlas_height, 1};
+    runtime.queue.WriteTexture(&atlas_destination, score_glyph_atlas_bytes(), score_glyph_atlas_size(), &atlas_layout, &atlas_extent);
+    wgpu::BindGroupLayoutEntry entries[4]{};
     entries[0].binding = 0; entries[0].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment; entries[0].buffer.type = wgpu::BufferBindingType::Uniform;
     entries[1].binding = 1; entries[1].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment; entries[1].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
-    wgpu::BindGroupLayoutDescriptor bgl_descriptor{}; bgl_descriptor.entryCount = 2; bgl_descriptor.entries = entries;
+    entries[2].binding = 2; entries[2].visibility = wgpu::ShaderStage::Fragment; entries[2].texture.sampleType = wgpu::TextureSampleType::Float; entries[2].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+    entries[3].binding = 3; entries[3].visibility = wgpu::ShaderStage::Fragment; entries[3].sampler.type = wgpu::SamplerBindingType::Filtering;
+    wgpu::BindGroupLayoutDescriptor bgl_descriptor{}; bgl_descriptor.entryCount = 4; bgl_descriptor.entries = entries;
     wgpu::BindGroupLayout bgl = runtime.device.CreateBindGroupLayout(&bgl_descriptor);
     wgpu::PipelineLayoutDescriptor layout_descriptor{}; layout_descriptor.bindGroupLayoutCount = 1; layout_descriptor.bindGroupLayouts = &bgl;
     wgpu::PipelineLayout layout = runtime.device.CreatePipelineLayout(&layout_descriptor);
@@ -238,8 +272,8 @@ void initialized() {
     wgpu::FragmentState fragment{}; fragment.module=module; fragment.entryPoint="fs_main"; fragment.targetCount=1; fragment.targets=&target;
     wgpu::RenderPipelineDescriptor pipeline_descriptor{}; pipeline_descriptor.layout=layout; pipeline_descriptor.vertex.module=module; pipeline_descriptor.vertex.entryPoint="vs_main"; pipeline_descriptor.fragment=&fragment; pipeline_descriptor.primitive.topology=wgpu::PrimitiveTopology::TriangleList;
     runtime.pipeline = runtime.device.CreateRenderPipeline(&pipeline_descriptor);
-    wgpu::BindGroupEntry bindings[2]{}; bindings[0].binding=0; bindings[0].buffer=runtime.globals; bindings[0].size=sizeof(Globals); bindings[1].binding=1; bindings[1].buffer=runtime.items; bindings[1].size=kMaxItems*sizeof(ScoreDrawItem);
-    wgpu::BindGroupDescriptor group_descriptor{}; group_descriptor.layout=bgl; group_descriptor.entryCount=2; group_descriptor.entries=bindings;
+    wgpu::BindGroupEntry bindings[4]{}; bindings[0].binding=0; bindings[0].buffer=runtime.globals; bindings[0].size=sizeof(Globals); bindings[1].binding=1; bindings[1].buffer=runtime.items; bindings[1].size=kMaxItems*sizeof(ScoreDrawItem); bindings[2].binding=2; bindings[2].textureView=runtime.glyph_atlas_view; bindings[3].binding=3; bindings[3].sampler=runtime.glyph_sampler;
+    wgpu::BindGroupDescriptor group_descriptor{}; group_descriptor.layout=bgl; group_descriptor.entryCount=4; group_descriptor.entries=bindings;
     runtime.bind_group = runtime.device.CreateBindGroup(&group_descriptor);
     EM_ASM({
         document.documentElement.style.cssText='width:100%;height:100%;background:#090b0e';

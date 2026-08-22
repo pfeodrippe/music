@@ -7,6 +7,7 @@ const recording = @import("recording.zig");
 const hot = @import("../hot_reload/abi.zig");
 const builtin_systems = @import("../systems/plugin.zig");
 const musicxml = @import("import/musicxml.zig");
+const musicxml_export = @import("export/musicxml.zig");
 const midi = @import("import/midi.zig");
 const mxl = @import("import/mxl.zig");
 const practice_assessment = @import("practice.zig");
@@ -15,6 +16,9 @@ const annotation = @import("annotation.zig");
 const accessibility = @import("accessibility.zig");
 const native_format = @import("persistence/native.zig");
 const playback = @import("playback/timeline.zig");
+
+const bundled_bach_minuet = @embedFile("../assets/scores/bach-minuet-in-g.mxl");
+const bundled_beethoven_fur_elise = @embedFile("../assets/scores/beethoven-fur-elise.musicxml");
 
 pub const c = @cImport({
     @cDefine("FLECS_CUSTOM_BUILD", "1");
@@ -47,6 +51,8 @@ pub const App = struct {
     session: c.ecs_entity_t,
     note_entities: [musicxml.max_import_notes]c.ecs_entity_t = undefined,
     note_count: usize = 0,
+    lyrics: [musicxml.max_import_lyrics]model.Lyric = undefined,
+    lyric_count: usize = 0,
     packet: render.Packet = .{},
     take: recording.Take = .{},
     time_seconds: f32 = 0,
@@ -65,9 +71,11 @@ pub const App = struct {
     take_replay_index: usize = 0,
     systems: [32]?*RuntimeSystem = [_]?*RuntimeSystem{null} ** 32,
     system_count: usize = 0,
+    draw_callback: ?hot.DrawCallback = null,
     notice_deadline_seconds: f32 = 0,
     last_observed_pitch: u8 = 255,
     last_observation_seconds: f32 = -10,
+    audition_pitch: u8 = 255,
 
     pub fn create(allocator: std.mem.Allocator, width: f32, height: f32, pixel_ratio: f32) !*App {
         const self = try allocator.create(App);
@@ -89,8 +97,8 @@ pub const App = struct {
         var ui_state: model.UiState = .{ .viewport_width = width, .viewport_height = height, .pixel_ratio = pixel_ratio };
         var practice: model.PracticeState = .{};
         var meta: model.DocumentMeta = .{};
-        meta.setTitle("ORIGINAL NOTATION STUDY");
-        meta.setCreator("SCORE FIXTURE");
+        meta.setTitle("Piano practice study");
+        meta.setCreator("Score");
         c.ecs_set_id(world, session, ids.transport, @sizeOf(model.Transport), &transport);
         c.ecs_set_id(world, session, ids.ui_state, @sizeOf(model.UiState), &ui_state);
         c.ecs_set_id(world, session, ids.practice, @sizeOf(model.PracticeState), &practice);
@@ -160,9 +168,24 @@ pub const App = struct {
             const end = self.scoreEndBeat();
             state.view_start_beat = std.math.clamp(state.view_start_beat + event.scroll_y * 0.04, 0, @max(0, end - 1));
         } else if (event.kind == .down) {
-            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height);
+            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
             const transport = self.getMut(model.Transport, self.session, self.ids.transport) orelse return;
-            if (layout.play.contains(event.x, event.y)) {
+            if (state.library_open != 0) {
+                if (layout.library_items[0].contains(event.x, event.y)) {
+                    state.library_open = 0;
+                    self.loadBundledScore(0) catch self.setHostStatus(3);
+                } else if (layout.library_items[1].contains(event.x, event.y)) {
+                    state.library_open = 0;
+                    self.loadBundledScore(1) catch self.setHostStatus(3);
+                } else if (layout.library_close.contains(event.x, event.y)) {
+                    state.library_open = 0;
+                }
+                c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+                self.buildFrame();
+                return;
+            } else if (layout.library_trigger.contains(event.x, event.y)) {
+                state.library_open = 1;
+            } else if (layout.play.contains(event.x, event.y)) {
                 self.toggleTransport(transport);
             } else if (layout.record.contains(event.x, event.y)) {
                 transport.recording = if (transport.recording == 0) 1 else 0;
@@ -193,6 +216,10 @@ pub const App = struct {
                 }
             } else if (layout.metronome_toggle.contains(event.x, event.y)) {
                 transport.metronome_enabled = if (transport.metronome_enabled == 0) 1 else 0;
+            } else if (layout.keyboard_toggle.contains(event.x, event.y)) {
+                state.keyboard_visible = if (state.keyboard_visible == 0) 1 else 0;
+            } else if (layout.vocal_guide_toggle.contains(event.x, event.y)) {
+                state.vocal_guide_visible = if (state.vocal_guide_visible == 0) 1 else 0;
             } else if (layout.tempo_minus.contains(event.x, event.y)) {
                 transport.tempo_bpm = @max(30, transport.tempo_bpm - 1);
             } else if (layout.tempo_plus.contains(event.x, event.y)) {
@@ -206,6 +233,10 @@ pub const App = struct {
                 self.host_request = .replay_take;
             } else if (layout.input_setup.contains(event.x, event.y)) {
                 self.host_request = .choose_microphone;
+            } else if (ui.pianoPitchAt(layout.keyboard_panel, event.x, event.y)) |pitch| {
+                if (self.audition_pitch != 255) self.pushPlayback(.{ .pitch = self.audition_pitch, .velocity = 0, .channel = 0, .on = 0 });
+                self.audition_pitch = pitch;
+                self.pushPlayback(.{ .pitch = pitch, .velocity = 92, .channel = 0, .on = 1 });
             } else {
                 if (layout.stage.contains(event.x, event.y)) switch (state.tool) {
                     .edit => self.insertNoteAt(event.x, event.y, layout.stage),
@@ -218,9 +249,15 @@ pub const App = struct {
             }
             c.ecs_modified_id(self.world, self.session, self.ids.transport);
         } else if (event.kind == .move and state.tool == .annotate and self.annotations.active != null) {
-            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height);
+            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
             if (layout.stage.contains(event.x, event.y)) self.annotations.append(annotationPoint(event, layout.stage, self.time_seconds));
-        } else if ((event.kind == .up or event.kind == .cancel) and self.annotations.active != null) self.annotations.end();
+        } else if (event.kind == .up or event.kind == .cancel) {
+            if (self.audition_pitch != 255) {
+                self.pushPlayback(.{ .pitch = self.audition_pitch, .velocity = 0, .channel = 0, .on = 0 });
+                self.audition_pitch = 255;
+            }
+            if (self.annotations.active != null) self.annotations.end();
+        }
         c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         self.buildFrame();
     }
@@ -244,6 +281,26 @@ pub const App = struct {
         }
         if (event.key == 90 and event.modifiers != 0) self.undo();
         if (event.key == 89 and event.modifiers != 0) self.redo();
+        if (event.key == 75 or event.key == 107) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.keyboard_visible = if (state.keyboard_visible == 0) 1 else 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 76 or event.key == 108) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.library_open = if (state.library_open == 0) 1 else 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 86 or event.key == 118) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.vocal_guide_visible = if (state.vocal_guide_visible == 0) 1 else 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 27 or event.key == 256) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.library_open = 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
         if (event.key == 34 or event.key == 267) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
             state.view_start_beat = @min(@floor(state.view_start_beat / 16) * 16 + 16, @max(0, self.scoreEndBeat() - 1));
@@ -306,6 +363,8 @@ pub const App = struct {
         const report = try musicxml.parse(source);
         try self.replaceNotes(report.notes[0..report.note_count]);
         self.resetDocumentExtras();
+        @memcpy(self.lyrics[0..report.lyric_count], report.lyrics[0..report.lyric_count]);
+        self.lyric_count = report.lyric_count;
         const meta = self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
         meta.* = .{};
         meta.setTitle(if (report.title_len != 0) report.titleSlice() else "IMPORTED MUSICXML SCORE");
@@ -342,6 +401,16 @@ pub const App = struct {
         self.buildFrame();
     }
 
+    pub fn loadBundledScore(self: *App, index: u32) !void {
+        switch (index) {
+            0 => try self.importMxl(bundled_bach_minuet),
+            1 => try self.importMusicXml(bundled_beethoven_fur_elise),
+            else => return error.UnknownBundledScore,
+        }
+        if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| state.library_open = 0;
+        self.setHostStatus(2);
+    }
+
     pub fn importMxl(self: *App, source: []const u8) !void {
         const document = try mxl.extract(std.heap.c_allocator, source);
         defer std.heap.c_allocator.free(document);
@@ -351,6 +420,7 @@ pub const App = struct {
     fn resetDocumentExtras(self: *App) void {
         self.annotations = .{};
         self.take = .{};
+        self.lyric_count = 0;
         (self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return).* = .{};
         if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| state.view_start_beat = 0;
     }
@@ -369,7 +439,14 @@ pub const App = struct {
         }
         const ui_state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
         ui_state.input_source = .midi;
-        if ((status & 0xf0) == 0x90 and data2 != 0) self.assessMidiNote(data1);
+        const message = status & 0xf0;
+        if (message == 0x90 and data2 != 0) self.assessMidiNote(data1);
+        if (message == 0xb0) switch (data1) {
+            64 => ui_state.sustain_pedal = data2,
+            66 => ui_state.sostenuto_pedal = data2,
+            67 => ui_state.soft_pedal = data2,
+            else => {},
+        };
         c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         self.buildFrame();
     }
@@ -416,9 +493,26 @@ pub const App = struct {
         snapshot.transport = self.transportSnapshot();
         snapshot.note_count = self.note_count;
         for (self.note_entities[0..self.note_count], 0..) |entity, index| snapshot.notes[index] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
+        snapshot.lyric_count = self.lyric_count;
+        @memcpy(snapshot.lyrics[0..self.lyric_count], self.lyrics[0..self.lyric_count]);
         snapshot.annotations = self.annotations;
         snapshot.take = self.take;
         return native_format.encode(snapshot, output);
+    }
+
+    /// Exports the editable notation as standards-based MusicXML for exchange
+    /// with notation tools. Portable `.score` serialization remains separate
+    /// because it additionally preserves practice takes and anchored ink.
+    pub fn exportMusicXml(self: *const App, output: []u8) !usize {
+        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
+        const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
+        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        var count: usize = 0;
+        for (self.note_entities[0..self.note_count]) |entity| {
+            notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
+            count += 1;
+        }
+        return musicxml_export.write(output, meta, transport, notes[0..count], self.lyrics[0..self.lyric_count]);
     }
 
     pub fn deserialize(self: *App, source: []const u8) !void {
@@ -426,6 +520,8 @@ pub const App = struct {
         defer std.heap.c_allocator.destroy(snapshot);
         try native_format.decode(source, snapshot);
         try self.replaceNotes(snapshot.notes[0..snapshot.note_count]);
+        self.lyric_count = snapshot.lyric_count;
+        @memcpy(self.lyrics[0..self.lyric_count], snapshot.lyrics[0..snapshot.lyric_count]);
         (self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta).* = snapshot.meta;
         (self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport).* = snapshot.transport;
         self.annotations = snapshot.annotations;
@@ -461,6 +557,7 @@ pub const App = struct {
                 self.system_count += 1;
             }
         }
+        if (plugin.draw) |draw_callback| self.draw_callback = draw_callback;
     }
 
     pub fn restoreBuiltinSystems(self: *App) void {
@@ -674,6 +771,7 @@ pub const App = struct {
         var nearest_distance: f32 = 1000;
         for (self.note_entities[0..self.note_count]) |entity| {
             const note = self.getConst(model.Note, entity, self.ids.note) orelse continue;
+            if ((note.flags & model.note_flag_vocal_guide) != 0) continue;
             const distance = @abs(note.start_beat - transport_state.cursor_beat);
             if (distance < nearest_distance) {
                 nearest_distance = distance;
@@ -709,7 +807,24 @@ pub const App = struct {
                 len += 1;
             }
         }
-        ui.draw(&self.packet, state, transport, practice, meta, notes[0..len], &self.annotations, self.time_seconds);
+        if (self.draw_callback) |draw_callback| {
+            var context = hot.FrameContext{
+                .packet = &self.packet,
+                .ui_state = state,
+                .transport = transport,
+                .practice = practice,
+                .document_meta = meta,
+                .notes = notes[0..].ptr,
+                .note_count = @intCast(len),
+                .lyrics = self.lyrics[0..].ptr,
+                .lyric_count = @intCast(self.lyric_count),
+                .annotations = &self.annotations,
+                .time_seconds = self.time_seconds,
+            };
+            draw_callback(&context);
+        } else {
+            ui.draw(&self.packet, state, transport, practice, meta, notes[0..len], self.lyrics[0..self.lyric_count], &self.annotations, self.time_seconds);
+        }
         self.accessibility.build(state, transport, meta);
     }
 
@@ -933,12 +1048,23 @@ test "multiple Flecs system queries share the hot-reload plugin ABI" {
     try std.testing.expect(practice.confidence < 1);
 }
 
+test "bundled public-domain score library imports offline" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.loadBundledScore(0);
+    try std.testing.expect(app.note_count > 20);
+    try app.loadBundledScore(1);
+    try std.testing.expect(app.note_count > 100);
+    const meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
+    try std.testing.expect(std.mem.indexOf(u8, meta.titleSlice(), "Elise") != null);
+}
+
 test "loop button isolates the current meter-aware measure" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
     const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
     transport.cursor_beat = 5.25;
-    const button = ui.Layout.calculate(1280, 800).loop_toggle;
+    const button = ui.Layout.calculate(1280, 800, true).loop_toggle;
     app.pointer(.{
         .kind = .down,
         .pointer_type = .mouse,
@@ -964,13 +1090,13 @@ test "page navigation preserves the Flecs document and moves the GPU score windo
     app.key(.{ .key = 34, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
     const state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
     try std.testing.expectEqual(@as(f32, 16), @floor(state.view_start_beat / 16) * 16);
-    try std.testing.expect(app.drawItems().len > 400);
+    try std.testing.expect(app.drawItems().len > 100);
 }
 
-test "GPU top bar exposes portable save action" {
+test "GPU top bar exposes MusicXML export action" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
-    const expected = ui.Layout.calculate(1280, 800).export_score;
+    const expected = ui.Layout.calculate(1280, 800, true).export_score;
     var found = false;
     for (app.drawItems()) |item| {
         if (@abs(item.rect[0] - expected.x) < 0.1 and @abs(item.rect[1] - expected.y) < 0.1 and @abs(item.rect[2] - expected.width) < 0.1) {
@@ -979,4 +1105,16 @@ test "GPU top bar exposes portable save action" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "edited Flecs score round-trips through industry MusicXML" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const output = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(output);
+    const length = try app.exportMusicXml(output);
+    const report = try musicxml.parse(output[0..length]);
+    try std.testing.expectEqual(app.note_count, report.note_count);
+    try std.testing.expectEqualStrings("Piano practice study", report.titleSlice());
+    try std.testing.expectEqual(@as(f32, 72), report.tempo_bpm);
 }

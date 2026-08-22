@@ -5,7 +5,7 @@ const musicxml = @import("../import/musicxml.zig");
 const recording = @import("../recording.zig");
 
 pub const magic = "SCOREAPP";
-pub const current_version: u32 = 5;
+pub const current_version: u32 = 7;
 const header_size = 20;
 
 pub const Snapshot = struct {
@@ -13,6 +13,8 @@ pub const Snapshot = struct {
     transport: model.Transport = .{},
     notes: [musicxml.max_import_notes]model.Note = undefined,
     note_count: usize = 0,
+    lyrics: [musicxml.max_import_lyrics]model.Lyric = undefined,
+    lyric_count: usize = 0,
     annotations: annotation.Store = .{},
     take: recording.Take = .{},
 };
@@ -25,6 +27,7 @@ pub const Error = error{
     ChecksumMismatch,
     InvalidData,
     TooManyNotes,
+    TooManyLyrics,
     TooManyStrokes,
     TooManyPoints,
     TooManyMidiEvents,
@@ -84,6 +87,11 @@ pub fn encode(snapshot: *const Snapshot, output: []u8) Error!usize {
     notation[2] = @bitCast(snapshot.meta.key_fifths);
     notation[3] = 0;
     try writer.u32(snapshot.transport.metronome_enabled);
+    try writer.u32(@intCast(snapshot.lyric_count));
+    for (snapshot.lyrics[0..snapshot.lyric_count]) |lyric| {
+        try writer.f32(lyric.start_beat);
+        try writer.bytes(lyric.textSlice());
+    }
 
     const payload = output[header_size..writer.offset];
     @memcpy(output[0..8], magic);
@@ -118,7 +126,7 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
     snapshot.transport.count_in_bars = try reader.u32();
     snapshot.note_count = try reader.u32();
     if (snapshot.note_count > snapshot.notes.len) return error.TooManyNotes;
-    for (snapshot.notes[0..snapshot.note_count]) |*note| note.* = try reader.note();
+    for (snapshot.notes[0..snapshot.note_count]) |*note| note.* = try reader.note(version);
     snapshot.annotations.stroke_count = try reader.u32();
     snapshot.annotations.point_count = try reader.u32();
     if (snapshot.annotations.stroke_count > snapshot.annotations.strokes.len) return error.TooManyStrokes;
@@ -164,6 +172,14 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
         snapshot.meta.key_fifths = @bitCast(notation[2]);
     }
     if (version >= 5) snapshot.transport.metronome_enabled = try reader.u32();
+    if (version >= 6) {
+        snapshot.lyric_count = try reader.u32();
+        if (snapshot.lyric_count > snapshot.lyrics.len) return error.TooManyLyrics;
+        for (snapshot.lyrics[0..snapshot.lyric_count]) |*lyric| {
+            lyric.* = .{ .start_beat = try reader.f32() };
+            lyric.setText(try reader.bytes());
+        }
+    }
     snapshot.annotations.next_id = 1;
     for (snapshot.annotations.strokes[0..snapshot.annotations.stroke_count]) |stroke| snapshot.annotations.next_id = @max(snapshot.annotations.next_id, stroke.stable_id + 1);
     if (reader.offset != payload.len) return error.InvalidData;
@@ -208,6 +224,7 @@ const Writer = struct {
         quartet[2] = value.staff;
         quartet[3] = value.voice;
         try self.u32(value.selected);
+        try self.u32(value.flags);
     }
 };
 
@@ -238,11 +255,13 @@ const Reader = struct {
         return @bitCast(try self.u32());
     }
 
-    fn note(self: *Reader) Error!model.Note {
+    fn note(self: *Reader, version: u32) Error!model.Note {
         const stable_id = try self.u64();
         const start = try self.f32();
         const duration = try self.f32();
         const quartet = try self.take(4);
+        const selected = try self.u32();
+        const flags = if (version >= 7) try self.u32() else 0;
         return .{
             .stable_id = stable_id,
             .start_beat = start,
@@ -251,7 +270,8 @@ const Reader = struct {
             .velocity = quartet[1],
             .staff = quartet[2],
             .voice = quartet[3],
-            .selected = try self.u32(),
+            .selected = selected,
+            .flags = flags,
         };
     }
 };
@@ -275,6 +295,9 @@ test "native document round trips notes, transport and anchored ink" {
     snapshot.transport.metronome_enabled = 0;
     snapshot.notes[0] = .{ .stable_id = 9, .start_beat = 1.5, .duration_beats = 0.5, .pitch = 64, .velocity = 90, .staff = 0, .voice = 0 };
     snapshot.note_count = 1;
+    snapshot.lyrics[0] = .{ .start_beat = 1.5 };
+    snapshot.lyrics[0].setText("sing this");
+    snapshot.lyric_count = 1;
     snapshot.annotations.begin(.{ .u = 0.2, .v = 0.3, .pressure = 0.8, .time_ms = 10 }, 1);
     snapshot.annotations.end();
     var bytes: [4096]u8 = undefined;
@@ -284,6 +307,7 @@ test "native document round trips notes, transport and anchored ink" {
     try decode(bytes[0..len], decoded);
     try std.testing.expectEqualStrings("Round Trip", decoded.meta.titleSlice());
     try std.testing.expectEqual(@as(u8, 64), decoded.notes[0].pitch);
+    try std.testing.expectEqualStrings("sing this", decoded.lyrics[0].textSlice());
     try std.testing.expectEqual(@as(usize, 1), decoded.annotations.point_count);
     try std.testing.expectEqual(@as(u32, 1), decoded.annotations.strokes[0].page_index);
     try std.testing.expectEqual(@as(u32, 0), decoded.transport.metronome_enabled);

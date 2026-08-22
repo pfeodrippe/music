@@ -8,6 +8,7 @@ const build_options = @import("build_options");
 const native_c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("stdio.h");
+    @cInclude("stdlib.h");
     @cInclude("unistd.h");
     @cInclude("open_panel.h");
     @cInclude("music_devices.h");
@@ -34,49 +35,107 @@ const DevReloader = if (build_options.hot_reload) struct {
     const Entry = *const fn () callconv(.c) *const score.hot_reload.PluginDescriptor;
 
     library: ?std.DynLib = null,
+    staged_path: [512:0]u8 = undefined,
+    staged_path_len: usize = 0,
     modified_ns: i128 = -1,
     next_poll: f64 = 0,
 
     fn poll(self: *@This(), app: *score.App, now: f64) void {
         if (now < self.next_poll) return;
         self.next_poll = now + 0.2;
-        const stamp = modificationTime() orelse return;
+        const source_path = pluginPath();
+        const stamp = modificationTime(source_path) orelse return;
         if (stamp == self.modified_ns) return;
 
         // Point every callback back into the monolith before unloading code.
         app.restoreBuiltinSystems();
         if (self.library) |*old| old.close();
         self.library = null;
+        self.removeStaged();
 
-        var candidate = std.DynLib.open(plugin_path) catch |err| {
+        var path_buffer: [512:0]u8 = undefined;
+        const source_slice = std.mem.span(source_path);
+        const directory = if (std.mem.lastIndexOfScalar(u8, source_slice, '/')) |slash| source_slice[0..slash] else ".";
+        const staged = std.fmt.bufPrintZ(&path_buffer, "{s}/.score-systems-hot-{d}.dylib", .{ directory, stamp }) catch {
+            std.log.err("hot reload path is too long", .{});
+            return;
+        };
+        stagePlugin(source_path, staged) catch |err| {
+            std.log.warn("hot reload staging deferred: {s}", .{@errorName(err)});
+            return;
+        };
+        var candidate = std.DynLib.open(staged) catch |err| {
+            _ = native_c.unlink(staged.ptr);
             std.log.warn("hot reload deferred: {s}", .{@errorName(err)});
             return;
         };
         const entry = candidate.lookup(Entry, "score_plugin_descriptor") orelse {
             candidate.close();
+            _ = native_c.unlink(staged.ptr);
             std.log.err("hot reload module has no score_plugin_descriptor", .{});
             return;
         };
         app.applySystemPlugin(entry()) catch |err| {
             candidate.close();
+            _ = native_c.unlink(staged.ptr);
             app.restoreBuiltinSystems();
             std.log.err("hot reload rejected: {s}", .{@errorName(err)});
             return;
         };
         self.library = candidate;
+        std.mem.copyForwards(u8, self.staged_path[0..staged.len], staged);
+        self.staged_path[staged.len] = 0;
+        self.staged_path_len = staged.len;
         self.modified_ns = stamp;
-        std.log.info("systems hot-reloaded; Flecs world preserved", .{});
+        std.log.info("systems and GPU screen composition hot-reloaded; Flecs world preserved", .{});
     }
 
     fn deinit(self: *@This(), app: *score.App) void {
         app.restoreBuiltinSystems();
         if (self.library) |*library| library.close();
         self.library = null;
+        self.removeStaged();
     }
 
-    fn modificationTime() ?i128 {
+    fn removeStaged(self: *@This()) void {
+        if (self.staged_path_len == 0) return;
+        _ = native_c.unlink(self.staged_path[0..self.staged_path_len :0].ptr);
+        self.staged_path_len = 0;
+    }
+
+    /// Darwin can retain a dlopen image for a path after dlclose. Loading a
+    /// uniquely named, fully written copy guarantees that a changed module is
+    /// fresh code rather than dyld's cached image.
+    fn stagePlugin(source_path: [*:0]const u8, destination_path: [:0]const u8) !void {
+        const source = native_c.fopen(source_path, "rb") orelse return error.StageOpenSourceFailed;
+        defer _ = native_c.fclose(source);
+        const destination = native_c.fopen(destination_path.ptr, "wb") orelse return error.StageOpenDestinationFailed;
+        var complete = false;
+        defer {
+            if (!complete) _ = native_c.unlink(destination_path.ptr);
+        }
+        defer _ = native_c.fclose(destination);
+
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const read_count = native_c.fread(&buffer, 1, buffer.len, source);
+            if (read_count == 0) break;
+            if (native_c.fwrite(&buffer, 1, read_count, destination) != read_count) return error.StageWriteFailed;
+        }
+        if (native_c.ferror(source) != 0) return error.StageReadFailed;
+        if (native_c.fflush(destination) != 0) return error.StageFlushFailed;
+        complete = true;
+    }
+
+    fn pluginPath() [*:0]const u8 {
+        const configured = native_c.getenv("SCORE_HOT_RELOAD_PLUGIN");
+        if (configured != null and configured[0] != 0) return configured;
+        return plugin_path.ptr;
+    }
+
+    fn modificationTime(path: [*:0]const u8) ?i128 {
         var info: native_c.struct_stat = undefined;
-        if (native_c.stat(plugin_path.ptr, &info) != 0) return null;
+        if (native_c.stat(path, &info) != 0) return null;
         return @as(i128, info.st_mtimespec.tv_sec) * std.time.ns_per_s + info.st_mtimespec.tv_nsec;
     }
 } else struct {
@@ -92,6 +151,9 @@ const Renderer = struct {
     bind_group: wgpu.BindGroup,
     uniforms: wgpu.Buffer,
     instances: wgpu.Buffer,
+    atlas_texture: wgpu.Texture,
+    atlas_view: wgpu.TextureView,
+    atlas_sampler: wgpu.Sampler,
 
     fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !Renderer {
         const context = try zgpu.GraphicsContext.create(
@@ -125,6 +187,29 @@ const Renderer = struct {
         });
         errdefer instances.release();
 
+        const atlas_texture = context.device.createTexture(.{
+            .label = "score Inter and Bravura glyph atlas",
+            .usage = .{ .texture_binding = true, .copy_dst = true },
+            .size = .{ .width = score.glyph_atlas.width, .height = score.glyph_atlas.height },
+            .format = .rgba8_unorm,
+        });
+        errdefer atlas_texture.release();
+        const atlas_view = atlas_texture.createView(.{});
+        errdefer atlas_view.release();
+        const atlas_sampler = context.device.createSampler(.{
+            .label = "score glyph atlas sampler",
+            .mag_filter = .linear,
+            .min_filter = .linear,
+        });
+        errdefer atlas_sampler.release();
+        context.queue.writeTexture(
+            .{ .texture = atlas_texture },
+            .{ .offset = 0, .bytes_per_row = score.glyph_atlas.width * 4, .rows_per_image = score.glyph_atlas.height },
+            .{ .width = score.glyph_atlas.width, .height = score.glyph_atlas.height },
+            u8,
+            score.glyph_atlas.pixels,
+        );
+
         const layout_entries = [_]wgpu.BindGroupLayoutEntry{
             .{
                 .binding = 0,
@@ -135,6 +220,16 @@ const Renderer = struct {
                 .binding = 1,
                 .visibility = .{ .vertex = true, .fragment = true },
                 .buffer = .{ .binding_type = .read_only_storage, .min_binding_size = @sizeOf(score.render.DrawItem) },
+            },
+            .{
+                .binding = 2,
+                .visibility = .{ .fragment = true },
+                .texture = .{ .sample_type = .float, .view_dimension = .tvdim_2d },
+            },
+            .{
+                .binding = 3,
+                .visibility = .{ .fragment = true },
+                .sampler = .{ .binding_type = .filtering },
             },
         };
         const bind_group_layout = context.device.createBindGroupLayout(.{
@@ -181,6 +276,8 @@ const Renderer = struct {
         const entries = [_]wgpu.BindGroupEntry{
             .{ .binding = 0, .buffer = uniforms, .size = @sizeOf(Uniforms) },
             .{ .binding = 1, .buffer = instances, .size = score.render.max_draw_items * @sizeOf(score.render.DrawItem) },
+            .{ .binding = 2, .size = 0, .texture_view = atlas_view },
+            .{ .binding = 3, .size = 0, .sampler = atlas_sampler },
         };
         const bind_group = context.device.createBindGroup(.{
             .label = "score ui bind group",
@@ -198,11 +295,17 @@ const Renderer = struct {
             .bind_group = bind_group,
             .uniforms = uniforms,
             .instances = instances,
+            .atlas_texture = atlas_texture,
+            .atlas_view = atlas_view,
+            .atlas_sampler = atlas_sampler,
         };
     }
 
     fn deinit(self: *Renderer, allocator: std.mem.Allocator) void {
         self.bind_group.release();
+        self.atlas_sampler.release();
+        self.atlas_view.release();
+        self.atlas_texture.release();
         self.pipeline.release();
         self.pipeline_layout.release();
         self.bind_group_layout.release();
@@ -391,7 +494,13 @@ fn pumpMidiInput(app: *score.App, synth: *score.synth.Synth, service: ?*native_c
     for (events[0..count]) |event| {
         app.midiInput(event.time_ns, event.status, event.data1, event.data2);
         const message = event.status & 0xf0;
-        if (message == 0x90 and event.data2 != 0) synth.noteOn(event.status & 0x0f, event.data1, event.data2) else if (message == 0x80 or (message == 0x90 and event.data2 == 0)) synth.noteOff(event.status & 0x0f, event.data1);
+        if (message == 0x90 and event.data2 != 0) {
+            synth.noteOn(event.status & 0x0f, event.data1, event.data2);
+        } else if (message == 0x80 or (message == 0x90 and event.data2 == 0)) {
+            synth.noteOff(event.status & 0x0f, event.data1);
+        } else if (message == 0xb0) {
+            synth.controlChange(event.status & 0x0f, event.data1, event.data2);
+        }
     }
 }
 
@@ -525,7 +634,7 @@ fn appDataPath(buffer: *[4096]u8, basename: []const u8) ![:0]u8 {
 fn saveScorePath(app: *score.App, allocator: std.mem.Allocator, path: [*:0]const u8) !void {
     const bytes = try allocator.alloc(u8, 4 * 1024 * 1024);
     defer allocator.free(bytes);
-    const len = try app.serialize(bytes);
+    const len = try app.exportMusicXml(bytes);
     const file = native_c.fopen(path, "wb") orelse return error.OpenFailed;
     if (native_c.fwrite(bytes.ptr, 1, len, file) != len) {
         _ = native_c.fclose(file);

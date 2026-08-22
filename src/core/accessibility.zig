@@ -1,7 +1,7 @@
 const model = @import("model.zig");
 const ui = @import("ui.zig");
 
-pub const max_items = 20;
+pub const max_items = 24;
 
 pub const Role = enum(u32) {
     document = 0,
@@ -27,6 +27,11 @@ pub const Id = struct {
     pub const tempo_down: u32 = 9;
     pub const tempo_up: u32 = 10;
     pub const replay: u32 = 11;
+    pub const keyboard: u32 = 12;
+    pub const library: u32 = 13;
+    pub const library_close: u32 = 14;
+    pub const library_first: u32 = 15;
+    pub const vocal_guide: u32 = 17;
     pub const tool_first: u32 = 20;
 };
 
@@ -49,19 +54,28 @@ pub const Snapshot = struct {
 
     pub fn build(self: *Snapshot, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta) void {
         self.len = 0;
-        const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height);
+        const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
         self.add(Id.document, .document, layout.stage, meta.titleSlice(), 0);
+        if (state.library_open != 0) {
+            self.add(Id.library_close, .button, layout.library_close, "Close score library", 0);
+            self.add(Id.library_first, .button, layout.library_items[0], "Open Minuet in G major by J. S. Bach", 0);
+            self.add(Id.library_first + 1, .button, layout.library_items[1], "Open Fur Elise by Ludwig van Beethoven", 0);
+            return;
+        }
+        if (layout.library_trigger.width > 0) self.add(Id.library, .button, layout.library_trigger, "Open score library", 0);
         if (layout.input_quick.width > 0) {
             self.add(Id.input, .button, layout.input_quick, "Set up music input", 0);
         } else if (layout.input_setup.width > 0) {
             self.add(Id.input, .button, layout.input_setup, "Set up music input", 0);
         }
-        self.add(Id.save, .button, layout.export_score, "Save portable score", 0);
+        self.add(Id.save, .button, layout.export_score, "Export MusicXML score", 0);
         self.add(Id.import_score, .button, layout.import_score, "Import score", 0);
         self.add(Id.record, .button, layout.record, if (transport.recording != 0) "Stop recording" else "Start recording", Flag.toggle | (if (transport.recording != 0) Flag.pressed else 0));
         self.add(Id.play, .button, layout.play, if (transport.playing != 0) "Pause score" else "Play score", Flag.toggle | (if (transport.playing != 0) Flag.pressed else 0));
         if (layout.loop_toggle.width > 0) self.add(Id.loop, .button, layout.loop_toggle, "Loop current measure", Flag.toggle | (if (transport.loop_enabled != 0) Flag.pressed else 0));
         if (layout.metronome_toggle.width > 0) self.add(Id.metronome, .button, layout.metronome_toggle, "Metronome click", Flag.toggle | (if (transport.metronome_enabled != 0) Flag.pressed else 0));
+        self.add(Id.keyboard, .button, layout.keyboard_toggle, if (state.keyboard_visible != 0) "Hide guided piano keyboard" else "Show guided piano keyboard", Flag.toggle | (if (state.keyboard_visible != 0) Flag.pressed else 0));
+        if (layout.vocal_guide_toggle.width > 0) self.add(Id.vocal_guide, .button, layout.vocal_guide_toggle, if (state.vocal_guide_visible != 0) "Hide vocal guide" else "Show vocal guide", Flag.toggle | (if (state.vocal_guide_visible != 0) Flag.pressed else 0));
         if (layout.tempo_minus.width > 0) {
             self.add(Id.tempo_down, .button, layout.tempo_minus, "Decrease tempo", 0);
             self.add(Id.tempo_up, .button, layout.tempo_plus, "Increase tempo", 0);

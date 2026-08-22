@@ -2,7 +2,7 @@
 
 Score is a game-style, local-first notation and piano-practice application. The score scene, product UI, hit testing, transport, recording model, assessment, persistence, and hot-reloadable systems are Zig/Flecs code. macOS presents the shared render packets through Dawn/Metal; the browser presents them through WebGPU. There is no DOM application UI, Canvas 2D, WebGL, or software renderer.
 
-The current build can import MusicXML/XML/MXL, standard MIDI, and portable `.score` documents; render and page through a grand staff; insert, select, move, delete, undo, annotate, loop, count in, adjust tempo, play, record microphone audio plus synchronized MIDI, replay a take, and assess live MIDI or detected microphone pitch. The shared semantic control tree is exposed through NSAccessibility, browser accessibility controls, and UIAccessibilityElement. Browser state stays in IndexedDB and the installable PWA works offline after its first successful load. Native state and captured audio stay under `~/Library/Application Support/Score`.
+The current build can import MusicXML/XML/MXL, standard MIDI, and portable `.score` documents; preserve timed lyrics and optional vocal-guide cues separately from instrument notes; render and page through a grand staff; insert, select, move, delete, undo, annotate, loop, count in, adjust tempo, play, record microphone audio plus synchronized MIDI, replay a take, and assess live MIDI or detected microphone pitch. The shared semantic control tree is exposed through NSAccessibility, browser accessibility controls, and UIAccessibilityElement. Browser state stays in IndexedDB and the installable PWA works offline after its first successful load. Native state and captured audio stay under `~/Library/Application Support/Score`.
 
 ## Toolchain
 
@@ -64,6 +64,24 @@ zig build ios-simulator
 - Ink: pressure-aware page-anchored annotation
 - Play: compare MIDI or microphone input with the score
 - Record: capture real audio and timestamped MIDI together
+- Voice button or `V`: show/hide the optional singer pitch guide; guide notes do
+  not enter piano playback, keyboard fingering, or piano assessment
+
+## Offline reference-audio analysis
+
+Analyze a lawful local PCM WAV and optionally compare its evidence with a
+MusicXML/MXL score:
+
+```sh
+zig build audio-analyze -Doptimize=ReleaseFast -- reference.wav \
+  --score authorized-score.mxl --output local-content/analysis.json
+```
+
+The versioned JSON contains onset/tempo evidence, bass and polyphonic pitch
+candidates, normalized chroma, and an alignment summary. It is deliberately
+labeled a review aid rather than an authoritative automatic transcription.
+The tool does not download streaming audio; keep private recordings and reports
+under the ignored `local-content/` tree.
 
 ## Architecture
 

@@ -50,5 +50,5 @@ pub const Backend = struct {
 test "GPU facade carries packets without platform handles" {
     const surface = Surface{ .logical_width = 1024, .logical_height = 768, .pixel_ratio = 2 };
     try @import("std").testing.expectEqual(@as(f32, 2048), surface.logical_width * surface.pixel_ratio);
-    try @import("std").testing.expect(@sizeOf(render.DrawItem) == 48);
+    try @import("std").testing.expect(@sizeOf(render.DrawItem) == 64);
 }

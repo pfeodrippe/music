@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const note_flag_vocal_guide: u32 = 1 << 0;
+
 pub const Tool = enum(u32) {
     read,
     edit,
@@ -22,6 +24,22 @@ pub const Note = extern struct {
     staff: u8,
     voice: u8,
     selected: u32 = 0,
+    flags: u32 = 0,
+};
+
+pub const Lyric = extern struct {
+    start_beat: f32 = 0,
+    text_len: u32 = 0,
+    text: [80]u8 = [_]u8{0} ** 80,
+
+    pub fn setText(self: *Lyric, value: []const u8) void {
+        self.text_len = @intCast(@min(value.len, self.text.len));
+        @memcpy(self.text[0..self.text_len], value[0..self.text_len]);
+    }
+
+    pub fn textSlice(self: *const Lyric) []const u8 {
+        return self.text[0..self.text_len];
+    }
 };
 
 pub const Transport = extern struct {
@@ -48,6 +66,12 @@ pub const UiState = extern struct {
     input_source: InputSource = .none,
     notice: u32 = 0,
     sidebar_open: u32 = 1,
+    keyboard_visible: u32 = 1,
+    library_open: u32 = 0,
+    sustain_pedal: u32 = 0,
+    sostenuto_pedal: u32 = 0,
+    soft_pedal: u32 = 0,
+    vocal_guide_visible: u32 = 1,
 };
 
 pub const PracticeState = extern struct {
@@ -93,6 +117,7 @@ pub const DocumentMeta = extern struct {
 
 test "portable score components have deterministic layouts" {
     try std.testing.expect(@sizeOf(Note) <= 32);
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(Lyric));
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Transport));
-    try std.testing.expectEqual(@as(usize, 44), @sizeOf(UiState));
+    try std.testing.expectEqual(@as(usize, 68), @sizeOf(UiState));
 }

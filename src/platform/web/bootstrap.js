@@ -276,10 +276,10 @@
     },
 
     exportSnapshot(bytes) {
-      const blob = new Blob([bytes.slice()], {type:"application/x-score-document"});
+      const blob = new Blob([bytes.slice()], {type:"application/vnd.recordare.musicxml+xml"});
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
-      link.download = "score-document.score";
+      link.download = "score.musicxml";
       link.style.display = "none";
       document.body.appendChild(link);
       link.click();

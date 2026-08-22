@@ -8,6 +8,7 @@ struct Item {
     rect: vec4f,
     color: vec4f,
     params: vec4f,
+    uv: vec4f,
 }
 
 struct VertexOutput {
@@ -17,10 +18,14 @@ struct VertexOutput {
     @location(2) @interpolate(flat) params: vec4f,
     @location(3) screen: vec2f,
     @location(4) @interpolate(flat) rect_size: vec2f,
+    @location(5) atlas_uv: vec2f,
+    @location(6) @interpolate(flat) atlas_rect: vec4f,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<storage, read> items: array<Item>;
+@group(0) @binding(2) var glyph_atlas: texture_2d<f32>;
+@group(0) @binding(3) var glyph_sampler: sampler;
 
 fn sd_segment(point: vec2f, start: vec2f, end: vec2f) -> f32 {
     let from_start = point - start;
@@ -29,34 +34,8 @@ fn sd_segment(point: vec2f, start: vec2f, end: vec2f) -> f32 {
     return length(from_start - segment * along);
 }
 
-fn ellipse_ring(point: vec2f, center: vec2f, scale: vec2f, width: f32) -> f32 {
-    return abs(length((point - center) / scale) - 1.0) * min(scale.x, scale.y) - width;
-}
-
-fn filled_ellipse(point: vec2f, center: vec2f, scale: vec2f) -> f32 {
-    return (length((point - center) / scale) - 1.0) * min(scale.x, scale.y);
-}
-
-fn treble_clef_distance(point: vec2f) -> f32 {
-    var distance = sd_segment(point, vec2f(0.12, -0.88), vec2f(0.12, 0.80)) - 0.052;
-    distance = min(distance, ellipse_ring(point, vec2f(0.11, -0.59), vec2f(0.34, 0.32), 0.055));
-    distance = min(distance, ellipse_ring(point, vec2f(-0.04, 0.13), vec2f(0.62, 0.34), 0.070));
-    distance = min(distance, sd_segment(point, vec2f(0.09, -0.30), vec2f(-0.38, -0.02)) - 0.063);
-    distance = min(distance, sd_segment(point, vec2f(-0.38, -0.02), vec2f(-0.42, 0.22)) - 0.063);
-    distance = min(distance, sd_segment(point, vec2f(-0.42, 0.22), vec2f(-0.08, 0.39)) - 0.063);
-    distance = min(distance, sd_segment(point, vec2f(-0.08, 0.39), vec2f(0.42, 0.34)) - 0.063);
-    distance = min(distance, ellipse_ring(point, vec2f(0.08, 0.72), vec2f(0.34, 0.15), 0.052));
-    return distance;
-}
-
-fn bass_clef_distance(point: vec2f) -> f32 {
-    var distance = ellipse_ring(point, vec2f(-0.18, -0.18), vec2f(0.49, 0.39), 0.085);
-    distance = min(distance, filled_ellipse(point, vec2f(-0.47, -0.19), vec2f(0.14, 0.14)));
-    distance = min(distance, sd_segment(point, vec2f(0.12, -0.01), vec2f(-0.01, 0.35)) - 0.075);
-    distance = min(distance, sd_segment(point, vec2f(-0.01, 0.35), vec2f(-0.31, 0.65)) - 0.068);
-    distance = min(distance, filled_ellipse(point, vec2f(0.55, -0.20), vec2f(0.075, 0.075)));
-    distance = min(distance, filled_ellipse(point, vec2f(0.55, 0.20), vec2f(0.075, 0.075)));
-    return distance;
+fn median(value: vec3f) -> f32 {
+    return max(min(value.r, value.g), min(max(value.r, value.g), value.b));
 }
 
 @vertex
@@ -79,6 +58,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     output.params = item.params;
     output.screen = pixel;
     output.rect_size = item.rect.zw;
+    output.atlas_uv = mix(item.uv.xy, item.uv.zw, local);
+    output.atlas_rect = item.uv;
     return output;
 }
 
@@ -100,11 +81,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         let distance = length((input.local - vec2f(0.5)) * 2.0);
         let breathing = 0.86 + 0.14 * sin(globals.time * 3.2 + input.params.z);
         alpha *= (1.0 - smoothstep(0.15, 1.0, distance)) * breathing;
-    } else if (kind == 4u || kind == 5u) {
-        let point = (input.local - vec2f(0.5)) * 2.0;
-        let distance = select(bass_clef_distance(point), treble_clef_distance(point), kind == 4u);
-        let antialias = 2.0 / max(1.0, min(input.rect_size.x, input.rect_size.y));
-        alpha *= 1.0 - smoothstep(-antialias, antialias, distance);
+    } else if (kind == 4u) {
+        let sample = textureSampleLevel(glyph_atlas, glyph_sampler, input.atlas_uv, 0.0);
+        let atlas_dimensions = vec2f(textureDimensions(glyph_atlas));
+        let atlas_pixels = max((input.atlas_rect.zw - input.atlas_rect.xy) * atlas_dimensions, vec2f(1.0));
+        let screen_scale = max(0.001, min(input.rect_size.x / atlas_pixels.x, input.rect_size.y / atlas_pixels.y));
+        let screen_distance = (median(sample.rgb) - 0.5) * input.params.y * screen_scale;
+        alpha *= clamp(screen_distance + 0.5, 0.0, 1.0);
     }
     let grain = (fract(sin(dot(input.screen, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012;
     return vec4f(clamp(input.color.rgb + vec3f(grain), vec3f(0.0), vec3f(1.0)), alpha);

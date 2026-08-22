@@ -26,8 +26,8 @@ pub export fn score_audio_midi(status: u32, data1: u32, data2: u32) void {
         synth.noteOn(channel, note, velocity);
     } else if (message == 0x80 or (message == 0x90 and velocity == 0)) {
         synth.noteOff(channel, note);
-    } else if (message == 0xb0 and note == 123) {
-        synth.allNotesOff();
+    } else if (message == 0xb0) {
+        synth.controlChange(channel, note, velocity);
     }
 }
 

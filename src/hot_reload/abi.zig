@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 3;
 pub const max_query_terms = 8;
 
 pub const ComponentKey = enum(u32) {
@@ -30,6 +30,25 @@ pub const SystemContext = extern struct {
 
 pub const SystemCallback = *const fn (*SystemContext) callconv(.c) void;
 
+/// Opaque frame boundary shared by the host and the development module. The
+/// module owns screen composition; the host owns durable application state and
+/// the GPU resources. That lets UI code reload without recreating the world.
+pub const FrameContext = extern struct {
+    packet: *anyopaque,
+    ui_state: *const anyopaque,
+    transport: *const anyopaque,
+    practice: *const anyopaque,
+    document_meta: *const anyopaque,
+    notes: *const anyopaque,
+    note_count: u32,
+    lyrics: *const anyopaque,
+    lyric_count: u32,
+    annotations: *const anyopaque,
+    time_seconds: f32,
+};
+
+pub const DrawCallback = *const fn (*FrameContext) callconv(.c) void;
+
 pub const SystemDescriptor = extern struct {
     stable_id: u64,
     name: [*:0]const u8,
@@ -44,6 +63,7 @@ pub const PluginDescriptor = extern struct {
     generation: u32,
     systems: [*]const SystemDescriptor,
     system_count: u32,
+    draw: ?DrawCallback,
 };
 
 pub fn compatible(descriptor: *const PluginDescriptor) bool {
@@ -57,6 +77,7 @@ test "hot reload ABI rejects mismatched modules" {
         .generation = 1,
         .systems = &empty_systems,
         .system_count = 0,
+        .draw = null,
     };
     try std.testing.expect(!compatible(&descriptor));
     descriptor.abi = abi_version;

@@ -11,6 +11,7 @@ struct ScoreDrawItemGPU {
     float4 rect;
     float4 color;
     float4 params;
+    float4 uv;
 };
 
 struct ScoreVertexOutput {
@@ -21,6 +22,8 @@ struct ScoreVertexOutput {
     float2 screen;
     float2 rectSize [[flat]];
     float time [[flat]];
+    float2 atlasUV;
+    float4 atlasRect [[flat]];
 };
 
 float scoreSegmentDistance(float2 point, float2 start, float2 end) {
@@ -30,34 +33,8 @@ float scoreSegmentDistance(float2 point, float2 start, float2 end) {
     return length(fromStart - segment * along);
 }
 
-float scoreEllipseRing(float2 point, float2 center, float2 scale, float width) {
-    return abs(length((point - center) / scale) - 1.0f) * min(scale.x, scale.y) - width;
-}
-
-float scoreFilledEllipse(float2 point, float2 center, float2 scale) {
-    return (length((point - center) / scale) - 1.0f) * min(scale.x, scale.y);
-}
-
-float scoreTrebleClefDistance(float2 point) {
-    float distance = scoreSegmentDistance(point, float2(0.12, -0.88), float2(0.12, 0.80)) - 0.052;
-    distance = min(distance, scoreEllipseRing(point, float2(0.11, -0.59), float2(0.34, 0.32), 0.055));
-    distance = min(distance, scoreEllipseRing(point, float2(-0.04, 0.13), float2(0.62, 0.34), 0.070));
-    distance = min(distance, scoreSegmentDistance(point, float2(0.09, -0.30), float2(-0.38, -0.02)) - 0.063);
-    distance = min(distance, scoreSegmentDistance(point, float2(-0.38, -0.02), float2(-0.42, 0.22)) - 0.063);
-    distance = min(distance, scoreSegmentDistance(point, float2(-0.42, 0.22), float2(-0.08, 0.39)) - 0.063);
-    distance = min(distance, scoreSegmentDistance(point, float2(-0.08, 0.39), float2(0.42, 0.34)) - 0.063);
-    distance = min(distance, scoreEllipseRing(point, float2(0.08, 0.72), float2(0.34, 0.15), 0.052));
-    return distance;
-}
-
-float scoreBassClefDistance(float2 point) {
-    float distance = scoreEllipseRing(point, float2(-0.18, -0.18), float2(0.49, 0.39), 0.085);
-    distance = min(distance, scoreFilledEllipse(point, float2(-0.47, -0.19), float2(0.14, 0.14)));
-    distance = min(distance, scoreSegmentDistance(point, float2(0.12, -0.01), float2(-0.01, 0.35)) - 0.075);
-    distance = min(distance, scoreSegmentDistance(point, float2(-0.01, 0.35), float2(-0.31, 0.65)) - 0.068);
-    distance = min(distance, scoreFilledEllipse(point, float2(0.55, -0.20), float2(0.075, 0.075)));
-    distance = min(distance, scoreFilledEllipse(point, float2(0.55, 0.20), float2(0.075, 0.075)));
-    return distance;
+float scoreMedian(float3 value) {
+    return max(min(value.r, value.g), min(max(value.r, value.g), value.b));
 }
 
 vertex ScoreVertexOutput scoreVertex(
@@ -80,10 +57,15 @@ vertex ScoreVertexOutput scoreVertex(
     output.screen = pixel;
     output.rectSize = item.rect.zw;
     output.time = uniforms.time;
+    output.atlasUV = mix(item.uv.xy, item.uv.zw, local);
+    output.atlasRect = item.uv;
     return output;
 }
 
-fragment float4 scoreFragment(ScoreVertexOutput input [[stage_in]]) {
+fragment float4 scoreFragment(
+    ScoreVertexOutput input [[stage_in]],
+    texture2d<float> glyphAtlas [[texture(0)]],
+    sampler glyphSampler [[sampler(0)]]) {
     uint kind = uint(input.params.x + 0.5);
     float alpha = input.color.a;
     if (kind == 1) {
@@ -100,11 +82,13 @@ fragment float4 scoreFragment(ScoreVertexOutput input [[stage_in]]) {
         float distance = length((input.local - float2(0.5)) * 2.0);
         float breathing = 0.86 + 0.14 * sin(input.time * 3.2 + input.params.z);
         alpha *= (1.0 - smoothstep(0.15, 1.0, distance)) * breathing;
-    } else if (kind == 4 || kind == 5) {
-        float2 point = (input.local - float2(0.5)) * 2.0;
-        float distance = kind == 4 ? scoreTrebleClefDistance(point) : scoreBassClefDistance(point);
-        float antialias = 2.0 / max(1.0, min(input.rectSize.x, input.rectSize.y));
-        alpha *= 1.0 - smoothstep(-antialias, antialias, distance);
+    } else if (kind == 4) {
+        float4 sample = glyphAtlas.sample(glyphSampler, input.atlasUV);
+        float2 atlasDimensions = float2(glyphAtlas.get_width(), glyphAtlas.get_height());
+        float2 atlasPixels = max((input.atlasRect.zw - input.atlasRect.xy) * atlasDimensions, float2(1.0));
+        float screenScale = max(0.001, min(input.rectSize.x / atlasPixels.x, input.rectSize.y / atlasPixels.y));
+        float screenDistance = (scoreMedian(sample.rgb) - 0.5) * input.params.y * screenScale;
+        alpha *= clamp(screenDistance + 0.5, 0.0, 1.0);
     }
     float grain = (fract(sin(dot(input.screen, float2(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012;
     return float4(clamp(input.color.rgb + float3(grain), float3(0), float3(1)), alpha);

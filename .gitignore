@@ -6,3 +6,4 @@ zig-pkg/
 tests/fixtures/licensed/*
 !tests/fixtures/licensed/.gitkeep
 captures/
+local-content/

@@ -4,7 +4,7 @@ const score = @import("score");
 var app: ?*score.App = null;
 
 pub export fn score_ios_api_version() u32 {
-    return 1;
+    return 2;
 }
 
 pub export fn score_ios_create(width: f32, height: f32, pixel_ratio: f32) bool {
@@ -73,6 +73,18 @@ pub export fn score_ios_draw_count() u32 {
     return @intCast(instance.drawItems().len);
 }
 
+pub export fn score_ios_glyph_atlas_bytes() [*]const u8 {
+    return score.glyph_atlas.pixels.ptr;
+}
+
+pub export fn score_ios_glyph_atlas_width() u32 {
+    return score.glyph_atlas.width;
+}
+
+pub export fn score_ios_glyph_atlas_height() u32 {
+    return score.glyph_atlas.height;
+}
+
 pub export fn score_ios_accessibility_items() ?[*]const score.accessibility.Item {
     const instance = app orelse return null;
     return instance.accessibilityItems().ptr;
@@ -119,6 +131,11 @@ pub export fn score_ios_import(bytes: [*]const u8, length: usize, kind: u32) u32
 pub export fn score_ios_serialize(bytes: [*]u8, capacity: usize) usize {
     const instance = app orelse return 0;
     return instance.serialize(bytes[0..capacity]) catch 0;
+}
+
+pub export fn score_ios_export_musicxml(bytes: [*]u8, capacity: usize) usize {
+    const instance = app orelse return 0;
+    return instance.exportMusicXml(bytes[0..capacity]) catch 0;
 }
 
 pub export fn score_ios_restore(bytes: [*]const u8, length: usize) u32 {
