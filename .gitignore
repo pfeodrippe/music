@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+build/
+zig-pkg/
+.DS_Store
+tests/fixtures/licensed/*
+!tests/fixtures/licensed/.gitkeep
+captures/

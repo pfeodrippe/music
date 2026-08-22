@@ -1,0 +1,105 @@
+const model = @import("model.zig");
+const ui = @import("ui.zig");
+
+pub const max_items = 20;
+
+pub const Role = enum(u32) {
+    document = 0,
+    button = 1,
+    tab = 2,
+};
+
+pub const Flag = struct {
+    pub const selected: u32 = 1 << 0;
+    pub const pressed: u32 = 1 << 1;
+    pub const toggle: u32 = 1 << 2;
+};
+
+pub const Id = struct {
+    pub const document: u32 = 1;
+    pub const input: u32 = 2;
+    pub const save: u32 = 3;
+    pub const import_score: u32 = 4;
+    pub const record: u32 = 5;
+    pub const play: u32 = 6;
+    pub const loop: u32 = 7;
+    pub const metronome: u32 = 8;
+    pub const tempo_down: u32 = 9;
+    pub const tempo_up: u32 = 10;
+    pub const replay: u32 = 11;
+    pub const tool_first: u32 = 20;
+};
+
+pub const Item = extern struct {
+    id: u32,
+    role: Role,
+    rect: [4]f32,
+    label_len: u32,
+    flags: u32,
+    label: [48]u8,
+
+    pub fn labelSlice(self: *const Item) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
+
+pub const Snapshot = struct {
+    items: [max_items]Item = undefined,
+    len: usize = 0,
+
+    pub fn build(self: *Snapshot, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta) void {
+        self.len = 0;
+        const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height);
+        self.add(Id.document, .document, layout.stage, meta.titleSlice(), 0);
+        if (layout.input_quick.width > 0) {
+            self.add(Id.input, .button, layout.input_quick, "Set up music input", 0);
+        } else if (layout.input_setup.width > 0) {
+            self.add(Id.input, .button, layout.input_setup, "Set up music input", 0);
+        }
+        self.add(Id.save, .button, layout.export_score, "Save portable score", 0);
+        self.add(Id.import_score, .button, layout.import_score, "Import score", 0);
+        self.add(Id.record, .button, layout.record, if (transport.recording != 0) "Stop recording" else "Start recording", Flag.toggle | (if (transport.recording != 0) Flag.pressed else 0));
+        self.add(Id.play, .button, layout.play, if (transport.playing != 0) "Pause score" else "Play score", Flag.toggle | (if (transport.playing != 0) Flag.pressed else 0));
+        if (layout.loop_toggle.width > 0) self.add(Id.loop, .button, layout.loop_toggle, "Loop current measure", Flag.toggle | (if (transport.loop_enabled != 0) Flag.pressed else 0));
+        if (layout.metronome_toggle.width > 0) self.add(Id.metronome, .button, layout.metronome_toggle, "Metronome click", Flag.toggle | (if (transport.metronome_enabled != 0) Flag.pressed else 0));
+        if (layout.tempo_minus.width > 0) {
+            self.add(Id.tempo_down, .button, layout.tempo_minus, "Decrease tempo", 0);
+            self.add(Id.tempo_up, .button, layout.tempo_plus, "Increase tempo", 0);
+        }
+        if (layout.replay_take.width > 0) self.add(Id.replay, .button, layout.replay_take, "Replay latest audio and MIDI take", 0);
+        const tool_labels = [_][]const u8{ "Read score", "Edit notes", "Draw annotation", "Practice and assess" };
+        for (layout.tool_buttons, 0..) |button, index| {
+            const flags = if (index == @intFromEnum(state.tool)) Flag.selected else 0;
+            self.add(Id.tool_first + @as(u32, @intCast(index)), .tab, button, tool_labels[index], flags);
+        }
+    }
+
+    fn add(self: *Snapshot, id: u32, role: Role, rect: ui.Rect, label: []const u8, flags: u32) void {
+        if (self.len == self.items.len or rect.width <= 0 or rect.height <= 0) return;
+        var item = Item{
+            .id = id,
+            .role = role,
+            .rect = .{ rect.x, rect.y, rect.width, rect.height },
+            .label_len = @intCast(@min(label.len, 48)),
+            .flags = flags,
+            .label = [_]u8{0} ** 48,
+        };
+        @memcpy(item.label[0..item.label_len], label[0..item.label_len]);
+        self.items[self.len] = item;
+        self.len += 1;
+    }
+};
+
+test "accessibility snapshot mirrors responsive GPU controls" {
+    var snapshot: Snapshot = .{};
+    var state = model.UiState{ .viewport_width = 1280, .viewport_height = 800 };
+    var transport: model.Transport = .{};
+    var meta: model.DocumentMeta = .{};
+    meta.setTitle("Accessible score");
+    snapshot.build(&state, &transport, &meta);
+    try @import("std").testing.expect(snapshot.len >= 12);
+    try @import("std").testing.expectEqualStrings("Accessible score", snapshot.items[0].labelSlice());
+    state.viewport_width = 390;
+    snapshot.build(&state, &transport, &meta);
+    try @import("std").testing.expect(snapshot.len >= 8);
+}

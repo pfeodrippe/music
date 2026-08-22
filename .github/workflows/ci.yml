@@ -1,0 +1,85 @@
+name: score-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  portable-native-web-ios:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pinned Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          machine="$(uname -m)"
+          case "$machine" in
+            arm64) zig_arch="aarch64" ;;
+            x86_64) zig_arch="x86_64" ;;
+            *) echo "Unsupported runner architecture: $machine" >&2; exit 1 ;;
+          esac
+          archive="zig-${zig_arch}-macos-0.16.0.tar.xz"
+          curl --fail --location --silent --show-error "https://ziglang.org/download/0.16.0/${archive}" --output "$RUNNER_TEMP/${archive}"
+          tar -xf "$RUNNER_TEMP/${archive}" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-${zig_arch}-macos-0.16.0" >> "$GITHUB_PATH"
+
+      - name: Verify portable core and native Metal package
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig version
+          test "$(zig version)" = "0.16.0"
+          zig build test
+          zig build -Doptimize=ReleaseSafe
+          zig build macos-bundle -Doptimize=ReleaseSafe
+          test -x zig-out/Score.app/Contents/MacOS/score
+          codesign --verify --deep --strict zig-out/Score.app
+
+      - name: Build iOS portable core
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build ios-core
+          zig build ios-app
+          test -f zig-out/lib/libscore-ios-core.a
+          test -f zig-out/include/score_ios.h
+          test -x build/ios/Score.app/Score
+
+      - name: Install pinned Emscripten 4.0.20 and build WebGPU export
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --depth 1 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+          "$RUNNER_TEMP/emsdk/emsdk" install 4.0.20
+          "$RUNNER_TEMP/emsdk/emsdk" activate 4.0.20
+          source "$RUNNER_TEMP/emsdk/emsdk_env.sh"
+          emcc --version | head -1 | rg " 4\\.0\\.20(-git)?$"
+          zig build web
+          test -f build/web/score.wasm
+          test -f build/web/audio_dsp.wasm
+          if rg -n "getContext\\([\"'](2d|webgl|webgl2)[\"']" src; then
+            echo "A forbidden browser renderer fallback was introduced" >&2
+            exit 1
+          fi
+
+      - name: Package CI artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent zig-out/Score.app Score-macos.zip
+          tar -czf Score-webgpu.tar.gz -C build/web .
+          tar -czf Score-ios-core.tar.gz -C zig-out lib/libscore-ios-core.a include/score_ios.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: score-${{ github.sha }}
+          path: |
+            Score-macos.zip
+            Score-webgpu.tar.gz
+            Score-ios-core.tar.gz
+          if-no-files-found: error

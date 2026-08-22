@@ -1,0 +1,29 @@
+.{
+    .name = .score,
+    .version = "0.1.0",
+    .fingerprint = 0x329937514fe0561b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zgpu = .{
+            .url = "https://github.com/zig-gamedev/zgpu/archive/e6d8103b3c34ce1d6aab4db86dedf9ac889b4e67.tar.gz",
+            .hash = "zgpu-0.12.0-dev-nqFT5DSoCACIu3-Gnwlg3Gv1if5vU5RBhpk8o6r6-vqk",
+        },
+        .zglfw = .{
+            .url = "https://github.com/zig-gamedev/zglfw/archive/f04fdbfc5b6d8c9a12025013992ac1d48653931e.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNNu5IQAk-UK7gIg0LWMmMzxj4sK9xCSTisLhjgI1",
+        },
+        .dawn_aarch64_macos = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-aarch64-macos/archive/d2360cdfff0cf4a780cb77aa47c57aca03cc6dfe.tar.gz",
+            .hash = "N-V-__8AALVIRAIf5nfpx8-4mEo2RGsynVryPQPcHk95qFM5",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor/flecs/distr",
+        "README.md",
+        "LICENSE",
+    },
+}
