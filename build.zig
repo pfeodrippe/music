@@ -27,6 +27,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addFlecs(b, score);
+    const sfizz_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-sfizz.sh" });
+    const sfizz_step = b.step("sfizz", "Build the native streaming SFZ sampler engine");
+    sfizz_step.dependOn(&sfizz_cmd.step);
 
     const diagnostic = b.addExecutable(.{
         .name = "score-diagnostic",
@@ -38,6 +41,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(diagnostic);
+
+    if (optimize == .Debug) {
+        const dev_controller = b.addExecutable(.{
+            .name = "score-devctl",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tools/dev_control.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        dev_controller.root_module.link_libc = true;
+        b.installArtifact(dev_controller);
+    }
 
     const audio_analyzer = b.addExecutable(.{
         .name = "score-audio-analyze",
@@ -54,6 +70,52 @@ pub fn build(b: *std.Build) void {
     const audio_analyzer_step = b.step("audio-analyze", "Analyze a local WAV and optionally compare it with MusicXML/MXL");
     audio_analyzer_step.dependOn(&audio_analyzer_run.step);
 
+    const sampler_module = b.createModule(.{
+        .root_source_file = b.path("src/platform/native/sfizz_sampler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "score", .module = score }},
+    });
+    const sampler_renderer = b.addExecutable(.{
+        .name = "score-sampler-render",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/render_sampler.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "score", .module = score },
+                .{ .name = "sfizz_sampler", .module = sampler_module },
+            },
+        }),
+    });
+    sampler_renderer.step.dependOn(&sfizz_cmd.step);
+    b.installArtifact(sampler_renderer);
+    const sampler_renderer_run = b.addRunArtifact(sampler_renderer);
+    sampler_renderer_run.step.dependOn(&sfizz_cmd.step);
+    if (b.args) |args| sampler_renderer_run.addArgs(args);
+    const sampler_renderer_step = b.step("sampler-render", "Render an offline SFZ grand-piano verification WAV");
+    sampler_renderer_step.dependOn(&sampler_renderer_run.step);
+
+    const sampler_verifier = b.addExecutable(.{
+        .name = "score-sampler-verify",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/verify_sampler.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "score", .module = score },
+                .{ .name = "sfizz_sampler", .module = sampler_module },
+            },
+        }),
+    });
+    sampler_verifier.step.dependOn(&sfizz_cmd.step);
+    b.installArtifact(sampler_verifier);
+    const sampler_verifier_run = b.addRunArtifact(sampler_verifier);
+    sampler_verifier_run.step.dependOn(&sfizz_cmd.step);
+    if (b.args) |args| sampler_verifier_run.addArgs(args);
+    const sampler_verifier_step = b.step("sampler-verify", "Run offline grand-piano dynamics, pedal, overload, and queue gates");
+    sampler_verifier_step.dependOn(&sampler_verifier_run.step);
+
     const native = b.addExecutable(.{
         .name = "score",
         .root_module = b.createModule(.{
@@ -63,6 +125,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "score", .module = score }},
         }),
     });
+    native.step.dependOn(&sfizz_cmd.step);
     const build_options = b.addOptions();
     build_options.addOption(bool, "hot_reload", optimize == .Debug);
     native.root_module.addOptions("build_options", build_options);
@@ -95,6 +158,7 @@ pub fn build(b: *std.Build) void {
     const bundle_step = b.step("macos-bundle", "Build an ad-hoc signed native macOS app bundle");
     const bundle_cmd = b.addSystemCommand(&.{ "sh", "scripts/bundle-macos.sh" });
     bundle_cmd.step.dependOn(b.getInstallStep());
+    bundle_cmd.step.dependOn(&sfizz_cmd.step);
     bundle_step.dependOn(&bundle_cmd.step);
 
     const systems_plugin = b.addLibrary(.{
@@ -113,11 +177,13 @@ pub fn build(b: *std.Build) void {
 
     const run_native_cmd = b.addRunArtifact(native);
     run_native_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_native_cmd.addArgs(args);
     const native_step = b.step("native", "Run the native WebGPU application");
     native_step.dependOn(&run_native_cmd.step);
 
     const dev_step = b.step("dev", "Run native app and rebuild hot-reloadable systems on change");
     const dev_cmd = b.addSystemCommand(&.{ "sh", "scripts/dev-native.sh" });
+    if (b.args) |args| dev_cmd.addArgs(args);
     dev_step.dependOn(&dev_cmd.step);
 
     const run_cmd = b.addRunArtifact(diagnostic);

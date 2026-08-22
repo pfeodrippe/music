@@ -1,7 +1,7 @@
 const model = @import("model.zig");
 const ui = @import("ui.zig");
 
-pub const max_items = 24;
+pub const max_items = 28;
 
 pub const Role = enum(u32) {
     document = 0,
@@ -32,7 +32,12 @@ pub const Id = struct {
     pub const library_close: u32 = 14;
     pub const library_first: u32 = 15;
     pub const vocal_guide: u32 = 17;
+    pub const pedal_guide: u32 = 18;
+    pub const export_take: u32 = 19;
     pub const tool_first: u32 = 20;
+    pub const page_previous: u32 = 24;
+    pub const page_next: u32 = 25;
+    pub const tempo_value: u32 = 26;
 };
 
 pub const Item = extern struct {
@@ -68,7 +73,7 @@ pub const Snapshot = struct {
         } else if (layout.input_setup.width > 0) {
             self.add(Id.input, .button, layout.input_setup, "Set up music input", 0);
         }
-        self.add(Id.save, .button, layout.export_score, "Export MusicXML score", 0);
+        self.add(Id.save, .button, layout.export_score, "Export score or MIDI", 0);
         self.add(Id.import_score, .button, layout.import_score, "Import score", 0);
         self.add(Id.record, .button, layout.record, if (transport.recording != 0) "Stop recording" else "Start recording", Flag.toggle | (if (transport.recording != 0) Flag.pressed else 0));
         self.add(Id.play, .button, layout.play, if (transport.playing != 0) "Pause score" else "Play score", Flag.toggle | (if (transport.playing != 0) Flag.pressed else 0));
@@ -76,11 +81,16 @@ pub const Snapshot = struct {
         if (layout.metronome_toggle.width > 0) self.add(Id.metronome, .button, layout.metronome_toggle, "Metronome click", Flag.toggle | (if (transport.metronome_enabled != 0) Flag.pressed else 0));
         self.add(Id.keyboard, .button, layout.keyboard_toggle, if (state.keyboard_visible != 0) "Hide guided piano keyboard" else "Show guided piano keyboard", Flag.toggle | (if (state.keyboard_visible != 0) Flag.pressed else 0));
         if (layout.vocal_guide_toggle.width > 0) self.add(Id.vocal_guide, .button, layout.vocal_guide_toggle, if (state.vocal_guide_visible != 0) "Hide vocal guide" else "Show vocal guide", Flag.toggle | (if (state.vocal_guide_visible != 0) Flag.pressed else 0));
+        if (layout.pedal_guide_toggle.width > 0) self.add(Id.pedal_guide, .button, layout.pedal_guide_toggle, if (state.pedal_guide_visible != 0) "Hide pedal guidance" else "Show pedal guidance", Flag.toggle | (if (state.pedal_guide_visible != 0) Flag.pressed else 0));
         if (layout.tempo_minus.width > 0) {
             self.add(Id.tempo_down, .button, layout.tempo_minus, "Decrease tempo", 0);
             self.add(Id.tempo_up, .button, layout.tempo_plus, "Increase tempo", 0);
         }
+        self.add(Id.tempo_value, .button, layout.tempo_value, if (state.tempo_editing != 0) "Editing tempo; type 30 to 240 and press Enter" else "Edit tempo", 0);
         if (layout.replay_take.width > 0) self.add(Id.replay, .button, layout.replay_take, "Replay latest audio and MIDI take", 0);
+        if (layout.export_take.width > 0) self.add(Id.export_take, .button, layout.export_take, "Export latest MIDI take", 0);
+        self.add(Id.page_previous, .button, layout.page_previous, "Previous score page", 0);
+        self.add(Id.page_next, .button, layout.page_next, "Next score page", 0);
         const tool_labels = [_][]const u8{ "Read score", "Edit notes", "Draw annotation", "Practice and assess" };
         for (layout.tool_buttons, 0..) |button, index| {
             const flags = if (index == @intFromEnum(state.tool)) Flag.selected else 0;
@@ -113,6 +123,14 @@ test "accessibility snapshot mirrors responsive GPU controls" {
     snapshot.build(&state, &transport, &meta);
     try @import("std").testing.expect(snapshot.len >= 12);
     try @import("std").testing.expectEqualStrings("Accessible score", snapshot.items[0].labelSlice());
+    var found_previous_page = false;
+    var found_next_page = false;
+    for (snapshot.items[0..snapshot.len]) |item| {
+        found_previous_page = found_previous_page or item.id == Id.page_previous;
+        found_next_page = found_next_page or item.id == Id.page_next;
+    }
+    try @import("std").testing.expect(found_previous_page);
+    try @import("std").testing.expect(found_next_page);
     state.viewport_width = 390;
     snapshot.build(&state, &transport, &meta);
     try @import("std").testing.expect(snapshot.len >= 8);

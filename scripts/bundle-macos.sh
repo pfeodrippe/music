@@ -4,13 +4,15 @@ set -eu
 bundle="zig-out/Score.app"
 contents="$bundle/Contents"
 resources="$contents/Resources"
+frameworks="$contents/Frameworks"
 icon_source="src/platform/web/icons/score-icon-1024.png"
 icon_workspace="$(mktemp -d)"
 trap 'rm -rf "$icon_workspace"' EXIT INT TERM
 iconset="$icon_workspace/Score.iconset"
 
-mkdir -p "$contents/MacOS" "$resources" "$iconset"
+mkdir -p "$contents/MacOS" "$resources" "$frameworks" "$iconset"
 cp zig-out/bin/score "$contents/MacOS/score"
+cp zig-out/lib/libsfizz.dylib "$frameworks/libsfizz.dylib"
 cp packaging/macos/Info.plist "$contents/Info.plist"
 
 for size in 16 32 128 256 512; do

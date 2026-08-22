@@ -9,8 +9,10 @@ pub const gpu = @import("platform/gpu.zig");
 pub const hot_reload = @import("hot_reload/abi.zig");
 pub const musicxml = @import("core/import/musicxml.zig");
 pub const musicxml_export = @import("core/export/musicxml.zig");
+pub const midi_export = @import("core/export/midi.zig");
 pub const midi = @import("core/import/midi.zig");
 pub const mxl = @import("core/import/mxl.zig");
+pub const mxl_export = @import("core/export/mxl.zig");
 pub const playback = @import("core/playback/timeline.zig");
 pub const command = @import("core/command.zig");
 pub const annotation = @import("core/annotation.zig");
@@ -21,6 +23,7 @@ pub const pitch = @import("audio/pitch.zig");
 pub const wav = @import("audio/wav.zig");
 pub const transcribe = @import("audio/transcribe.zig");
 pub const instrument = @import("audio/instrument.zig");
+pub const audio_quality = @import("audio/quality.zig");
 
 test {
     _ = @import("core/app.zig");
@@ -33,8 +36,10 @@ test {
     _ = @import("hot_reload/abi.zig");
     _ = @import("core/import/musicxml.zig");
     _ = @import("core/export/musicxml.zig");
+    _ = @import("core/export/midi.zig");
     _ = @import("core/import/midi.zig");
     _ = @import("core/import/mxl.zig");
+    _ = @import("core/export/mxl.zig");
     _ = @import("core/playback/timeline.zig");
     _ = @import("core/command.zig");
     _ = @import("core/annotation.zig");
@@ -45,4 +50,5 @@ test {
     _ = @import("audio/wav.zig");
     _ = @import("audio/transcribe.zig");
     _ = @import("audio/instrument.zig");
+    _ = @import("audio/quality.zig");
 }

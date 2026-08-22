@@ -46,7 +46,17 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     );
     let item = items[instance_index];
     let local = corners[vertex_index];
-    let pixel = item.rect.xy + local * item.rect.zw;
+    let kind = u32(item.params.x + 0.5);
+    var pixel = item.rect.xy + local * item.rect.zw;
+    var rect_size = item.rect.zw;
+    if (kind == 5u) {
+        let delta = item.rect.zw - item.rect.xy;
+        let segment_length = max(length(delta), 0.0001);
+        let direction = delta / segment_length;
+        let normal = vec2f(-direction.y, direction.x);
+        pixel = item.rect.xy + direction * (local.x * segment_length) + normal * ((local.y - 0.5) * item.params.y);
+        rect_size = vec2f(segment_length, item.params.y);
+    }
     let ndc = vec2f(
         pixel.x / globals.viewport.x * 2.0 - 1.0,
         1.0 - pixel.y / globals.viewport.y * 2.0
@@ -57,7 +67,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     output.color = item.color;
     output.params = item.params;
     output.screen = pixel;
-    output.rect_size = item.rect.zw;
+    output.rect_size = rect_size;
     output.atlas_uv = mix(item.uv.xy, item.uv.zw, local);
     output.atlas_rect = item.uv;
     return output;
@@ -92,3 +102,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let grain = (fract(sin(dot(input.screen, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5) * 0.012;
     return vec4f(clamp(input.color.rgb + vec3f(grain), vec3f(0.0), vec3f(1.0)), alpha);
 }
+
+// Native development reloads this WGSL pipeline without restarting the world.

@@ -3,6 +3,15 @@ const std = @import("std");
 pub const target_sample_rate: u32 = 8_000;
 pub const feature_hz: u32 = 4;
 pub const max_candidates: usize = 6;
+pub const max_tempo_candidates: usize = 5;
+const tempo_sample_rate: u32 = 44_100;
+const onset_fft_size: usize = 4_096;
+const onset_hop: usize = 512;
+
+pub const TempoCandidate = struct {
+    bpm: f32,
+    relative_score: f32,
+};
 
 pub const FeatureFrame = struct {
     time_seconds: f32,
@@ -18,6 +27,8 @@ pub const Analysis = struct {
     duration_seconds: f32,
     estimated_tempo_bpm: f32,
     tempo_confidence: f32,
+    tempo_candidate_count: u8,
+    tempo_candidates: [max_tempo_candidates]TempoCandidate,
     frames: []FeatureFrame,
     onsets: []f32,
     allocator: std.mem.Allocator,
@@ -33,32 +44,14 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
     if (source.len == 0 or source_rate < 4_000) return error.InvalidAudio;
     const samples = try resample(allocator, source, source_rate, target_sample_rate);
     defer allocator.free(samples);
+    const tempo_samples = try resample(allocator, source, source_rate, tempo_sample_rate);
+    defer allocator.free(tempo_samples);
     const duration = @as(f32, @floatFromInt(samples.len)) / @as(f32, @floatFromInt(target_sample_rate));
 
-    const onset_hop: usize = target_sample_rate / 100;
-    const onset_window: usize = target_sample_rate / 50;
-    const envelope_len = if (samples.len <= onset_window) 1 else (samples.len - onset_window) / onset_hop + 1;
-    const envelope = try allocator.alloc(f32, envelope_len);
+    const envelope = try spectralFluxEnvelope(allocator, tempo_samples);
     defer allocator.free(envelope);
-    var previous_energy: f32 = 0;
     var envelope_mean: f32 = 0;
-    for (envelope, 0..) |*value, index| {
-        const start = @min(index * onset_hop, samples.len -| 1);
-        const end = @min(start + onset_window, samples.len);
-        var energy: f32 = 0;
-        var high_pass: f32 = 0;
-        var previous: f32 = samples[start];
-        for (samples[start..end]) |sample| {
-            energy += sample * sample;
-            const delta = sample - previous;
-            high_pass += delta * delta;
-            previous = sample;
-        }
-        energy = @log(1.0 + 500.0 * (energy + 0.35 * high_pass) / @as(f32, @floatFromInt(@max(1, end - start))));
-        value.* = @max(0, energy - previous_energy);
-        previous_energy = energy;
-        envelope_mean += value.*;
-    }
+    for (envelope) |value| envelope_mean += value;
     envelope_mean /= @as(f32, @floatFromInt(envelope.len));
     var variance: f32 = 0;
     for (envelope) |value| variance += (value - envelope_mean) * (value - envelope_mean);
@@ -69,13 +62,14 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
     var last_onset: f32 = -10;
     for (envelope, 0..) |value, index| {
         if (index == 0 or index + 1 == envelope.len) continue;
-        const time = @as(f32, @floatFromInt(index * onset_hop)) / @as(f32, @floatFromInt(target_sample_rate));
+        const time = @as(f32, @floatFromInt(index * onset_hop)) / @as(f32, @floatFromInt(tempo_sample_rate));
         if (value > envelope_mean + 0.72 * envelope_std and value >= envelope[index - 1] and value > envelope[index + 1] and time - last_onset >= 0.065) {
             try onset_list.append(allocator, time);
             last_onset = time;
         }
     }
-    const tempo = if (onset_list.items.len >= 4) estimateTempo(envelope, 100, envelope_mean) else Tempo{ .bpm = 0, .confidence = 0 };
+    const envelope_rate = @as(f32, @floatFromInt(tempo_sample_rate)) / @as(f32, @floatFromInt(onset_hop));
+    const tempo = if (onset_list.items.len >= 4) estimateTempo(envelope, envelope_rate, envelope_mean) else Tempo{ .bpm = 0, .confidence = 0 };
 
     const frame_hop: usize = target_sample_rate / feature_hz;
     const window_size: usize = 1024;
@@ -148,9 +142,10 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
         if (chroma_total > 0) {
             for (&chroma) |*value| value.* /= chroma_total;
         }
-        const envelope_index = @min(envelope.len - 1, center / onset_hop);
+        const frame_time = @as(f32, @floatFromInt(center)) / @as(f32, @floatFromInt(target_sample_rate));
+        const envelope_index = @min(envelope.len - 1, @as(usize, @intFromFloat(frame_time * envelope_rate)));
         frame.* = .{
-            .time_seconds = @as(f32, @floatFromInt(center)) / @as(f32, @floatFromInt(target_sample_rate)),
+            .time_seconds = frame_time,
             .rms = rms,
             .onset_strength = envelope[envelope_index],
             .bass_pitch = bass_pitch,
@@ -164,6 +159,8 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
         .duration_seconds = duration,
         .estimated_tempo_bpm = tempo.bpm,
         .tempo_confidence = tempo.confidence,
+        .tempo_candidate_count = tempo.candidate_count,
+        .tempo_candidates = tempo.candidates,
         .frames = frames,
         .onsets = try onset_list.toOwnedSlice(allocator),
         .allocator = allocator,
@@ -184,6 +181,74 @@ fn resample(allocator: std.mem.Allocator, source: []const f32, source_rate: u32,
     return output;
 }
 
+fn spectralFluxEnvelope(allocator: std.mem.Allocator, samples: []const f32) ![]f32 {
+    const frame_count = if (samples.len <= onset_fft_size) 1 else (samples.len - onset_fft_size) / onset_hop + 1;
+    const envelope = try allocator.alloc(f32, frame_count);
+    errdefer allocator.free(envelope);
+    var previous = [_]f32{0} ** (onset_fft_size / 2 + 1);
+    var real: [onset_fft_size]f32 = undefined;
+    var imaginary = [_]f32{0} ** onset_fft_size;
+    for (envelope, 0..) |*flux, frame_index| {
+        const start = @min(frame_index * onset_hop, samples.len -| 1);
+        var energy: f32 = 0;
+        for (&real, 0..) |*value, offset| {
+            const sample = if (start + offset < samples.len) samples[start + offset] else 0;
+            const phase = @as(f32, @floatFromInt(offset)) / @as(f32, @floatFromInt(onset_fft_size - 1));
+            value.* = sample * (0.5 - 0.5 * @cos(std.math.tau * phase));
+            energy += sample * sample;
+        }
+        @memset(&imaginary, 0);
+        fft(&real, &imaginary);
+        flux.* = 0;
+        const rms = @sqrt(energy / onset_fft_size);
+        for (previous[1..], 1..) |*old, bin| {
+            const magnitude = if (rms < 0.0003) 0 else @log(1.0 + 10.0 * @sqrt(real[bin] * real[bin] + imaginary[bin] * imaginary[bin]));
+            flux.* += @max(0, magnitude - old.*);
+            old.* = magnitude;
+        }
+    }
+    return envelope;
+}
+
+fn fft(real: *[onset_fft_size]f32, imaginary: *[onset_fft_size]f32) void {
+    var target: usize = 0;
+    for (1..onset_fft_size) |index| {
+        var bit = onset_fft_size >> 1;
+        while ((target & bit) != 0) : (bit >>= 1) target ^= bit;
+        target ^= bit;
+        if (index < target) {
+            std.mem.swap(f32, &real[index], &real[target]);
+            std.mem.swap(f32, &imaginary[index], &imaginary[target]);
+        }
+    }
+    var width: usize = 2;
+    while (width <= onset_fft_size) : (width <<= 1) {
+        const angle = -std.math.tau / @as(f32, @floatFromInt(width));
+        const step_real = @cos(angle);
+        const step_imaginary = @sin(angle);
+        var block: usize = 0;
+        while (block < onset_fft_size) : (block += width) {
+            var weight_real: f32 = 1;
+            var weight_imaginary: f32 = 0;
+            for (0..width / 2) |offset| {
+                const even = block + offset;
+                const odd = even + width / 2;
+                const odd_real = real[odd] * weight_real - imaginary[odd] * weight_imaginary;
+                const odd_imaginary = real[odd] * weight_imaginary + imaginary[odd] * weight_real;
+                const even_real = real[even];
+                const even_imaginary = imaginary[even];
+                real[even] = even_real + odd_real;
+                imaginary[even] = even_imaginary + odd_imaginary;
+                real[odd] = even_real - odd_real;
+                imaginary[odd] = even_imaginary - odd_imaginary;
+                const next_weight_real = weight_real * step_real - weight_imaginary * step_imaginary;
+                weight_imaginary = weight_real * step_imaginary + weight_imaginary * step_real;
+                weight_real = next_weight_real;
+            }
+        }
+    }
+}
+
 fn midiFrequency(pitch: u8) f32 {
     return 440.0 * std.math.pow(f32, 2.0, (@as(f32, @floatFromInt(pitch)) - 69.0) / 12.0);
 }
@@ -201,24 +266,69 @@ fn goertzel(samples: []const f32, frequency: f32, sample_rate: u32) f32 {
     return @max(0, s1 * s1 + s2 * s2 - coefficient * s1 * s2) / @as(f32, @floatFromInt(samples.len * samples.len));
 }
 
-const Tempo = struct { bpm: f32, confidence: f32 };
+const Tempo = struct {
+    bpm: f32,
+    confidence: f32,
+    candidate_count: u8 = 0,
+    candidates: [max_tempo_candidates]TempoCandidate = [_]TempoCandidate{.{ .bpm = 0, .relative_score = 0 }} ** max_tempo_candidates,
+};
 
-fn estimateTempo(envelope: []const f32, envelope_rate: u32, mean: f32) Tempo {
-    var best_bpm: u32 = 60;
-    var best_score: f32 = 0;
-    var total_score: f32 = 0;
-    for (45..181) |bpm| {
-        const lag = @max(1, envelope_rate * 60 / bpm);
-        if (lag >= envelope.len) continue;
+fn estimateTempo(envelope: []const f32, envelope_rate: f32, mean: f32) Tempo {
+    const minimum_bpm: u32 = 45;
+    const maximum_bpm: u32 = 180;
+    var scores = [_]f32{0} ** (maximum_bpm - minimum_bpm + 1);
+    for (minimum_bpm..maximum_bpm + 1) |bpm| {
+        const lag = envelope_rate * 60 / @as(f32, @floatFromInt(bpm));
+        const lag_floor: usize = @intFromFloat(@floor(lag));
+        if (lag_floor + 1 >= envelope.len) continue;
+        const fraction = lag - @as(f32, @floatFromInt(lag_floor));
         var score: f32 = 0;
-        for (lag..envelope.len) |index| score += @max(0, envelope[index] - mean) * @max(0, envelope[index - lag] - mean);
-        total_score += score;
-        if (score > best_score) {
-            best_score = score;
-            best_bpm = @intCast(bpm);
+        for (lag_floor + 1..envelope.len) |index| {
+            const previous = envelope[index - lag_floor - 1] * fraction + envelope[index - lag_floor] * (1 - fraction);
+            score += @max(0, envelope[index] - mean) * @max(0, previous - mean);
         }
+        scores[bpm - minimum_bpm] = score;
     }
-    return .{ .bpm = @floatFromInt(best_bpm), .confidence = if (total_score > 0) std.math.clamp(best_score * 136.0 / total_score, 0, 1) else 0 };
+
+    var result: Tempo = .{ .bpm = 0, .confidence = 0 };
+    var candidate_scores = [_]f32{0} ** max_tempo_candidates;
+    while (result.candidate_count < max_tempo_candidates) {
+        var best_index: ?usize = null;
+        var best_score: f32 = 0;
+        for (scores, 0..) |score, index| {
+            if (score <= 0) continue;
+            if (index > 0 and score < scores[index - 1]) continue;
+            if (index + 1 < scores.len and score <= scores[index + 1]) continue;
+            const bpm: i32 = @intCast(index + minimum_bpm);
+            var separated = true;
+            for (result.candidates[0..result.candidate_count]) |candidate| {
+                if (@abs(@as(f32, @floatFromInt(bpm)) - candidate.bpm) < 4) separated = false;
+            }
+            if (separated and score > best_score) {
+                best_score = score;
+                best_index = index;
+            }
+        }
+        const index = best_index orelse break;
+        const slot = result.candidate_count;
+        result.candidates[slot] = .{ .bpm = @floatFromInt(index + minimum_bpm), .relative_score = best_score };
+        candidate_scores[slot] = best_score;
+        result.candidate_count += 1;
+        scores[index] = -1;
+    }
+    if (result.candidate_count == 0) return result;
+    result.bpm = result.candidates[0].bpm;
+    const best_score = candidate_scores[0];
+    for (result.candidates[0..result.candidate_count]) |*candidate| candidate.relative_score /= best_score;
+    if (result.candidate_count == 1) {
+        result.confidence = 1;
+    } else {
+        // Confidence is separation from the next distinct tempo peak. It is
+        // intentionally low for half/double-time ambiguity instead of being
+        // inflated by the total number of BPM bins searched.
+        result.confidence = std.math.clamp(1.0 - candidate_scores[1] / best_score, 0, 1);
+    }
+    return result;
 }
 
 test "analysis finds a sustained A4 candidate" {
@@ -233,4 +343,23 @@ test "analysis finds a sustained A4 candidate" {
         found = true;
     };
     try std.testing.expect(found);
+}
+
+test "tempo estimator handles distinct song pulses" {
+    var envelope = [_]f32{0} ** 2_000;
+    for ([_]u32{ 90, 147 }) |expected_bpm| {
+        @memset(&envelope, 0);
+        var pulse: usize = 0;
+        var pulse_count: usize = 0;
+        while (true) : (pulse += 1) {
+            const index: usize = @intFromFloat(@round(@as(f32, @floatFromInt(pulse * 100 * 60)) / @as(f32, @floatFromInt(expected_bpm))));
+            if (index >= envelope.len) break;
+            envelope[index] = 1;
+            pulse_count += 1;
+        }
+        const mean = @as(f32, @floatFromInt(pulse_count)) / @as(f32, @floatFromInt(envelope.len));
+        const tempo = estimateTempo(&envelope, 100, mean);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expected_bpm)), tempo.bpm, 1);
+        try std.testing.expect(tempo.candidate_count >= 1);
+    }
 }

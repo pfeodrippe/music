@@ -83,6 +83,22 @@ labeled a review aid rather than an authoritative automatic transcription.
 The tool does not download streaming audio; keep private recordings and reports
 under the ignored `local-content/` tree.
 
+On macOS, an authorized browser or application stream can be captured through
+an installed **BlackHole 16ch** loopback device and analyzed with one command:
+
+```sh
+scripts/capture-browser-reference.sh local-content/reference/song.wav \
+  --duration 60 --score local-content/reference/song.mxl
+```
+
+Start playback when the command prints `CAPTURE READY`. The helper discovers
+BlackHole's current AVFoundation index, records lossless 24-bit PCM, and always
+restores the previous macOS output device—even if capture is interrupted. It
+allows audio applications to follow the output-device change, rejects silent
+captures before analysis, and refuses to overwrite an existing recording. Use
+it only for audio you may analyze and keep private captures under the ignored
+`local-content/` tree.
+
 ## Architecture
 
 ```text

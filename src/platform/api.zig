@@ -12,6 +12,7 @@ pub const HostRequest = enum(u32) {
     choose_midi,
     choose_microphone,
     export_score,
+    export_take,
     start_recording,
     stop_recording,
     replay_take,

@@ -60,10 +60,31 @@ const char *score_save_score_panel(void) {
     selected_path[0] = '\0';
     @autoreleasepool {
         NSSavePanel *panel = [NSSavePanel savePanel];
-        panel.title = @"Export MusicXML score";
-        panel.message = @"MusicXML opens in MuseScore and other notation software.";
+        panel.title = @"Export score or MIDI performance";
+        panel.message = @"Use MusicXML for notation exchange, MIDI for DAWs and instruments, or Score for a complete editable session.";
         panel.nameFieldStringValue = @"score.musicxml";
-        panel.allowedFileTypes = @[@"musicxml", @"xml"];
+        panel.allowedFileTypes = @[@"musicxml", @"xml", @"mxl", @"mid", @"midi", @"score"];
+        panel.canCreateDirectories = YES;
+        if ([panel runModal] == NSModalResponseOK) {
+            const char *path = panel.URL.fileSystemRepresentation;
+            if (path != NULL) {
+                strncpy(selected_path, path, sizeof(selected_path) - 1);
+                selected_path[sizeof(selected_path) - 1] = '\0';
+            }
+        }
+    }
+    return selected_path;
+}
+
+const char *score_save_take_panel(void) {
+    static char selected_path[4096];
+    selected_path[0] = '\0';
+    @autoreleasepool {
+        NSSavePanel *panel = [NSSavePanel savePanel];
+        panel.title = @"Export recorded MIDI take";
+        panel.message = @"Exports the captured performance timing, velocity, channels, and controller movements.";
+        panel.nameFieldStringValue = @"latest-take.mid";
+        panel.allowedFileTypes = @[@"mid", @"midi"];
         panel.canCreateDirectories = YES;
         if ([panel runModal] == NSModalResponseOK) {
             const char *path = panel.URL.fileSystemRepresentation;

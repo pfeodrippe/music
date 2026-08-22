@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 12;
 pub const max_query_terms = 8;
 
 pub const ComponentKey = enum(u32) {
@@ -11,6 +11,7 @@ pub const ComponentKey = enum(u32) {
     annotation = 5,
     capture_state = 6,
     document_meta = 7,
+    playback_bounds = 8,
 };
 
 pub const Access = enum(u32) { read, write, read_write, none };
@@ -43,11 +44,38 @@ pub const FrameContext = extern struct {
     note_count: u32,
     lyrics: *const anyopaque,
     lyric_count: u32,
+    harmonies: *const anyopaque,
+    harmony_count: u32,
+    pedals: *const anyopaque,
+    pedal_count: u32,
+    measures: *const anyopaque,
+    measure_count: u32,
     annotations: *const anyopaque,
     time_seconds: f32,
 };
 
 pub const DrawCallback = *const fn (*FrameContext) callconv(.c) void;
+
+/// A development-only command boundary into the hot module. The long-lived
+/// host owns every pointer; the plugin may mutate the session components and
+/// the fixed-size note snapshot during this call only. The host copies note
+/// edits back into Flecs before returning a response to the local controller.
+pub const DevCommandContext = extern struct {
+    command: [*]const u8,
+    command_len: u32,
+    response: [*]u8,
+    response_capacity: u32,
+    response_len: u32,
+    transport: *anyopaque,
+    ui_state: *anyopaque,
+    practice: *anyopaque,
+    document_meta: *anyopaque,
+    playback_bounds: *anyopaque,
+    notes: *anyopaque,
+    note_count: u32,
+};
+
+pub const DevCommandCallback = *const fn (*DevCommandContext) callconv(.c) void;
 
 pub const SystemDescriptor = extern struct {
     stable_id: u64,
@@ -61,9 +89,11 @@ pub const SystemDescriptor = extern struct {
 pub const PluginDescriptor = extern struct {
     abi: u32,
     generation: u32,
+    glyph_atlas_hash: u64,
     systems: [*]const SystemDescriptor,
     system_count: u32,
     draw: ?DrawCallback,
+    dev_command: ?DevCommandCallback,
 };
 
 pub fn compatible(descriptor: *const PluginDescriptor) bool {
@@ -75,9 +105,11 @@ test "hot reload ABI rejects mismatched modules" {
     var descriptor = PluginDescriptor{
         .abi = abi_version + 1,
         .generation = 1,
+        .glyph_atlas_hash = 0,
         .systems = &empty_systems,
         .system_count = 0,
         .draw = null,
+        .dev_command = null,
     };
     try std.testing.expect(!compatible(&descriptor));
     descriptor.abi = abi_version;

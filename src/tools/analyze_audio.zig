@@ -53,6 +53,12 @@ pub fn main(init: std.process.Init) !void {
     const writer = &allocating.writer;
     try writer.writeAll("{\n  \"schema\": 1,\n  \"analysis_kind\": \"polyphonic-evidence-not-authoritative-transcription\",");
     try writer.print("\n  \"sample_rate\": {d},\n  \"duration_seconds\": {d:.4},\n  \"estimated_tempo_bpm\": {d:.2},\n  \"tempo_confidence\": {d:.4},", .{ decoded.sample_rate, analysis.duration_seconds, analysis.estimated_tempo_bpm, analysis.tempo_confidence });
+    try writer.writeAll("\n  \"tempo_candidates\": [");
+    for (analysis.tempo_candidates[0..analysis.tempo_candidate_count], 0..) |candidate, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writer.print("{{\"bpm\":{d:.2},\"relative_score\":{d:.4}}}", .{ candidate.bpm, candidate.relative_score });
+    }
+    try writer.writeAll("],");
     try writer.writeAll("\n  \"onsets_seconds\": [");
     for (analysis.onsets, 0..) |onset, index| {
         if (index != 0) try writer.writeAll(", ");
@@ -99,7 +105,7 @@ fn alignScore(analysis: *const score.transcribe.Analysis, report: *const score.m
     if (analysis.frames.len == 0) return result;
     const tempo = if (report.tempo_bpm > 1) report.tempo_bpm else analysis.estimated_tempo_bpm;
     for (report.notes[0..report.note_count]) |note| {
-        if ((note.flags & score.model.note_flag_vocal_guide) != 0) continue;
+        if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0) continue;
         result.expected_notes += 1;
         const time = note.start_beat * 60.0 / tempo;
         var nearest = &analysis.frames[0];

@@ -22,6 +22,7 @@ pub const AudioSpan = extern struct {
 pub const Take = struct {
     started_ns: u64 = 0,
     stopped_ns: u64 = 0,
+    tempo_bpm: f32 = 120,
     midi: [max_midi_events]MidiEvent = undefined,
     midi_len: usize = 0,
     midi_overflow: bool = false,

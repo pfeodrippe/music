@@ -9,6 +9,9 @@ pub const Kind = enum(u32) {
     ellipse = 2,
     glow = 3,
     glyph = 4,
+    /// GPU-expanded line segment. rect contains x1,y1,x2,y2 and params.y is
+    /// thickness; this keeps stems/beams/spanners analytic on every backend.
+    line = 5,
 };
 
 /// ABI-stable instance consumed directly by every GPU backend.
@@ -74,6 +77,20 @@ pub const Packet = struct {
 
     pub fn glow(self: *Packet, x: f32, y: f32, width: f32, height: f32, radius: f32, color: Color, pulse: f32) void {
         self.add(.glow, x, y, width, height, color, radius, pulse);
+    }
+
+    pub fn line(self: *Packet, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Color) void {
+        if (self.len == self.items.len) {
+            self.clipped = true;
+            return;
+        }
+        self.items[self.len] = .{
+            .rect = .{ x1, y1, x2, y2 },
+            .color = color,
+            .params = .{ @floatFromInt(@intFromEnum(Kind.line)), thickness, 0, 0 },
+            .uv = .{ 0, 0, 0, 0 },
+        };
+        self.len += 1;
     }
 
     pub fn musicGlyph(self: *Packet, codepoint: u21, origin_x: f32, baseline_y: f32, em_size: f32, color: Color) void {

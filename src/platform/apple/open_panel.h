@@ -3,6 +3,7 @@
 
 const char *score_open_score_panel(void);
 const char *score_save_score_panel(void);
+const char *score_save_take_panel(void);
 const char *score_application_support_path(void);
 void score_replay_audio_file(const char *path);
 

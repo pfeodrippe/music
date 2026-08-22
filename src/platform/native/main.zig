@@ -4,6 +4,8 @@ const zglfw = @import("zglfw");
 const zgpu = @import("zgpu");
 const wgpu = zgpu.wgpu;
 const build_options = @import("build_options");
+const SfizzSampler = @import("sfizz_sampler.zig").Sampler;
+const dev_control = @import("dev_control.zig");
 
 const native_c = @cImport({
     @cInclude("sys/stat.h");
@@ -29,6 +31,55 @@ const MicrophoneMonitor = struct {
     confidence_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     timestamp_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
+
+const CaptureMapState = struct {
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    status: std.atomic.Value(u32) = std.atomic.Value(u32).init(@intFromEnum(wgpu.BufferMapAsyncStatus.unknown)),
+};
+
+const PipelineCreateState = struct {
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    status: std.atomic.Value(u32) = std.atomic.Value(u32).init(@intFromEnum(wgpu.CreatePipelineAsyncStatus.unknown)),
+    pipeline: ?wgpu.RenderPipeline = null,
+    message_len: usize = 0,
+    message: [2048]u8 = [_]u8{0} ** 2048,
+};
+
+const ErrorScopeState = struct {
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    err_type: std.atomic.Value(u32) = std.atomic.Value(u32).init(@intFromEnum(wgpu.ErrorType.unknown)),
+    message_len: usize = 0,
+    message: [2048]u8 = [_]u8{0} ** 2048,
+};
+
+fn captureMapped(status: wgpu.BufferMapAsyncStatus, context: ?*anyopaque) callconv(.c) void {
+    const state: *CaptureMapState = @ptrCast(@alignCast(context orelse return));
+    state.status.store(@intFromEnum(status), .monotonic);
+    state.done.store(true, .release);
+}
+
+fn pipelineCreated(status: wgpu.CreatePipelineAsyncStatus, pipeline: wgpu.RenderPipeline, message: ?[*:0]const u8, context: ?*anyopaque) callconv(.c) void {
+    const state: *PipelineCreateState = @ptrCast(@alignCast(context orelse return));
+    state.status.store(@intFromEnum(status), .monotonic);
+    if (status == .success) state.pipeline = pipeline;
+    if (message) |value| {
+        const source = std.mem.span(value);
+        state.message_len = @min(source.len, state.message.len);
+        @memcpy(state.message[0..state.message_len], source[0..state.message_len]);
+    }
+    state.done.store(true, .release);
+}
+
+fn errorScopeCompleted(err_type: wgpu.ErrorType, message: ?[*:0]const u8, context: ?*anyopaque) callconv(.c) void {
+    const state: *ErrorScopeState = @ptrCast(@alignCast(context orelse return));
+    state.err_type.store(@intFromEnum(err_type), .monotonic);
+    if (message) |value| {
+        const source = std.mem.span(value);
+        state.message_len = @min(source.len, state.message.len);
+        @memcpy(state.message[0..state.message_len], source[0..state.message_len]);
+    }
+    state.done.store(true, .release);
+}
 
 const DevReloader = if (build_options.hot_reload) struct {
     const plugin_path: [:0]const u8 = "zig-out/lib/libscore-systems.dylib";
@@ -72,6 +123,7 @@ const DevReloader = if (build_options.hot_reload) struct {
         const entry = candidate.lookup(Entry, "score_plugin_descriptor") orelse {
             candidate.close();
             _ = native_c.unlink(staged.ptr);
+            self.modified_ns = stamp;
             std.log.err("hot reload module has no score_plugin_descriptor", .{});
             return;
         };
@@ -79,6 +131,7 @@ const DevReloader = if (build_options.hot_reload) struct {
             candidate.close();
             _ = native_c.unlink(staged.ptr);
             app.restoreBuiltinSystems();
+            self.modified_ns = stamp;
             std.log.err("hot reload rejected: {s}", .{@errorName(err)});
             return;
         };
@@ -95,6 +148,11 @@ const DevReloader = if (build_options.hot_reload) struct {
         if (self.library) |*library| library.close();
         self.library = null;
         self.removeStaged();
+    }
+
+    fn force(self: *@This()) void {
+        self.modified_ns = -1;
+        self.next_poll = 0;
     }
 
     fn removeStaged(self: *@This()) void {
@@ -141,6 +199,7 @@ const DevReloader = if (build_options.hot_reload) struct {
 } else struct {
     fn poll(_: *@This(), _: *score.App, _: f64) void {}
     fn deinit(_: *@This(), _: *score.App) void {}
+    fn force(_: *@This()) void {}
 };
 
 const Renderer = struct {
@@ -154,6 +213,9 @@ const Renderer = struct {
     atlas_texture: wgpu.Texture,
     atlas_view: wgpu.TextureView,
     atlas_sampler: wgpu.Sampler,
+    shader_generation: u32,
+    shader_error_len: usize,
+    shader_error: [2048]u8,
 
     fn init(allocator: std.mem.Allocator, window: *zglfw.Window) !Renderer {
         const context = try zgpu.GraphicsContext.create(
@@ -298,7 +360,91 @@ const Renderer = struct {
             .atlas_texture = atlas_texture,
             .atlas_view = atlas_view,
             .atlas_sampler = atlas_sampler,
+            .shader_generation = 0,
+            .shader_error_len = 0,
+            .shader_error = [_]u8{0} ** 2048,
         };
+    }
+
+    /// Build a replacement pipeline asynchronously so Dawn can return complete
+    /// WGSL and interface validation diagnostics. The active pipeline is not
+    /// released until the candidate succeeds, which makes failed edits
+    /// non-destructive during native development.
+    fn reloadShaderSource(self: *Renderer, source: [*:0]const u8) !void {
+        // zgpu deliberately terminates Debug processes on uncaptured WebGPU
+        // errors. Keep candidate validation inside a scope so an invalid edit
+        // becomes a recoverable developer diagnostic instead.
+        self.context.device.pushErrorScope(.validation);
+        const shader = zgpu.createWgslShaderModule(self.context.device, source, "score hot WGSL shader");
+        defer shader.release();
+
+        const blend = wgpu.BlendState{
+            .color = .{ .src_factor = .src_alpha, .dst_factor = .one_minus_src_alpha },
+            .alpha = .{ .src_factor = .one, .dst_factor = .one_minus_src_alpha },
+        };
+        const targets = [_]wgpu.ColorTargetState{.{
+            .format = zgpu.GraphicsContext.swapchain_format,
+            .blend = &blend,
+        }};
+        const fragment = wgpu.FragmentState{
+            .module = shader,
+            .entry_point = "fs_main",
+            .target_count = targets.len,
+            .targets = &targets,
+        };
+        const descriptor = wgpu.RenderPipelineDescriptor{
+            .label = "score hot procedural ui pipeline",
+            .layout = self.pipeline_layout,
+            .vertex = .{ .module = shader, .entry_point = "vs_main" },
+            .primitive = .{ .topology = .triangle_list, .cull_mode = .none },
+            .fragment = &fragment,
+        };
+        var state: PipelineCreateState = .{};
+        self.context.device.createRenderPipelineAsync(descriptor, pipelineCreated, &state);
+        const deadline = zglfw.getTime() + 5;
+        while (!state.done.load(.acquire) and zglfw.getTime() < deadline) self.context.device.tick();
+
+        var validation: ErrorScopeState = .{};
+        // This pinned zgpu revision declares a bool even though Dawn's C ABI
+        // returns void; the callback is the authoritative completion signal.
+        _ = self.context.device.popErrorScope(errorScopeCompleted, &validation);
+        const validation_deadline = zglfw.getTime() + 5;
+        while (!validation.done.load(.acquire) and zglfw.getTime() < validation_deadline) self.context.device.tick();
+        if (!validation.done.load(.acquire)) {
+            self.setShaderError("shader validation diagnostics timed out");
+            return error.ShaderValidationTimedOut;
+        }
+        if (validation.err_type.load(.monotonic) != @intFromEnum(wgpu.ErrorType.no_error)) {
+            if (state.pipeline) |candidate| candidate.release();
+            self.setShaderError(if (validation.message_len == 0) "Dawn rejected the shader" else validation.message[0..validation.message_len]);
+            return error.ShaderPipelineRejected;
+        }
+        if (!state.done.load(.acquire)) {
+            self.setShaderError("pipeline validation timed out");
+            return error.ShaderValidationTimedOut;
+        }
+        if (state.status.load(.monotonic) != @intFromEnum(wgpu.CreatePipelineAsyncStatus.success)) {
+            self.setShaderError(if (state.message_len == 0) "Dawn rejected the shader pipeline" else state.message[0..state.message_len]);
+            return error.ShaderPipelineRejected;
+        }
+        const candidate = state.pipeline orelse {
+            self.setShaderError("Dawn returned no pipeline after successful validation");
+            return error.ShaderPipelineMissing;
+        };
+        const previous = self.pipeline;
+        self.pipeline = candidate;
+        previous.release();
+        self.shader_generation +%= 1;
+        self.shader_error_len = 0;
+    }
+
+    fn setShaderError(self: *Renderer, message: []const u8) void {
+        self.shader_error_len = @min(message.len, self.shader_error.len);
+        @memcpy(self.shader_error[0..self.shader_error_len], message[0..self.shader_error_len]);
+    }
+
+    fn shaderError(self: *const Renderer) []const u8 {
+        return self.shader_error[0..self.shader_error_len];
     }
 
     fn deinit(self: *Renderer, allocator: std.mem.Allocator) void {
@@ -328,8 +474,16 @@ const Renderer = struct {
         defer back_buffer.release();
         const encoder = self.context.device.createCommandEncoder(null);
         defer encoder.release();
+        self.encodePass(encoder, back_buffer, items);
+        const commands = encoder.finish(null);
+        defer commands.release();
+        self.context.submit(&.{commands});
+        _ = self.context.present();
+    }
+
+    fn encodePass(self: *Renderer, encoder: wgpu.CommandEncoder, target: wgpu.TextureView, items: []const score.render.DrawItem) void {
         const attachments = [_]wgpu.RenderPassColorAttachment{.{
-            .view = back_buffer,
+            .view = target,
             .load_op = .clear,
             .store_op = .store,
             .clear_value = .{ .r = 0.035, .g = 0.043, .b = 0.055, .a = 1 },
@@ -344,15 +498,186 @@ const Renderer = struct {
         pass.draw(6, @intCast(items.len), 0, 0);
         pass.end();
         pass.release();
+    }
+
+    /// Debug-only visual QA path. The same WebGPU/Metal pipeline is rendered
+    /// into a copyable BGRA texture, read back, and written as a top-down BMP.
+    /// This is a capture of the real GPU result, never a software renderer.
+    fn captureBmp(self: *Renderer, app: *const score.App, logical_size: [2]i32, scale: [2]f32, time: f32, path: [*:0]const u8) !void {
+        if (!build_options.hot_reload) return error.DebugCaptureUnavailable;
+        if (!self.context.canRender()) return error.SurfaceUnavailable;
+        const physical_width = self.context.swapchain_descriptor.width;
+        const physical_height = self.context.swapchain_descriptor.height;
+        if (physical_width == 0 or physical_height == 0) return error.SurfaceUnavailable;
+        const row_bytes = physical_width * 4;
+        const padded_row_bytes = std.mem.alignForward(u32, row_bytes, 256);
+        const mapped_size: usize = @as(usize, padded_row_bytes) * physical_height;
+
+        const frame = Uniforms{
+            .viewport = .{ @floatFromInt(@max(logical_size[0], 1)), @floatFromInt(@max(logical_size[1], 1)) },
+            .time = time,
+            .pixel_ratio = scale[0],
+        };
+        const items = app.drawItems();
+        self.context.queue.writeBuffer(self.uniforms, 0, Uniforms, (&[_]Uniforms{frame})[0..]);
+        if (items.len != 0) self.context.queue.writeBuffer(self.instances, 0, score.render.DrawItem, items);
+
+        const texture = self.context.device.createTexture(.{
+            .label = "score debug GPU capture",
+            .usage = .{ .render_attachment = true, .copy_src = true },
+            .size = .{ .width = physical_width, .height = physical_height },
+            .format = zgpu.GraphicsContext.swapchain_format,
+        });
+        defer texture.release();
+        const view = texture.createView(.{});
+        defer view.release();
+        const readback = self.context.device.createBuffer(.{
+            .label = "score debug GPU readback",
+            .usage = .{ .copy_dst = true, .map_read = true },
+            .size = mapped_size,
+        });
+        defer readback.release();
+
+        const encoder = self.context.device.createCommandEncoder(null);
+        defer encoder.release();
+        self.encodePass(encoder, view, items);
+        encoder.copyTextureToBuffer(
+            .{ .texture = texture },
+            .{ .layout = .{ .bytes_per_row = padded_row_bytes, .rows_per_image = physical_height }, .buffer = readback },
+            .{ .width = physical_width, .height = physical_height },
+        );
         const commands = encoder.finish(null);
         defer commands.release();
         self.context.submit(&.{commands});
-        _ = self.context.present();
+
+        var state: CaptureMapState = .{};
+        readback.mapAsync(.{ .read = true }, 0, mapped_size, captureMapped, &state);
+        const deadline = zglfw.getTime() + 5;
+        while (!state.done.load(.acquire) and zglfw.getTime() < deadline) self.context.device.tick();
+        if (!state.done.load(.acquire)) return error.GpuReadbackTimedOut;
+        if (state.status.load(.monotonic) != @intFromEnum(wgpu.BufferMapAsyncStatus.success)) return error.GpuReadbackFailed;
+        const bytes = readback.getConstMappedRange(u8, 0, mapped_size) orelse return error.GpuReadbackFailed;
+        defer readback.unmap();
+        try writeTopDownBmp(path, physical_width, physical_height, padded_row_bytes, bytes);
     }
 };
 
-pub fn main() !void {
+const DevShaderReloader = if (build_options.hot_reload) struct {
+    const default_path: [:0]const u8 = "src/render/shaders/ui.wgsl";
+    const source_capacity = 256 * 1024;
+
+    modified_ns: i128 = -1,
+    next_poll: f64 = 0,
+    source: [source_capacity:0]u8 = [_:0]u8{0} ** source_capacity,
+
+    fn poll(self: *@This(), app: *score.App, renderer: *Renderer, now: f64) void {
+        if (now < self.next_poll) return;
+        self.next_poll = now + 0.2;
+        const path = shaderPath();
+        const stamp = modificationTime(path) orelse return;
+        if (stamp == self.modified_ns) return;
+        self.modified_ns = stamp;
+        const source = self.readSource(path) catch |err| {
+            renderer.setShaderError(@errorName(err));
+            app.setHostStatus(9);
+            std.log.err("WGSL hot reload kept last-good pipeline: {s}", .{@errorName(err)});
+            return;
+        };
+        renderer.reloadShaderSource(source.ptr) catch |err| {
+            app.setHostStatus(9);
+            std.log.err("WGSL hot reload kept last-good pipeline: {s}: {s}", .{ @errorName(err), renderer.shaderError() });
+            return;
+        };
+        app.setHostStatus(10);
+        std.log.info("WGSL pipeline hot-reloaded; generation={d}; Flecs world preserved", .{renderer.shader_generation});
+    }
+
+    fn force(self: *@This()) void {
+        self.modified_ns = -1;
+        self.next_poll = 0;
+    }
+
+    fn readSource(self: *@This(), path: [*:0]const u8) ![:0]const u8 {
+        const file = native_c.fopen(path, "rb") orelse return error.ShaderOpenFailed;
+        defer _ = native_c.fclose(file);
+        const count = native_c.fread(&self.source, 1, self.source.len - 1, file);
+        if (native_c.ferror(file) != 0) return error.ShaderReadFailed;
+        if (count == self.source.len - 1 and native_c.fgetc(file) != native_c.EOF) return error.ShaderTooLarge;
+        self.source[count] = 0;
+        return self.source[0..count :0];
+    }
+
+    fn shaderPath() [*:0]const u8 {
+        const configured = native_c.getenv("SCORE_HOT_RELOAD_SHADER");
+        if (configured != null and configured[0] != 0) return configured;
+        return default_path.ptr;
+    }
+
+    fn modificationTime(path: [*:0]const u8) ?i128 {
+        var info: native_c.struct_stat = undefined;
+        if (native_c.stat(path, &info) != 0) return null;
+        return @as(i128, info.st_mtimespec.tv_sec) * std.time.ns_per_s + info.st_mtimespec.tv_nsec;
+    }
+} else struct {
+    fn poll(_: *@This(), _: *score.App, _: *Renderer, _: f64) void {}
+    fn force(_: *@This()) void {}
+};
+
+fn writeTopDownBmp(path: [*:0]const u8, width: u32, height: u32, stride: u32, pixels: []const u8) !void {
+    const file = native_c.fopen(path, "wb") orelse return error.CaptureOpenFailed;
+    defer _ = native_c.fclose(file);
+    var header = [_]u8{0} ** 54;
+    header[0] = 'B';
+    header[1] = 'M';
+    putLe32(header[2..6], 54 + width * height * 4);
+    putLe32(header[10..14], 54);
+    putLe32(header[14..18], 40);
+    putLe32(header[18..22], width);
+    putLe32(header[22..26], @bitCast(-@as(i32, @intCast(height))));
+    header[26] = 1;
+    header[28] = 32;
+    putLe32(header[34..38], width * height * 4);
+    if (native_c.fwrite(&header, 1, header.len, file) != header.len) return error.CaptureWriteFailed;
+    const row_bytes: usize = @as(usize, width) * 4;
+    for (0..height) |row| {
+        const start: usize = @as(usize, row) * stride;
+        if (native_c.fwrite(pixels[start .. start + row_bytes].ptr, 1, row_bytes, file) != row_bytes) return error.CaptureWriteFailed;
+    }
+    if (native_c.fflush(file) != 0) return error.CaptureWriteFailed;
+}
+
+fn putLe32(destination: []u8, value: u32) void {
+    for (0..4) |index| destination[index] = @truncate(value >> @intCast(index * 8));
+}
+
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.c_allocator;
+    var arguments = std.process.Args.Iterator.init(init.minimal.args);
+    _ = arguments.next();
+    var initial_score_path: ?[:0]const u8 = null;
+    const accurate_salamander_path: [:0]const u8 = "local-content/instruments/AccurateSalamanderGrandPianoV6.2beta2/sfz_live/Accurate-SalamanderGrandPiano_flat.Recommended.sfz";
+    const salamander_v3_path: [:0]const u8 = "local-content/instruments/SalamanderGrandPiano/Salamander Grand Piano V3.sfz";
+    var instrument_path: [:0]const u8 = if (readableFile(accurate_salamander_path.ptr)) accurate_salamander_path else salamander_v3_path;
+    if (native_c.getenv("SCORE_INSTRUMENT")) |configured| if (configured[0] != 0) {
+        instrument_path = std.mem.span(configured);
+    };
+    var expects_instrument_path = false;
+    var start_playing = false;
+    while (arguments.next()) |argument| {
+        if (expects_instrument_path) {
+            instrument_path = argument;
+            expects_instrument_path = false;
+        } else if (std.mem.eql(u8, argument, "--sfz")) {
+            expects_instrument_path = true;
+        } else if (std.mem.eql(u8, argument, "--play")) {
+            start_playing = true;
+        } else if (initial_score_path == null) {
+            initial_score_path = argument;
+        } else {
+            return error.TooManyArguments;
+        }
+    }
+    if (expects_instrument_path) return error.MissingInstrumentPath;
     try zglfw.init();
     defer zglfw.terminate();
     zglfw.windowHint(.client_api, .no_api);
@@ -367,21 +692,49 @@ pub fn main() !void {
     const initial_scale = window.getContentScale();
     const app = try score.App.create(allocator, @floatFromInt(initial_size[0]), @floatFromInt(initial_size[1]), initial_scale[0]);
     defer app.destroy(allocator);
-    var synth: score.synth.Synth = .{};
-    const audio_output = native_c.score_audio_output_start(audioRender, &synth);
+    var executable_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const executable_dir_len = try std.process.executableDirPath(init.io, &executable_path_buffer);
+    var bundle_library_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const bundle_library = try std.fmt.bufPrint(&bundle_library_buffer, "{s}/../Frameworks/libsfizz.dylib", .{executable_path_buffer[0..executable_dir_len]});
+    const sampler_library_paths = [_][]const u8{
+        "zig-out/lib/libsfizz.dylib",
+        bundle_library,
+    };
+    const sampler = try SfizzSampler.create(allocator, &sampler_library_paths, instrument_path);
+    defer sampler.destroy();
+    // The reference Salamander/Accurate-Salamander profiles document these
+    // controls as sampled release, hammer noise, pedal mechanics, and damper
+    // resonance. Other SFZ instruments safely ignore unbound controllers.
+    sampler.controlChange(0, 20, 64);
+    sampler.controlChange(0, 21, 64);
+    sampler.controlChange(0, 22, 64);
+    sampler.controlChange(0, 23, 64);
+    const audio_output = native_c.score_audio_output_start(audioRender, sampler);
     defer native_c.score_audio_output_stop(audio_output);
     const midi_service = native_c.score_midi_create();
     defer native_c.score_midi_destroy(midi_service);
-    std.log.info("music devices: {d} MIDI inputs, {d} MIDI outputs, audio {d:.0} Hz", .{
+    std.log.info("music devices: {d} MIDI inputs, {d} MIDI outputs, audio {d:.0} Hz; SFZ {d} regions / {d} preloaded samples; instrument {s}", .{
         native_c.score_midi_source_count(midi_service),
         native_c.score_midi_destination_count(midi_service),
         native_c.score_audio_output_sample_rate(audio_output),
+        sampler.region_count,
+        sampler.preloaded_sample_count,
+        instrument_path,
     });
     var microphone_monitor: MicrophoneMonitor = .{};
     var audio_input: ?*native_c.ScoreAudioInput = null;
     defer native_c.score_audio_input_stop(audio_input);
     var reloader: DevReloader = .{};
     defer reloader.deinit(app);
+    var dev_server: ?dev_control.Server = null;
+    if (build_options.hot_reload) {
+        dev_server = dev_control.Server.init() catch |err| blk: {
+            std.log.warn("development control unavailable: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (dev_server) |*server| std.log.info("development control listening at {s}", .{server.pathSlice()});
+    }
+    defer if (dev_server) |*server| server.deinit();
     window.setUserPointer(app);
     _ = window.setCursorPosCallback(cursorCallback);
     _ = window.setMouseButtonCallback(mouseButtonCallback);
@@ -390,16 +743,28 @@ pub fn main() !void {
     _ = window.setDropCallback(dropCallback);
 
     loadAutosave(app, allocator);
+    if (initial_score_path) |path| {
+        loadScorePath(app, allocator, path.ptr) catch |err| {
+            std.log.err("initial score import failed for {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+    }
+    if (start_playing) app.key(.{ .key = 32, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
 
     var renderer = try Renderer.init(allocator, window);
     defer renderer.deinit(allocator);
+    var shader_reloader: DevShaderReloader = .{};
 
     var previous_time = zglfw.getTime();
     var next_autosave = previous_time + 2;
     while (!window.shouldClose()) {
         zglfw.pollEvents();
         const now = zglfw.getTime();
+        const logical_size = window.getSize();
+        const scale = window.getContentScale();
         reloader.poll(app, now);
+        shader_reloader.poll(app, &renderer, now);
+        if (dev_server) |*server| pumpDevControl(server, app, sampler, instrument_path, &reloader, &shader_reloader, &renderer, logical_size, scale, @floatCast(now));
         switch (app.takeHostRequest()) {
             .open_score => {
                 const selected = native_c.score_open_score_panel();
@@ -417,6 +782,13 @@ pub fn main() !void {
                 if (selected != null and selected[0] != 0) saveScorePath(app, allocator, selected) catch |err| {
                     app.setHostStatus(3);
                     std.log.err("score export failed: {s}", .{@errorName(err)});
+                };
+            },
+            .export_take => {
+                const selected = native_c.score_save_take_panel();
+                if (selected != null and selected[0] != 0) saveTakePath(app, allocator, selected) catch |err| {
+                    app.setHostStatus(3);
+                    std.log.err("MIDI take export failed: {s}", .{@errorName(err)});
                 };
             },
             .start_recording => {
@@ -437,15 +809,13 @@ pub fn main() !void {
         }
         const delta: f32 = @floatCast(now - previous_time);
         previous_time = now;
-        const logical_size = window.getSize();
-        const scale = window.getContentScale();
         app.resize(@floatFromInt(logical_size[0]), @floatFromInt(logical_size[1]), scale[0]);
         app.tick(delta);
         const semantic_items = app.accessibilityItems();
         native_c.score_accessibility_update(@ptrCast(semantic_items.ptr), @intCast(semantic_items.len), accessibilityActivate, app);
-        pumpMidiInput(app, &synth, midi_service);
+        pumpMidiInput(app, sampler, midi_service);
         pumpMicrophone(app, &microphone_monitor);
-        pumpPlayback(app, &synth, midi_service);
+        pumpPlayback(app, sampler, midi_service);
         renderer.draw(app, logical_size, scale, @floatCast(now));
         if (now >= next_autosave) {
             saveAutosave(app, allocator) catch |err| std.log.warn("autosave failed: {s}", .{@errorName(err)});
@@ -453,6 +823,121 @@ pub fn main() !void {
         }
     }
     try saveAutosave(app, allocator);
+}
+
+fn readableFile(path: [*:0]const u8) bool {
+    const file = native_c.fopen(path, "rb") orelse return false;
+    _ = native_c.fclose(file);
+    return true;
+}
+
+fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzSampler, instrument_path: []const u8, reloader: *DevReloader, shader_reloader: *DevShaderReloader, renderer: *Renderer, logical_size: [2]i32, scale: [2]f32, time: f32) void {
+    var command_buffer: [dev_control.max_command_bytes]u8 = undefined;
+    const client = server.poll(&command_buffer) orelse return;
+    const command = std.mem.trim(u8, command_buffer[0..client.command_len], " \t\r\n");
+    var response: [dev_control.max_response_bytes]u8 = undefined;
+    var response_len: usize = 0;
+    if (std.mem.eql(u8, command, "reload")) {
+        reloader.force();
+        shader_reloader.force();
+        response_len = hostDevResponse(&response, "ok systems and shader hot reload scheduled", .{});
+    } else if (std.mem.eql(u8, command, "shader reload")) {
+        shader_reloader.force();
+        response_len = hostDevResponse(&response, "ok shader hot reload scheduled", .{});
+    } else if (std.mem.eql(u8, command, "shader state")) {
+        const message = renderer.shaderError();
+        response_len = if (message.len == 0)
+            hostDevResponse(&response, "ok shader_generation={d} last_good=1 error=none", .{renderer.shader_generation})
+        else
+            hostDevResponse(&response, "ok shader_generation={d} last_good=1 error={s}", .{ renderer.shader_generation, message });
+    } else if (std.mem.eql(u8, command, "sampler state")) {
+        response_len = hostDevResponse(&response, "ok regions={d} preloaded={d} dropped={d} overloaded={d} instrument={s}", .{
+            sampler.region_count,
+            sampler.preloaded_sample_count,
+            sampler.droppedEventCount(),
+            sampler.overloadedSampleCount(),
+            instrument_path,
+        });
+    } else if (std.mem.startsWith(u8, command, "midi ")) {
+        response_len = app.runDevCommand(command, &response);
+        if (std.mem.startsWith(u8, response[0..response_len], "ok ")) dispatchDevMidi(sampler, command[5..]);
+    } else if (std.mem.startsWith(u8, command, "load ")) {
+        const path = std.mem.trim(u8, command[5..], " \t\r\n");
+        var path_buffer: [std.fs.max_path_bytes:0]u8 = [_:0]u8{0} ** std.fs.max_path_bytes;
+        if (path.len >= path_buffer.len) {
+            response_len = hostDevResponse(&response, "error score path is too long", .{});
+        } else {
+            @memcpy(path_buffer[0..path.len], path);
+            path_buffer[path.len] = 0;
+            loadScorePath(app, std.heap.c_allocator, path_buffer[0..path.len :0].ptr) catch |err| {
+                response_len = hostDevResponse(&response, "error load failed: {s}", .{@errorName(err)});
+            };
+            if (response_len == 0) response_len = hostDevResponse(&response, "ok loaded {s}", .{path});
+        }
+    } else if (std.mem.startsWith(u8, command, "export-take ")) {
+        const path = std.mem.trim(u8, command[12..], " \t\r\n");
+        var path_buffer: [std.fs.max_path_bytes:0]u8 = [_:0]u8{0} ** std.fs.max_path_bytes;
+        if (path.len >= path_buffer.len) {
+            response_len = hostDevResponse(&response, "error take export path is too long", .{});
+        } else {
+            @memcpy(path_buffer[0..path.len], path);
+            path_buffer[path.len] = 0;
+            saveTakePath(app, std.heap.c_allocator, path_buffer[0..path.len :0].ptr) catch |err| {
+                response_len = hostDevResponse(&response, "error take export failed: {s}", .{@errorName(err)});
+            };
+            if (response_len == 0) response_len = hostDevResponse(&response, "ok exported MIDI take {s}", .{path});
+        }
+    } else if (std.mem.startsWith(u8, command, "export ")) {
+        const path = std.mem.trim(u8, command[7..], " \t\r\n");
+        var path_buffer: [std.fs.max_path_bytes:0]u8 = [_:0]u8{0} ** std.fs.max_path_bytes;
+        if (path.len >= path_buffer.len) {
+            response_len = hostDevResponse(&response, "error export path is too long", .{});
+        } else {
+            @memcpy(path_buffer[0..path.len], path);
+            path_buffer[path.len] = 0;
+            saveScorePath(app, std.heap.c_allocator, path_buffer[0..path.len :0].ptr) catch |err| {
+                response_len = hostDevResponse(&response, "error export failed: {s}", .{@errorName(err)});
+            };
+            if (response_len == 0) response_len = hostDevResponse(&response, "ok exported {s}", .{path});
+        }
+    } else if (build_options.hot_reload and std.mem.startsWith(u8, command, "capture ")) {
+        const path = std.mem.trim(u8, command[8..], " \t\r\n");
+        var path_buffer: [std.fs.max_path_bytes:0]u8 = [_:0]u8{0} ** std.fs.max_path_bytes;
+        if (path.len >= path_buffer.len) {
+            response_len = hostDevResponse(&response, "error capture path is too long", .{});
+        } else {
+            @memcpy(path_buffer[0..path.len], path);
+            path_buffer[path.len] = 0;
+            renderer.captureBmp(app, logical_size, scale, time, path_buffer[0..path.len :0].ptr) catch |err| {
+                response_len = hostDevResponse(&response, "error GPU capture failed: {s}", .{@errorName(err)});
+            };
+            if (response_len == 0) response_len = hostDevResponse(&response, "ok captured native GPU frame {s}", .{path});
+        }
+    } else {
+        response_len = app.runDevCommand(command, &response);
+    }
+    client.respond(response[0..response_len]);
+}
+
+fn dispatchDevMidi(sampler: *SfizzSampler, argument: []const u8) void {
+    var fields = std.mem.tokenizeAny(u8, argument, " \t");
+    const status = std.fmt.parseInt(u8, fields.next() orelse return, 0) catch return;
+    const data1 = std.fmt.parseInt(u8, fields.next() orelse return, 0) catch return;
+    const data2 = std.fmt.parseInt(u8, fields.next() orelse return, 0) catch return;
+    const message = status & 0xf0;
+    const channel = status & 0x0f;
+    if (message == 0x90 and data2 != 0) {
+        sampler.noteOn(channel, data1, data2);
+    } else if (message == 0x80 or (message == 0x90 and data2 == 0)) {
+        sampler.noteOff(channel, data1);
+    } else if (message == 0xb0) {
+        sampler.controlChange(channel, data1, data2);
+    }
+}
+
+fn hostDevResponse(output: []u8, comptime format: []const u8, arguments: anytype) usize {
+    const value = std.fmt.bufPrint(output, format, arguments) catch return 0;
+    return value.len;
 }
 
 fn ensureMicrophone(input: *?*native_c.ScoreAudioInput, monitor: *MicrophoneMonitor) void {
@@ -483,12 +968,12 @@ fn pumpMicrophone(app: *score.App, monitor: *MicrophoneMonitor) void {
 }
 
 fn audioRender(samples: [*c]f32, frames: u32, channels: u32, sample_rate: f64, context: ?*anyopaque) callconv(.c) void {
-    const synth: *score.synth.Synth = @ptrCast(@alignCast(context orelse return));
+    const synth: *SfizzSampler = @ptrCast(@alignCast(context orelse return));
     const len = @as(usize, frames) * channels;
     synth.renderInterleaved(samples[0..len], frames, channels, @floatCast(sample_rate));
 }
 
-fn pumpMidiInput(app: *score.App, synth: *score.synth.Synth, service: ?*native_c.ScoreMidiService) void {
+fn pumpMidiInput(app: *score.App, synth: *SfizzSampler, service: ?*native_c.ScoreMidiService) void {
     var events: [128]native_c.ScoreMidiEvent = undefined;
     const count = native_c.score_midi_poll(service, &events, events.len);
     for (events[0..count]) |event| {
@@ -504,7 +989,7 @@ fn pumpMidiInput(app: *score.App, synth: *score.synth.Synth, service: ?*native_c
     }
 }
 
-fn pumpPlayback(app: *score.App, synth: *score.synth.Synth, service: ?*native_c.ScoreMidiService) void {
+fn pumpPlayback(app: *score.App, synth: *SfizzSampler, service: ?*native_c.ScoreMidiService) void {
     var events: [128]score.playback.HostEvent = undefined;
     const count = app.drainPlaybackEvents(&events);
     for (events[0..count]) |event| {
@@ -514,6 +999,10 @@ fn pumpPlayback(app: *score.App, synth: *score.synth.Synth, service: ?*native_c.
         }
         if (event.on == 3) {
             synth.click(event.velocity >= 120);
+            continue;
+        }
+        if (event.on == 4) {
+            synth.controlChange(event.channel, event.pitch, event.velocity);
             continue;
         }
         if (event.on != 0) {
@@ -607,10 +1096,13 @@ fn saveAutosave(app: *const score.App, allocator: std.mem.Allocator) !void {
     const bytes = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(bytes);
     const len = try app.serialize(bytes);
+    var temporary_name_buffer: [64]u8 = undefined;
+    const temporary_name = try std.fmt.bufPrint(&temporary_name_buffer, "autosave.score.{d}.tmp", .{native_c.getpid()});
     var temporary_buffer: [4096]u8 = undefined;
     var destination_buffer: [4096]u8 = undefined;
-    const temporary = try appDataPath(&temporary_buffer, "autosave.score.tmp");
+    const temporary = try appDataPath(&temporary_buffer, temporary_name);
     const destination = try appDataPath(&destination_buffer, "autosave.score");
+    errdefer _ = native_c.unlink(temporary.ptr);
     const file = native_c.fopen(temporary.ptr, "wb") orelse return error.OpenFailed;
     if (native_c.fwrite(bytes.ptr, 1, len, file) != len) {
         _ = native_c.fclose(file);
@@ -632,9 +1124,17 @@ fn appDataPath(buffer: *[4096]u8, basename: []const u8) ![:0]u8 {
 }
 
 fn saveScorePath(app: *score.App, allocator: std.mem.Allocator, path: [*:0]const u8) !void {
-    const bytes = try allocator.alloc(u8, 4 * 1024 * 1024);
+    const bytes = try allocator.alloc(u8, 16 * 1024 * 1024);
     defer allocator.free(bytes);
-    const len = try app.exportMusicXml(bytes);
+    const extension = std.fs.path.extension(std.mem.span(path));
+    const len = if (std.ascii.eqlIgnoreCase(extension, ".mid") or std.ascii.eqlIgnoreCase(extension, ".midi"))
+        try app.exportMidi(bytes)
+    else if (std.ascii.eqlIgnoreCase(extension, ".score"))
+        try app.serialize(bytes)
+    else if (std.ascii.eqlIgnoreCase(extension, ".mxl"))
+        try app.exportMxl(bytes)
+    else
+        try app.exportMusicXml(bytes);
     const file = native_c.fopen(path, "wb") orelse return error.OpenFailed;
     if (native_c.fwrite(bytes.ptr, 1, len, file) != len) {
         _ = native_c.fclose(file);
@@ -647,6 +1147,24 @@ fn saveScorePath(app: *score.App, allocator: std.mem.Allocator, path: [*:0]const
     _ = native_c.fsync(native_c.fileno(file));
     if (native_c.fclose(file) != 0) return error.CloseFailed;
     app.setHostStatus(8);
+}
+
+fn saveTakePath(app: *score.App, allocator: std.mem.Allocator, path: [*:0]const u8) !void {
+    const bytes = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(bytes);
+    const len = try app.exportTakeMidi(bytes);
+    const file = native_c.fopen(path, "wb") orelse return error.OpenFailed;
+    if (native_c.fwrite(bytes.ptr, 1, len, file) != len) {
+        _ = native_c.fclose(file);
+        return error.WriteFailed;
+    }
+    if (native_c.fflush(file) != 0) {
+        _ = native_c.fclose(file);
+        return error.FlushFailed;
+    }
+    _ = native_c.fsync(native_c.fileno(file));
+    if (native_c.fclose(file) != 0) return error.CloseFailed;
+    app.setHostStatus(11);
 }
 
 fn pointerEvent(kind: score.platform.PointerKind, x: f64, y: f64, buttons: u32, scroll_x: f64, scroll_y: f64) score.platform.PointerEvent {

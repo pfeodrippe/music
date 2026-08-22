@@ -1,6 +1,8 @@
 # Cross-Platform GPU Music Application — Implementation
 
-Status: working native macOS, WebGPU/Wasm, and iOS/iPadOS Metal implementations
+Status: native macOS implementation under active completion and verification;
+WebGPU/Wasm and iOS/iPadOS ports exist but are intentionally deferred until the
+native release gate is clear
 
 Updated: 2026-08-22
 
@@ -16,26 +18,131 @@ Browser distribution target: **WebAssembly + WebGPU only**, behind the same plat
 
 This document started as the architecture plan and now also records the working implementation. The following is present and build-verified:
 
-- A Zig-owned Flecs world with persistent score/session components, replaceable system descriptors, deterministic transport progression, and native frame-boundary dylib reload while the world remains alive.
+- A Zig-owned Flecs world with persistent score/session components, replaceable system descriptors, deterministic transport progression, native frame-boundary dylib reload while the world remains alive, and a Debug-only local Zig control client for repeatable live-state QA.
+- Native hot reload is resource-safe: screen-composition and Flecs systems swap
+  in place, while atlas/ABI/renderer changes rebuild and relaunch the host. A
+  glyph-atlas content hash in ABI v11 prevents new UV metadata from sampling an
+  old Metal texture. This contract prevents the corrupted text/music atlas seen
+  when only one side of the hot-module boundary changed. Debug builds can
+  capture the real Dawn/Metal framebuffer for repeatable visual QA.
 - A signed macOS `.app` using Dawn/Metal, CoreAudio/AudioUnit, CoreMIDI, AudioQueue microphone capture, native import/export panels, app-support autosave, and WAV take replay.
 - A WebGPU-only Wasm/PWA export using Emdawnwebgpu, IndexedDB recovery, Service Worker offline caching, Web MIDI, getUserMedia, MediaRecorder, and a Zig DSP AudioWorklet. No Canvas 2D, WebGL, DOM product controls, or software renderer exists.
 - A stable iOS C ABI plus device and simulator application bundles: CAMetalLayer rendering, AVAudioEngine synthesis/metronome/microphone capture, CoreMIDI, system document import/export, atomic recovery, Pencil/touch/mouse input, and external keyboard commands.
-- MusicXML/XML, compressed MXL, standard MIDI, and versioned `.score` import; multi-part/polyphonic MusicXML timing; note edits with undo/redo; page-anchored pressure ink; pagination; transport looping/count-in/metronome/tempo; synchronized audio/MIDI takes; pitch/timing practice feedback.
+- MusicXML/XML, compressed MXL, standard MIDI, and versioned `.score` v12 import;
+  multi-part/polyphonic MusicXML timing; semantic explicit rests, tuplets,
+  dynamics, slurs, articulations, fermatas, lyrics, and harmonies with tested
+  MusicXML export/re-import; note edits with undo/redo; page-anchored pressure
+  ink; measure-aware system layout; transport looping/count-in/metronome/tempo;
+  synchronized audio/MIDI takes; and pitch/timing practice feedback.
+- Score drawing and interaction share one imported-measure layout: note insert
+  and selection hit-testing, annotation page anchors, playback following,
+  seeking, and next/previous navigation all resolve authored system/page
+  boundaries. Debug control exposes the same navigation for live Metal QA.
+- Playback resolves connected MusicXML tie chains into one sustained sampler
+  attack/release, while malformed dangling tie marks remain bounded and cannot
+  leave a voice stuck.
+- Score-authored pedal directions render in collision-aware expression lanes
+  below the bass staff and drive a toggleable live/expected three-pedal guide;
+  the same state is controllable from the GPU transport bar, keyboard,
+  accessibility tree, and Debug hot-control channel.
+- Native playback uses pinned sfizz on the CoreAudio callback through a bounded
+  SPSC MIDI queue. When the ignored Accurate-Salamander Grand V6.2beta2 pack is
+  installed, its recommended 48 kHz/24-bit live SFZ (1,704 regions / 641
+  preloaded samples) is selected; the 1,121-region Salamander V3 pack is the
+  development fallback. Both remain optional local assets rather than silently
+  bundled content, and an explicit `SCORE_INSTRUMENT`/`--sfz` override supports
+  other instruments.
+- `score-sampler-verify` is an executable native acceptance gate, not a demo
+  render. It checks silence/finite output, an eight-point velocity sweep,
+  sustain and continuous half-pedal behavior, release and pedal mechanics,
+  exact replay, nonzero MIDI channels, queue drops, and raw pre-limiter
+  overload. It emits JSON plus PCM16 WAV evidence and exits nonzero on failure.
+  The Accurate-Salamander live preset currently passes with a 33.478 dB measured
+  velocity span, distinct pedal-up/half/full release tails, and zero drops or
+  overloads under the stress chord.
+- Standard MIDI import preserves ordered CC64/66/67 automation, continuous
+  controller values, and PPQ timing. Type-1 tracks keep independent active-note
+  state, malformed high-bit data bytes are rejected, and the imported pedal
+  tail participates in document bounds and native sampler playback.
+- Standard MIDI export writes deterministic format-1 files at 480 PPQ with
+  conductor metadata, a piano track, an optional vocal-guide track, connected
+  tie chains, velocity/channel data, and ordered CC64/66/67 automation. Native
+  export dispatches by `.musicxml`/`.xml`, `.mid`/`.midi`, or `.score` extension;
+  an exported pedal fixture has been re-imported live with its beat-5 tail intact.
+- Recorded MIDI takes export independently as deterministic format-1 files
+  without notation quantization. The exporter converts the captured monotonic
+  nanosecond timebase using the take's recorded tempo, preserves channel voice
+  and continuous controller messages, and is available through GPU controls,
+  accessibility, a native save panel, and the Debug control socket. Portable
+  `.score` v12 persists the take tempo and raw events; a live note-plus-pedal
+  take was saved, reloaded, and exported byte-identically.
 - Standards-based MusicXML 4.0 export, metrical bar alignment even when an OMR
-  measure is underfilled, live MIDI CC64/66/67 pedal state, sustain and
-  sostenuto semantics in the Zig diagnostic synth, and GPU three-pedal status.
+  measure is underfilled, semantic harmony import/persistence/GPU
+  rendering/export, clef-aware seven-accidental key signatures, live MIDI
+  CC64/66/67 pedal state, sustain and sostenuto semantics in the Zig diagnostic
+  synth, and GPU three-pedal status. Timed MusicXML sustain-pedal directions now
+  survive `.score` v12 and MusicXML round trips, render as analytic pedal lines,
+  drive native sampler CC64 playback, and provide a score marker against the
+  continuous live hardware fill with late-transition practice feedback.
+- Multi-part MusicXML export keeps each imported source staff/voice lane
+  distinct until the final two-staff projection. This prevents overlapping
+  vocal-guide and piano material from being serialized as one overfilled voice;
+  the private acceptance export passes the structural audit and preserves all
+  1,286 sounding note onsets across export/re-import.
+- Imported measure maps are now first-class portable core data. MusicXML import,
+  `.score` v12 persistence, hot-reloaded GPU UI, measure loops, bar/beat labels,
+  metronome accents, and MusicXML export all retain pickups, irregular measure
+  durations, source numbers, and mid-score meters. The private acceptance file
+  round-trips as 175 measures with all 17 time-signature entries instead of the
+  former 171-bar fixed-4/4 reflow.
 - A shared instanced WGSL renderer with responsive desktop/iPad/phone layout and a generated original PWA/macOS icon.
 - A core-owned semantic accessibility snapshot mirrored through NSAccessibility on macOS, hidden semantic DOM controls in the browser, and UIAccessibilityElement on iOS/iPadOS. Actions route back through the same Zig hit-testing path as pointer input.
 - Native, web, and iOS build gates plus portable unit/integration tests and a pinned macOS CI workflow.
 
-Release gaps are explicit rather than silently approximated: PDF page import/annotation, a full SMuFL atlas and professional engraving breadth, text/lasso annotation tools, optional cloud sync, App Store provisioning, and production content licensing remain follow-on work. The code must not describe those items as complete until their acceptance tests pass.
+Release gaps are explicit rather than silently approximated: professional
+multi-voice/optical engraving, arbitrary responsive pagination and print
+layout, the deferred iOS Metal shader-reload equivalent, final editor/practice hardware QA,
+production concert-grand quality, PDF page import/annotation, text/lasso
+annotation tools, optional cloud sync, App Store provisioning, and production
+content licensing remain open. The code must not describe those items as
+complete until their acceptance tests pass.
 
 The private, gitignored Holocene fixture is also explicitly incomplete. Its
 current 12-page OMR-derived MXL is useful for exercising import and playback,
-but the generated structural ledger still fails and the source is a voice/harp
-edition rather than a finished two-hand piano reduction. It must not be called
-professional or accurate until every flagged measure and every musical symbol
-has been reviewed against the user-supplied pages.
+and its meter/cursor structure now passes with zero structural issues. That
+pass is deliberately separate from musical review: 265 inserted `<forward>`
+spans initially identified unrecovered recognition time. Complete source-page
+transcription of the dense page-8 accompaniment (P2 measures 98-114) removed 49
+of those gaps. Complete source-page transcription of the page-9 piano part (P2
+measures 115-130) removed another 26, including the changing second-half
+voicings in measures 121-122 and the independent low E2 in measure 123.
+Complete source-page transcription of page 10 (P2 measures 131-146) restored
+the D/C accompaniment cells, corrected the C4 bass arrivals in measures
+136-137, and rebuilt the 2/4 measure 138 through the 4/4 continuation. The
+repair pipeline now also removes Audiveris's 24-unit phantom bar before that
+2/4 transition, restoring the printed measure numbers for all later pages.
+Complete page-11 transcription (P2 measures 147-164) restores the last
+C5-G5-C5 cell, the full un-beamed right-hand figure, and every printed bass
+quarter alternation. Complete page-12 transcription (P2 measures 165-174)
+finishes six more two-hand figures, both arpeggiated half-note cadence bars,
+and the tied low E2 close. The resulting 174-measure/2,217-event MXL retains 114
+gaps across 83 part/measures, and 86 original Audiveris rhythm warnings remain
+in ignored JSON/Markdown ledgers. A separate 348-entry part/measure review
+matrix records 77 page-complete accompaniment measures, 271 entries requiring
+page review, and zero recording-verified entries. The native renderer has also
+survived ten consecutive combined system/WGSL hot reloads with clean text and
+SMuFL output; atlas metadata changes are deliberately escalated to a host
+rebuild/relaunch rather than allowed to sample a stale GPU texture.
+Authored page navigation was additionally exercised through the live control
+socket on pages 42-44; a Metal readback of the short final page retained clean
+text, SMuFL rests, and the tied closing E2 after the host rebuild. The short
+page now draws only its populated system rather than a phantom empty staff.
+The source is a voice/harp edition rather than a finished two-hand piano
+reduction. It must not be called professional or accurate until every ledgered
+gap and every musical symbol has been reviewed against the user-supplied pages
+and a lawful local copy of the official recording. No such recording is
+currently present in ignored local content, so the recording-led accuracy gate
+remains open rather than waived.
 
 ## 1. Product definition
 
@@ -73,17 +180,27 @@ No notation application can semantically understand every PDF or proprietary for
 
 Unknown MusicXML elements should be retained as opaque source fragments when safe, and the importer must report unsupported or approximated content. It must never silently claim a lossless round trip.
 
-## 2. Copyright and “Holocene”
+## 2. Copyrighted private acceptance fixtures
 
-“Holocene” by Bon Iver is copyrighted. The repository and public deployment must not contain its notation, lyrics, recording, album artwork, or an unlicensed sound-alike arrangement.
+Copyrighted works used for private acceptance testing must never become bundled
+catalog content. The repository and public deployment must not contain their
+notation, lyrics, recordings, album artwork, or unlicensed sound-alike
+arrangements.
 
-The first-song experience will be implemented in one of these lawful ways:
+Private development fixtures are handled in one of these lawful ways:
 
-1. Preferred during development: show an **Import your copy of Holocene** card that accepts a MusicXML, MXL, MIDI, or PDF file the user obtained lawfully. The file stays local unless the user explicitly enables sync.
-2. Keep a developer-owned licensed fixture under `tests/fixtures/licensed/`, ignored by Git and excluded from builds. Tests locate it through `HOLOCENE_FIXTURE_PATH` and skip cleanly when absent.
-3. Bundle the score only after written distribution rights are recorded in `legal/content-licenses/holocene.md`, including territory, term, arrangement, lyrics, and offline-cache rights.
+1. Import a MusicXML, MXL, MIDI, or PDF file the user obtained lawfully. The
+   file stays local unless the user explicitly enables sync.
+2. Keep a developer-owned licensed fixture under `local-content/`, ignored by
+   Git and excluded from every build and public screenshot.
+3. Bundle any work only after written distribution rights are recorded under
+   `legal/content-licenses/`, including territory, term, arrangement, lyrics,
+   and offline-cache rights.
 
-Until option 3 is satisfied, use a public-domain score for automated tests, screenshots, the hosted demo, and first-run fallback. Song title/artist metadata may identify the user’s imported document, but it is not a substitute for rights to the musical work.
+Until option 3 is satisfied, use public-domain or appropriately licensed scores
+for automated tests, screenshots, the hosted demo, and first-run content. Song
+title/artist metadata may identify a user-imported document, but it is not a
+substitute for rights to the musical work.
 
 “Holocene” acceptance test, using a lawful user-supplied fixture:
 
@@ -176,10 +293,36 @@ Optional WebGPU features such as timestamp queries and `shader-f16` create quali
 Component schemas, stable document IDs, Flecs world ownership, render resources, and platform devices live in the host. Reloadable application modules publish a versioned descriptor containing systems, query terms, phases, event subscriptions, callbacks, migrations, and an optional module-local state serializer.
 
 - Native development builds compile systems into watched dynamic libraries. A reload is prepared beside the live module, ABI-checked, and installed at a frame boundary. Changed queries recreate only their Flecs system entities; component data and unrelated systems remain live.
+- Debug native builds also expose a user-only Unix-domain socket at
+  `/tmp/score-dev-<uid>.sock` (overridable with `SCORE_DEV_SOCKET`).
+`score-devctl` can inspect the live Flecs session, load a local score, control
+transport/tempo/UI state, request a reload, and call the current dylib's
+versioned development-command hook. New one-off Zig operations are written
+in the hot module, rebuilt with `zig build systems`, and invoked as
+`score-devctl plugin <command>` without restarting the world. The host copies
+bounded note-snapshot edits back into Flecs at the same frame boundary. The
+same control surface exposes `sampler state` telemetry and routes validated
+`midi` commands to both the core/practice recorder and the live sfizz instance,
+which makes channel, velocity, and pedal behavior testable without GUI input.
 - A failed compile, load, ABI check, or migration keeps the last working module active and reports the error through the GPU developer overlay.
 - Browser development rebuilds the Wasm application and performs a live restart from a versioned serialized world snapshot. This avoids making Wasm dynamic linking a production dependency while retaining rapid stateful iteration.
-- GPU resources are addressed by stable logical handles and restored/rebound after renderer or shader reloads. Shader compilation errors are non-destructive.
-- Release builds import the same module descriptors statically. The watcher, dynamic-library loader, developer overlay, and migration diagnostics are removed, and Zig links the application into one platform binary (or one main Wasm module plus required browser packaging files).
+- The generated glyph atlas is hashed into the hot-module descriptor. A changed
+  UV table cannot load against a stale host texture: the ABI check rejects it,
+  and the development watcher rebuilds/relaunches the native host atomically for
+  atlas, ABI, renderer, shader, audio, and other host-resource changes.
+- Native Debug builds poll the WGSL source directly, create candidate Dawn
+  pipelines asynchronously inside captured validation scopes, and swap only
+  after shader and pipeline-interface validation succeeds. Invalid WGSL and
+  missing entry points retain the last-good pipeline, preserve the live Flecs
+  world, show a GPU notice, and expose exact diagnostics through
+  `score-devctl shader state`. Release builds retain only the embedded shader.
+- GPU resources are addressed by stable logical handles and restored/rebound
+  after renderer or shader reloads. The equivalent iOS Metal development path
+  remains deferred until the native macOS release gate clears.
+- Release builds import the same module descriptors statically. The watcher,
+  dynamic-library loader, control socket, developer overlay, and migration
+  diagnostics are removed, and Zig links the application into one platform
+  binary (or one main Wasm module plus required browser packaging files).
 - Reloadable callbacks may not retain Flecs table pointers, iterator pointers, Wasm linear-memory slices, or platform handles beyond the call. Long-lived state must be a registered component or a versioned serialized module block.
 
 ### 3.6 Production multi-sampled instrument engine
@@ -505,6 +648,16 @@ the same manual correction/audit workflow. Streaming-site ripping is outside
 the content pipeline; private reference recordings must be supplied locally by
 the user and remain ignored.
 
+For native development on macOS, `scripts/capture-browser-reference.sh`
+provides a reusable user-authorized loopback workflow for browser or app
+playback. It discovers the current AVFoundation index for `BlackHole 16ch`,
+temporarily selects that device as the macOS output, captures stereo PCM24 WAV,
+restores the previous output from an exit/signal trap, and invokes
+`score-audio-analyze` with an optional MusicXML/MXL comparison. The capture
+command allows an application-settle interval, rejects silent captures,
+refuses to overwrite evidence, and keeps acquisition separate from analysis so
+the same workflow works for any song or local player.
+
 MusicXML lyric text is modeled independently from notes. A named vocal part or
 cue note is tagged as a vocal guide: it may render as an optional singer cue,
 but it is excluded from instrument playback, keyboard fingering, and piano
@@ -555,7 +708,7 @@ Replaying a take offers:
 - **Together**: aligned audio and MIDI with a user-adjustable correction offset.
 - **Compare**: A/B two takes or place the reference performance against the user take.
 
-Export audio in its original lossless/encoded track plus a widely playable derived file when available. Export MIDI as Standard MIDI File with tempo/calibration metadata in the native package. Recording audio is opt-in for sync because it is large and sensitive; MIDI/assessment-only sync is the default. Show duration/size/quota before long recordings and write chunks incrementally so a refresh does not lose the whole take.
+Export audio in its original lossless/encoded track plus a widely playable derived file when available. Export MIDI as a Type-1 Standard MIDI File from the raw monotonic take timebase, preserving performance timing, channel data, and controller automation without notation quantization. Portable `.score` v12 stores the captured take tempo so the same take exports deterministically after recovery. Recording audio is opt-in for sync because it is large and sensitive; MIDI/assessment-only sync is the default. Show duration/size/quota before long recordings and write chunks incrementally so a refresh does not lose the whole take.
 
 ### 8.5 Practice features and coaching
 
@@ -644,7 +797,9 @@ The visual-research pass surveyed notation/readers such as StaffPad and forScore
 - Header: product name, search, import, new score, account/sync state.
 - Continue card for the most recently opened document.
 - Responsive score grid with title, composer, parts, modified time, sync/offline badge.
-- First-run cards: **Import your copy of Holocene**, **Open a MusicXML file**, **Try a public-domain example**, **Create an empty score**.
+- First-run cards: **Import score**, **Open recent**, **Try a public-domain
+  example**, **Create an empty score**. Do not name a private acceptance fixture
+  in product onboarding.
 - Import progress, format warnings, and recovery actions appear inline; raw errors remain in a copyable details panel.
 
 ### 10.3 Editor — wide layout

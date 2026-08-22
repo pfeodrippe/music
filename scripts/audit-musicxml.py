@@ -180,7 +180,13 @@ def audit(root: ET.Element, omr_log: Path | None) -> dict:
                     if not is_chord:
                         previous_note_onset = onset
                         cursor = end
-                    type_duration = expected_type_duration(child, divisions)
+                    rest = child.find("rest")
+                    # MusicXML represents a full-measure rest with the
+                    # measure's duration while its display type may remain
+                    # ``whole`` in meters shorter than 4/4. That is valid,
+                    # intentional notation rather than a rhythmic mismatch.
+                    is_measure_rest = rest is not None and rest.get("measure") == "yes"
+                    type_duration = None if is_measure_rest else expected_type_duration(child, divisions)
                     if type_duration is not None and duration != type_duration:
                         pitch = child.find("pitch")
                         label = "rest"
@@ -230,8 +236,9 @@ def audit(root: ET.Element, omr_log: Path | None) -> dict:
             )
 
     conflicts = parse_omr_conflicts(omr_log, starts)
+    source_warnings = []
     for conflict in conflicts:
-        issues.append(
+        source_warnings.append(
             {
                 "kind": "omr-no-correct-rhythm",
                 "page": conflict["page"],
@@ -242,13 +249,21 @@ def audit(root: ET.Element, omr_log: Path | None) -> dict:
         )
 
     issues.sort(key=lambda item: (item["page"], item["measure"], item["kind"], item["part"]))
+    source_warnings.sort(
+        key=lambda item: (item["page"], item["measure"], item["kind"], item["part"])
+    )
     affected = sorted({(item["page"], item["measure"]) for item in issues})
+    source_affected = sorted(
+        {(item["page"], item["measure"]) for item in source_warnings}
+    )
     return {
         "status": "FAIL" if issues else "PASS",
+        "review_status": "REVIEW_REQUIRED" if issues or source_warnings else "CLEAR",
         "scope": (
             "Structural audit only; PASS is not a musical-accuracy certification. "
             "Pitch, spelling, voicing, lyrics, dynamics, articulation, and pedal "
-            "still require visual/source review."
+            "still require visual/source review. Audiveris source warnings are "
+            "reported separately and never waived by structural padding."
         ),
         "page_starts": starts,
         "measure_counts": measure_counts,
@@ -258,6 +273,12 @@ def audit(root: ET.Element, omr_log: Path | None) -> dict:
             {"page": page, "measure": measure} for page, measure in affected
         ],
         "issues": issues,
+        "source_warning_count": len(source_warnings),
+        "source_warning_measure_count": len(source_affected),
+        "source_warning_measures": [
+            {"page": page, "measure": measure} for page, measure in source_affected
+        ],
+        "source_warnings": source_warnings,
     }
 
 
@@ -266,12 +287,15 @@ def write_markdown(report: dict, path: Path) -> None:
         "# MusicXML structural audit",
         "",
         f"**Status:** {report['status']}",
+        f"**Review status:** {report['review_status']}",
         "",
         report["scope"],
         "",
         f"- Issues: {report['issue_count']}",
         f"- Affected measures: {report['affected_measure_count']}",
         f"- Measures per part: {report['measure_counts']}",
+        f"- Audiveris source warnings: {report['source_warning_count']}",
+        f"- Source-warning measures: {report['source_warning_measure_count']}",
         "",
         "| Page | Measure | Part | Issue | Detail |",
         "| ---: | ---: | --- | --- | --- |",
@@ -282,6 +306,26 @@ def write_markdown(report: dict, path: Path) -> None:
             f"| {issue['page']} | {issue['measure']} | {issue['part']} | "
             f"{issue['kind']} | {detail} |"
         )
+    if report["source_warnings"]:
+        lines.extend(
+            [
+                "",
+                "## Source-recognition warnings",
+                "",
+                "These warnings come from the original Audiveris run. They remain a "
+                "manual page/recording-review worklist even when the MusicXML cursor "
+                "structure passes.",
+                "",
+                "| Page | Measure | Source warning | Detail |",
+                "| ---: | ---: | --- | --- |",
+            ]
+        )
+        for warning in report["source_warnings"]:
+            detail = str(warning["detail"]).replace("|", "\\|")
+            lines.append(
+                f"| {warning['page']} | {warning['measure']} | "
+                f"{warning['kind']} | {detail} |"
+            )
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -299,7 +343,8 @@ def main() -> None:
     write_markdown(report, args.markdown)
     print(
         f"{report['status']}: {report['issue_count']} issues across "
-        f"{report['affected_measure_count']} measures"
+        f"{report['affected_measure_count']} measures; "
+        f"{report['source_warning_count']} source warnings remain"
     )
 
 

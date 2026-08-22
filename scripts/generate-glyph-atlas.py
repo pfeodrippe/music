@@ -8,6 +8,7 @@ Dawn/WebGPU and Metal, so application builds do not depend on this tool.
 from __future__ import annotations
 
 import json
+import hashlib
 import pathlib
 import shutil
 import subprocess
@@ -51,7 +52,9 @@ def main() -> None:
                 "-font",
                 str(BRAVURA),
                 "-chars",
-                "0xe050, 0xe062, [0xe080, 0xe089], 0xe0a2, 0xe0a3, 0xe0a4, 0xe240, 0xe241",
+                "0xe050, 0xe062, [0xe080, 0xe089], 0xe0a2, 0xe0a3, 0xe0a4, "
+                "0xe1e7, 0xe240, 0xe241, [0xe260, 0xe264], "
+                "[0xe4a0, 0xe4a5], 0xe4ac, 0xe4ad, 0xe4c0, 0xe4c1, [0xe4e3, 0xe4e8], [0xe520, 0xe526]",
                 "-fontname",
                 "Bravura",
                 "-type",
@@ -80,6 +83,7 @@ def main() -> None:
         if len(raw_image) != expected_size:
             raise SystemExit(f"unexpected atlas byte count: {len(raw_image)} (expected {expected_size})")
         (OUTPUT_DIR / "glyph-atlas.rgba").write_bytes(raw_image)
+        content_hash = int.from_bytes(hashlib.sha256(raw_image).digest()[:8], "little")
 
     atlas = data["atlas"]
     variants = {variant["name"]: variant for variant in data["variants"]}
@@ -96,6 +100,7 @@ def main() -> None:
         f"pub const width: u32 = {atlas['width']};",
         f"pub const height: u32 = {atlas['height']};",
         f"pub const pixel_range: f32 = {zig_float(atlas['distanceRange'])};",
+        f"pub const content_hash: u64 = 0x{content_hash:016x};",
         'pub const pixels = @embedFile("assets/glyph-atlas.rgba");',
         "",
     ]
@@ -141,6 +146,12 @@ def main() -> None:
             "    try testing.expectEqual(@as(usize, width * height * 4), pixels.len);",
             "    try testing.expect(findUi('A') != null);",
             "    try testing.expect(findMusic(0xe050) != null);",
+            "    try testing.expect(findMusic(0xe260) != null);",
+            "    try testing.expect(findMusic(0xe261) != null);",
+            "    try testing.expect(findMusic(0xe262) != null);",
+            "    try testing.expect(findMusic(0xe263) != null);",
+            "    try testing.expect(findMusic(0xe264) != null);",
+            "    try testing.expect(findMusic(0xe1e7) != null);",
             "}",
             "",
         )

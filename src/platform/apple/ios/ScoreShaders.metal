@@ -48,14 +48,24 @@ vertex ScoreVertexOutput scoreVertex(
     };
     ScoreDrawItemGPU item = items[instanceID];
     float2 local = corners[vertexID];
+    uint kind = uint(item.params.x + 0.5);
     float2 pixel = item.rect.xy + local * item.rect.zw;
+    float2 rectSize = item.rect.zw;
+    if (kind == 5) {
+        float2 delta = item.rect.zw - item.rect.xy;
+        float segmentLength = max(length(delta), 0.0001f);
+        float2 direction = delta / segmentLength;
+        float2 normal = float2(-direction.y, direction.x);
+        pixel = item.rect.xy + direction * (local.x * segmentLength) + normal * ((local.y - 0.5f) * item.params.y);
+        rectSize = float2(segmentLength, item.params.y);
+    }
     ScoreVertexOutput output;
     output.position = float4(pixel.x / uniforms.viewport.x * 2.0 - 1.0, 1.0 - pixel.y / uniforms.viewport.y * 2.0, 0, 1);
     output.local = local;
     output.color = item.color;
     output.params = item.params;
     output.screen = pixel;
-    output.rectSize = item.rect.zw;
+    output.rectSize = rectSize;
     output.time = uniforms.time;
     output.atlasUV = mix(item.uv.xy, item.uv.zw, local);
     output.atlasRect = item.uv;

@@ -8,6 +8,8 @@ const hot = @import("../hot_reload/abi.zig");
 const builtin_systems = @import("../systems/plugin.zig");
 const musicxml = @import("import/musicxml.zig");
 const musicxml_export = @import("export/musicxml.zig");
+const mxl_export = @import("export/mxl.zig");
+const midi_export = @import("export/midi.zig");
 const midi = @import("import/midi.zig");
 const mxl = @import("import/mxl.zig");
 const practice_assessment = @import("practice.zig");
@@ -34,6 +36,7 @@ const ComponentIds = struct {
     ui_state: c.ecs_entity_t,
     practice: c.ecs_entity_t,
     document_meta: c.ecs_entity_t,
+    playback_bounds: c.ecs_entity_t,
 };
 
 const RuntimeSystem = struct {
@@ -53,6 +56,12 @@ pub const App = struct {
     note_count: usize = 0,
     lyrics: [musicxml.max_import_lyrics]model.Lyric = undefined,
     lyric_count: usize = 0,
+    harmonies: [musicxml.max_import_harmonies]model.Harmony = undefined,
+    harmony_count: usize = 0,
+    pedals: [musicxml.max_import_pedals]model.PedalEvent = undefined,
+    pedal_count: usize = 0,
+    measures: [musicxml.max_import_measures]model.Measure = undefined,
+    measure_count: usize = 0,
     packet: render.Packet = .{},
     take: recording.Take = .{},
     time_seconds: f32 = 0,
@@ -72,10 +81,14 @@ pub const App = struct {
     systems: [32]?*RuntimeSystem = [_]?*RuntimeSystem{null} ** 32,
     system_count: usize = 0,
     draw_callback: ?hot.DrawCallback = null,
+    dev_command_callback: ?hot.DevCommandCallback = null,
+    plugin_generation: u32 = 0,
     notice_deadline_seconds: f32 = 0,
     last_observed_pitch: u8 = 255,
     last_observation_seconds: f32 = -10,
     audition_pitch: u8 = 255,
+    page_scroll_accumulator: f32 = 0,
+    last_page_scroll_seconds: f32 = -10,
 
     pub fn create(allocator: std.mem.Allocator, width: f32, height: f32, pixel_ratio: f32) !*App {
         const self = try allocator.create(App);
@@ -89,13 +102,15 @@ pub const App = struct {
             .ui_state = registerComponent(world, model.UiState, "Score.UiState"),
             .practice = registerComponent(world, model.PracticeState, "Score.PracticeState"),
             .document_meta = registerComponent(world, model.DocumentMeta, "Score.DocumentMeta"),
+            .playback_bounds = registerComponent(world, model.PlaybackBounds, "Score.PlaybackBounds"),
         };
-        if (ids.note == 0 or ids.transport == 0 or ids.ui_state == 0 or ids.practice == 0 or ids.document_meta == 0) return error.ComponentRegistrationFailed;
+        if (ids.note == 0 or ids.transport == 0 or ids.ui_state == 0 or ids.practice == 0 or ids.document_meta == 0 or ids.playback_bounds == 0) return error.ComponentRegistrationFailed;
 
         const session = createEntity(world, "Score.Session");
         var transport: model.Transport = .{};
         var ui_state: model.UiState = .{ .viewport_width = width, .viewport_height = height, .pixel_ratio = pixel_ratio };
         var practice: model.PracticeState = .{};
+        var playback_bounds: model.PlaybackBounds = .{};
         var meta: model.DocumentMeta = .{};
         meta.setTitle("Piano practice study");
         meta.setCreator("Score");
@@ -103,6 +118,7 @@ pub const App = struct {
         c.ecs_set_id(world, session, ids.ui_state, @sizeOf(model.UiState), &ui_state);
         c.ecs_set_id(world, session, ids.practice, @sizeOf(model.PracticeState), &practice);
         c.ecs_set_id(world, session, ids.document_meta, @sizeOf(model.DocumentMeta), &meta);
+        c.ecs_set_id(world, session, ids.playback_bounds, @sizeOf(model.PlaybackBounds), &playback_bounds);
 
         self.* = App{ .world = world, .ids = ids, .session = session };
         try self.applySystemPlugin(builtin_systems.descriptor());
@@ -138,8 +154,10 @@ pub const App = struct {
         self.advanceTakeReplay(clamped);
         if (after.playing != 0 and after.cursor_beat >= 0) {
             if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| {
-                if (after.cursor_beat < state.view_start_beat or after.cursor_beat >= state.view_start_beat + 16) {
-                    state.view_start_beat = @floor(after.cursor_beat / 16) * 16;
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
+                if (after.cursor_beat < page.startBeat() or after.cursor_beat >= page.endBeat()) {
+                    state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], after.cursor_beat, meta).startBeat();
                     c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
                 }
             }
@@ -165,8 +183,22 @@ pub const App = struct {
         state.pointer_x = event.x;
         state.pointer_y = event.y;
         if (event.kind == .scroll) {
-            const end = self.scoreEndBeat();
-            state.view_start_beat = std.math.clamp(state.view_start_beat + event.scroll_y * 0.04, 0, @max(0, end - 1));
+            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
+            if (layout.stage.contains(event.x, event.y) and self.time_seconds - self.last_page_scroll_seconds >= 0.24) {
+                const dominant_delta = if (@abs(event.scroll_y) >= @abs(event.scroll_x)) event.scroll_y else -event.scroll_x;
+                if (self.page_scroll_accumulator != 0 and std.math.sign(self.page_scroll_accumulator) != std.math.sign(dominant_delta)) self.page_scroll_accumulator = 0;
+                self.page_scroll_accumulator += dominant_delta;
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                if (self.page_scroll_accumulator <= -0.65) {
+                    self.nextScorePage(state, meta);
+                    self.page_scroll_accumulator = 0;
+                    self.last_page_scroll_seconds = self.time_seconds;
+                } else if (self.page_scroll_accumulator >= 0.65) {
+                    self.previousScorePage(state, meta);
+                    self.page_scroll_accumulator = 0;
+                    self.last_page_scroll_seconds = self.time_seconds;
+                }
+            }
         } else if (event.kind == .down) {
             const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
             const transport = self.getMut(model.Transport, self.session, self.ids.transport) orelse return;
@@ -191,6 +223,7 @@ pub const App = struct {
                 transport.recording = if (transport.recording == 0) 1 else 0;
                 if (transport.recording != 0) {
                     self.take.reset(@intFromFloat(self.time_seconds * std.time.ns_per_s));
+                    self.take.tempo_bpm = transport.tempo_bpm;
                     (self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return).* = .{};
                     self.last_observed_pitch = 255;
                     self.last_observation_seconds = -10;
@@ -206,10 +239,10 @@ pub const App = struct {
             } else if (layout.loop_toggle.contains(event.x, event.y)) {
                 if (transport.loop_enabled == 0) {
                     const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-                    const measure_beats: f32 = @floatFromInt(@max(1, meta.beats_per_measure));
-                    transport.loop_start = @floor(@max(0, transport.cursor_beat) / measure_beats) * measure_beats;
-                    transport.loop_end = @min(self.scoreEndBeat(), transport.loop_start + measure_beats);
-                    if (transport.loop_end <= transport.loop_start) transport.loop_end = transport.loop_start + measure_beats;
+                    const position = model.barBeatAt(self.measures[0..self.measure_count], transport.cursor_beat, meta);
+                    transport.loop_start = position.measure_start;
+                    transport.loop_end = @min(self.scoreEndBeat(), position.measure_start + position.measure_duration);
+                    if (transport.loop_end <= transport.loop_start) transport.loop_end = transport.loop_start + position.measure_duration;
                     transport.loop_enabled = 1;
                 } else {
                     transport.loop_enabled = 0;
@@ -220,9 +253,16 @@ pub const App = struct {
                 state.keyboard_visible = if (state.keyboard_visible == 0) 1 else 0;
             } else if (layout.vocal_guide_toggle.contains(event.x, event.y)) {
                 state.vocal_guide_visible = if (state.vocal_guide_visible == 0) 1 else 0;
+            } else if (layout.pedal_guide_toggle.contains(event.x, event.y)) {
+                state.pedal_guide_visible = if (state.pedal_guide_visible == 0) 1 else 0;
+            } else if (layout.tempo_value.contains(event.x, event.y)) {
+                state.tempo_editing = 1;
+                state.tempo_edit_value = @intFromFloat(@round(transport.tempo_bpm));
             } else if (layout.tempo_minus.contains(event.x, event.y)) {
+                state.tempo_editing = 0;
                 transport.tempo_bpm = @max(30, transport.tempo_bpm - 1);
             } else if (layout.tempo_plus.contains(event.x, event.y)) {
+                state.tempo_editing = 0;
                 transport.tempo_bpm = @min(240, transport.tempo_bpm + 1);
             } else if (layout.input_quick.contains(event.x, event.y)) {
                 self.host_request = .choose_microphone;
@@ -231,6 +271,14 @@ pub const App = struct {
             } else if (layout.replay_take.contains(event.x, event.y)) {
                 self.beginTakeReplay();
                 self.host_request = .replay_take;
+            } else if (layout.export_take.contains(event.x, event.y)) {
+                self.host_request = .export_take;
+            } else if (layout.page_previous.contains(event.x, event.y)) {
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                self.previousScorePage(state, meta);
+            } else if (layout.page_next.contains(event.x, event.y)) {
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                self.nextScorePage(state, meta);
             } else if (layout.input_setup.contains(event.x, event.y)) {
                 self.host_request = .choose_microphone;
             } else if (ui.pianoPitchAt(layout.keyboard_panel, event.x, event.y)) |pitch| {
@@ -241,7 +289,11 @@ pub const App = struct {
                 if (layout.stage.contains(event.x, event.y)) switch (state.tool) {
                     .edit => self.insertNoteAt(event.x, event.y, layout.stage),
                     .read, .practice => self.selectNearestNote(event.x, event.y, layout.stage),
-                    .annotate => self.annotations.begin(annotationPoint(event, layout.stage, self.time_seconds), @intFromFloat(@floor(state.view_start_beat / 16))),
+                    .annotate => {
+                        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                        const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
+                        self.annotations.begin(annotationPoint(event, layout.stage, self.time_seconds), page.page_index);
+                    },
                 };
                 for (layout.tool_buttons, 0..) |button, index| {
                     if (button.contains(event.x, event.y)) state.tool = @enumFromInt(index);
@@ -264,6 +316,30 @@ pub const App = struct {
 
     pub fn key(self: *App, event: platform.KeyEvent) void {
         if (event.pressed == 0 or event.repeat != 0) return;
+        if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| {
+            if (state.tempo_editing != 0) {
+                const transport = self.getMut(model.Transport, self.session, self.ids.transport) orelse return;
+                if (event.key >= 48 and event.key <= 57) {
+                    const digit = event.key - 48;
+                    state.tempo_edit_value = if (state.tempo_editing == 1) digit else @min(999, state.tempo_edit_value * 10 + digit);
+                    state.tempo_editing = 2;
+                } else if (event.key == 8 or event.key == 259) {
+                    state.tempo_edit_value /= 10;
+                    state.tempo_editing = 2;
+                } else if (event.key == 13 or event.key == 257) {
+                    if (state.tempo_edit_value >= 30 and state.tempo_edit_value <= 240) {
+                        transport.tempo_bpm = @floatFromInt(state.tempo_edit_value);
+                        state.tempo_editing = 0;
+                        c.ecs_modified_id(self.world, self.session, self.ids.transport);
+                    }
+                } else if (event.key == 27 or event.key == 256) {
+                    state.tempo_editing = 0;
+                }
+                c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+                self.buildFrame();
+                return;
+            }
+        }
         if (event.key == 32) {
             const transport = self.getMut(model.Transport, self.session, self.ids.transport) orelse return;
             self.toggleTransport(transport);
@@ -296,24 +372,34 @@ pub const App = struct {
             state.vocal_guide_visible = if (state.vocal_guide_visible == 0) 1 else 0;
             c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         }
+        if (event.key == 71 or event.key == 103) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.pedal_guide_visible = if (state.pedal_guide_visible == 0) 1 else 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
         if (event.key == 27 or event.key == 256) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
             state.library_open = 0;
             c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         }
-        if (event.key == 34 or event.key == 267) {
+        const state_for_navigation = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
+        const page_forward = event.key == 34 or event.key == 267 or ((event.key == 39 or event.key == 262) and state_for_navigation.tool != .edit);
+        const page_backward = event.key == 33 or event.key == 266 or ((event.key == 37 or event.key == 263) and state_for_navigation.tool != .edit);
+        if (page_forward) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
-            state.view_start_beat = @min(@floor(state.view_start_beat / 16) * 16 + 16, @max(0, self.scoreEndBeat() - 1));
+            const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+            self.nextScorePage(state, meta);
         }
-        if (event.key == 33 or event.key == 266) {
+        if (page_backward) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
-            state.view_start_beat = @max(0, @floor(state.view_start_beat / 16) * 16 - 16);
+            const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+            self.previousScorePage(state, meta);
         }
         if (event.key == 8 or event.key == 46 or event.key == 261) self.deleteSelectedNote();
         if (event.key == 38 or event.key == 265) self.moveSelectedNote(1, 0);
         if (event.key == 40 or event.key == 264) self.moveSelectedNote(-1, 0);
-        if (event.key == 37 or event.key == 263) self.moveSelectedNote(0, -0.25);
-        if (event.key == 39 or event.key == 262) self.moveSelectedNote(0, 0.25);
+        if ((event.key == 37 or event.key == 263) and state_for_navigation.tool == .edit) self.moveSelectedNote(0, -0.25);
+        if ((event.key == 39 or event.key == 262) and state_for_navigation.tool == .edit) self.moveSelectedNote(0, 0.25);
         self.buildFrame();
     }
 
@@ -365,6 +451,13 @@ pub const App = struct {
         self.resetDocumentExtras();
         @memcpy(self.lyrics[0..report.lyric_count], report.lyrics[0..report.lyric_count]);
         self.lyric_count = report.lyric_count;
+        @memcpy(self.harmonies[0..report.harmony_count], report.harmonies[0..report.harmony_count]);
+        self.harmony_count = report.harmony_count;
+        @memcpy(self.pedals[0..report.pedal_count], report.pedals[0..report.pedal_count]);
+        self.pedal_count = report.pedal_count;
+        @memcpy(self.measures[0..report.measure_count], report.measures[0..report.measure_count]);
+        self.measure_count = report.measure_count;
+        self.rebuildTimeline();
         const meta = self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
         meta.* = .{};
         meta.setTitle(if (report.title_len != 0) report.titleSlice() else "IMPORTED MUSICXML SCORE");
@@ -377,6 +470,10 @@ pub const App = struct {
         const transport_state = self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
         transport_state.tempo_bpm = report.tempo_bpm;
         transport_state.cursor_beat = 0;
+        transport_state.playing = 0;
+        transport_state.recording = 0;
+        transport_state.loop_enabled = 0;
+        transport_state.loop_start = 0;
         transport_state.loop_end = self.scoreEndBeat();
         c.ecs_modified_id(self.world, self.session, self.ids.document_meta);
         c.ecs_modified_id(self.world, self.session, self.ids.transport);
@@ -387,14 +484,24 @@ pub const App = struct {
         const report = try midi.parse(source);
         try self.replaceNotes(report.notes[0..report.note_count]);
         self.resetDocumentExtras();
+        @memcpy(self.pedals[0..report.pedal_count], report.pedals[0..report.pedal_count]);
+        self.pedal_count = report.pedal_count;
+        self.rebuildTimeline();
         const meta = self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
         meta.* = .{};
         meta.setTitle(if (report.title_len != 0) report.titleSlice() else "IMPORTED MIDI PERFORMANCE");
         meta.setCreator("QUANTIZATION REVIEW");
         meta.source_kind = 2;
+        meta.beats_per_measure = report.beats_per_measure;
+        meta.beat_unit = report.beat_unit;
+        meta.key_fifths = report.key_fifths;
         const transport_state = self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
         transport_state.tempo_bpm = report.tempo_bpm;
         transport_state.cursor_beat = 0;
+        transport_state.playing = 0;
+        transport_state.recording = 0;
+        transport_state.loop_enabled = 0;
+        transport_state.loop_start = 0;
         transport_state.loop_end = self.scoreEndBeat();
         c.ecs_modified_id(self.world, self.session, self.ids.document_meta);
         c.ecs_modified_id(self.world, self.session, self.ids.transport);
@@ -421,6 +528,9 @@ pub const App = struct {
         self.annotations = .{};
         self.take = .{};
         self.lyric_count = 0;
+        self.harmony_count = 0;
+        self.pedal_count = 0;
+        self.measure_count = 0;
         (self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return).* = .{};
         if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| state.view_start_beat = 0;
     }
@@ -442,9 +552,18 @@ pub const App = struct {
         const message = status & 0xf0;
         if (message == 0x90 and data2 != 0) self.assessMidiNote(data1);
         if (message == 0xb0) switch (data1) {
-            64 => ui_state.sustain_pedal = data2,
-            66 => ui_state.sostenuto_pedal = data2,
-            67 => ui_state.soft_pedal = data2,
+            64 => {
+                self.assessPedal(model.pedal_sustain, @intCast(ui_state.sustain_pedal), data2);
+                ui_state.sustain_pedal = data2;
+            },
+            66 => {
+                self.assessPedal(model.pedal_sostenuto, @intCast(ui_state.sostenuto_pedal), data2);
+                ui_state.sostenuto_pedal = data2;
+            },
+            67 => {
+                self.assessPedal(model.pedal_soft, @intCast(ui_state.soft_pedal), data2);
+                ui_state.soft_pedal = data2;
+            },
             else => {},
         };
         c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
@@ -495,6 +614,12 @@ pub const App = struct {
         for (self.note_entities[0..self.note_count], 0..) |entity, index| snapshot.notes[index] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
         snapshot.lyric_count = self.lyric_count;
         @memcpy(snapshot.lyrics[0..self.lyric_count], self.lyrics[0..self.lyric_count]);
+        snapshot.harmony_count = self.harmony_count;
+        @memcpy(snapshot.harmonies[0..self.harmony_count], self.harmonies[0..self.harmony_count]);
+        snapshot.pedal_count = self.pedal_count;
+        @memcpy(snapshot.pedals[0..self.pedal_count], self.pedals[0..self.pedal_count]);
+        snapshot.measure_count = self.measure_count;
+        @memcpy(snapshot.measures[0..self.measure_count], self.measures[0..self.measure_count]);
         snapshot.annotations = self.annotations;
         snapshot.take = self.take;
         return native_format.encode(snapshot, output);
@@ -512,7 +637,36 @@ pub const App = struct {
             notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
             count += 1;
         }
-        return musicxml_export.write(output, meta, transport, notes[0..count], self.lyrics[0..self.lyric_count]);
+        return musicxml_export.write(output, meta, transport, notes[0..count], self.lyrics[0..self.lyric_count], self.harmonies[0..self.harmony_count], self.pedals[0..self.pedal_count], self.measures[0..self.measure_count]);
+    }
+
+    /// Exports the same editable notation inside the standard compressed
+    /// MusicXML (`.mxl`) container used by MuseScore and other notation tools.
+    pub fn exportMxl(self: *const App, output: []u8) !usize {
+        const xml = try std.heap.c_allocator.alloc(u8, output.len);
+        defer std.heap.c_allocator.free(xml);
+        const xml_len = try self.exportMusicXml(xml);
+        return mxl_export.write(output, xml[0..xml_len]);
+    }
+
+    /// Exports a deterministic Type-1 Standard MIDI File with conductor,
+    /// piano, optional vocal-guide, and three-pedal automation tracks.
+    pub fn exportMidi(self: *const App, output: []u8) !usize {
+        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
+        const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
+        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        var count: usize = 0;
+        for (self.note_entities[0..self.note_count]) |entity| {
+            notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
+            count += 1;
+        }
+        return midi_export.write(output, meta, transport.tempo_bpm, notes[0..count], self.pedals[0..self.pedal_count]);
+    }
+
+    pub fn exportTakeMidi(self: *const App, output: []u8) !usize {
+        if (self.take.midi_len == 0) return error.EmptyMidiTake;
+        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
+        return midi_export.writeTake(output, meta, &self.take);
     }
 
     pub fn deserialize(self: *App, source: []const u8) !void {
@@ -522,6 +676,13 @@ pub const App = struct {
         try self.replaceNotes(snapshot.notes[0..snapshot.note_count]);
         self.lyric_count = snapshot.lyric_count;
         @memcpy(self.lyrics[0..self.lyric_count], snapshot.lyrics[0..snapshot.lyric_count]);
+        self.harmony_count = snapshot.harmony_count;
+        @memcpy(self.harmonies[0..self.harmony_count], snapshot.harmonies[0..snapshot.harmony_count]);
+        self.pedal_count = snapshot.pedal_count;
+        @memcpy(self.pedals[0..self.pedal_count], snapshot.pedals[0..snapshot.pedal_count]);
+        self.measure_count = snapshot.measure_count;
+        @memcpy(self.measures[0..self.measure_count], snapshot.measures[0..snapshot.measure_count]);
+        self.rebuildTimeline();
         (self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta).* = snapshot.meta;
         (self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport).* = snapshot.transport;
         self.annotations = snapshot.annotations;
@@ -535,11 +696,173 @@ pub const App = struct {
         return (self.getConst(model.Transport, self.session, self.ids.transport) orelse unreachable).*;
     }
 
+    /// Executes a local development command against the live Flecs session.
+    /// The native debug socket is omitted from release builds; keeping parsing
+    /// here makes the behavior directly unit-testable without a window.
+    pub fn runDevCommand(self: *App, source: []const u8, response: []u8) usize {
+        const input = std.mem.trim(u8, source, " \t\r\n");
+        if (input.len == 0) return devResponse(response, "error empty command", .{});
+
+        const transport_state = self.getMut(model.Transport, self.session, self.ids.transport) orelse return devResponse(response, "error missing transport", .{});
+        const ui_state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return devResponse(response, "error missing ui", .{});
+        const practice_state = self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return devResponse(response, "error missing practice", .{});
+        const meta = self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return devResponse(response, "error missing metadata", .{});
+        const bounds = self.getMut(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return devResponse(response, "error missing playback bounds", .{});
+
+        var result_len: usize = 0;
+        if (std.mem.eql(u8, input, "help")) {
+            result_len = devResponse(response, "ok commands: state | load FILE | export FILE | export-take FILE | capture FILE | record start|stop | midi STATUS DATA1 DATA2 | sampler state | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
+        } else if (std.mem.eql(u8, input, "state")) {
+            const position = model.barBeatAt(self.measures[0..self.measure_count], transport_state.cursor_beat, meta);
+            result_len = devResponse(response, "ok generation={d} playing={d} cursor={d:.3} tempo={d:.2} end={d:.3} page={d:.3} bar={d} beat={d} measures={d} keys={d} voice={d} pedalguide={d} notes={d} harmonies={d} pedals={d} take={d} title={s}", .{
+                self.plugin_generation,
+                transport_state.playing,
+                transport_state.cursor_beat,
+                transport_state.tempo_bpm,
+                bounds.end_beat,
+                ui_state.view_start_beat,
+                position.bar,
+                position.beat,
+                self.measure_count,
+                ui_state.keyboard_visible,
+                ui_state.vocal_guide_visible,
+                ui_state.pedal_guide_visible,
+                self.note_count,
+                self.harmony_count,
+                self.pedal_count,
+                self.take.midi_len,
+                meta.titleSlice(),
+            });
+        } else if (commandArgument(input, "record")) |argument| {
+            if (std.mem.eql(u8, argument, "start")) {
+                transport_state.recording = 1;
+                self.take.reset(@intFromFloat(self.time_seconds * std.time.ns_per_s));
+                self.take.tempo_bpm = transport_state.tempo_bpm;
+                practice_state.* = .{};
+                self.host_request = .start_recording;
+                result_len = devResponse(response, "ok recording=1 tempo={d:.2}", .{self.take.tempo_bpm});
+            } else if (std.mem.eql(u8, argument, "stop")) {
+                transport_state.recording = 0;
+                self.take.stopped_ns = @intFromFloat(self.time_seconds * std.time.ns_per_s);
+                self.host_request = .stop_recording;
+                result_len = devResponse(response, "ok recording=0 take={d}", .{self.take.midi_len});
+            } else {
+                return devResponse(response, "error record expects start or stop", .{});
+            }
+        } else if (commandArgument(input, "midi")) |argument| {
+            var fields = std.mem.tokenizeAny(u8, argument, " \t");
+            const status_text = fields.next() orelse return devResponse(response, "error midi expects STATUS DATA1 DATA2", .{});
+            const data1_text = fields.next() orelse return devResponse(response, "error midi expects STATUS DATA1 DATA2", .{});
+            const data2_text = fields.next() orelse return devResponse(response, "error midi expects STATUS DATA1 DATA2", .{});
+            if (fields.next() != null) return devResponse(response, "error midi expects STATUS DATA1 DATA2", .{});
+            const status = std.fmt.parseInt(u8, status_text, 0) catch return devResponse(response, "error invalid MIDI status", .{});
+            const data1 = std.fmt.parseInt(u8, data1_text, 0) catch return devResponse(response, "error invalid MIDI data1", .{});
+            const data2 = std.fmt.parseInt(u8, data2_text, 0) catch return devResponse(response, "error invalid MIDI data2", .{});
+            if (status < 0x80 or status >= 0xf0 or data1 >= 128 or data2 >= 128) return devResponse(response, "error invalid MIDI channel message", .{});
+            self.midiInput(@intFromFloat(self.time_seconds * std.time.ns_per_s), status, data1, data2);
+            result_len = devResponse(response, "ok midi=0x{x} {d} {d} take={d}", .{ status, data1, data2, self.take.midi_len });
+        } else if (std.mem.eql(u8, input, "play")) {
+            if (transport_state.playing == 0) self.toggleTransport(transport_state);
+            result_len = devResponse(response, "ok playing={d} cursor={d:.3}", .{ transport_state.playing, transport_state.cursor_beat });
+        } else if (std.mem.eql(u8, input, "pause")) {
+            transport_state.playing = 0;
+            result_len = devResponse(response, "ok playing=0 cursor={d:.3}", .{transport_state.cursor_beat});
+        } else if (std.mem.eql(u8, input, "toggle")) {
+            self.toggleTransport(transport_state);
+            result_len = devResponse(response, "ok playing={d} cursor={d:.3}", .{ transport_state.playing, transport_state.cursor_beat });
+        } else if (commandArgument(input, "seek")) |argument| {
+            const beat = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error seek expects a number", .{});
+            transport_state.cursor_beat = std.math.clamp(beat, 0, bounds.end_beat);
+            ui_state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], transport_state.cursor_beat, meta).startBeat();
+            result_len = devResponse(response, "ok cursor={d:.3} page={d:.3}", .{ transport_state.cursor_beat, ui_state.view_start_beat });
+        } else if (commandArgument(input, "page")) |argument| {
+            if (std.mem.eql(u8, argument, "next")) {
+                self.nextScorePage(ui_state, meta);
+            } else if (std.mem.eql(u8, argument, "previous")) {
+                self.previousScorePage(ui_state, meta);
+            } else {
+                return devResponse(response, "error page expects next or previous", .{});
+            }
+            const page = ui.scorePageForBeat(self.measures[0..self.measure_count], ui_state.view_start_beat, meta);
+            result_len = devResponse(response, "ok page={d} start={d:.3} end={d:.3}", .{ page.page_index + 1, page.startBeat(), page.endBeat() });
+        } else if (commandArgument(input, "tempo")) |argument| {
+            const bpm = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error tempo expects a number", .{});
+            transport_state.tempo_bpm = std.math.clamp(bpm, 30, 240);
+            result_len = devResponse(response, "ok tempo={d:.2}", .{transport_state.tempo_bpm});
+        } else if (commandArgument(input, "keys")) |argument| {
+            ui_state.keyboard_visible = devToggle(argument, ui_state.keyboard_visible) orelse return devResponse(response, "error keys expects on, off, or toggle", .{});
+            result_len = devResponse(response, "ok keys={d}", .{ui_state.keyboard_visible});
+        } else if (commandArgument(input, "voice")) |argument| {
+            ui_state.vocal_guide_visible = devToggle(argument, ui_state.vocal_guide_visible) orelse return devResponse(response, "error voice expects on, off, or toggle", .{});
+            result_len = devResponse(response, "ok voice={d}", .{ui_state.vocal_guide_visible});
+        } else if (commandArgument(input, "pedal")) |argument| {
+            ui_state.pedal_guide_visible = devToggle(argument, ui_state.pedal_guide_visible) orelse return devResponse(response, "error pedal expects on, off, or toggle", .{});
+            result_len = devResponse(response, "ok pedalguide={d}", .{ui_state.pedal_guide_visible});
+        } else if (commandArgument(input, "metronome")) |argument| {
+            transport_state.metronome_enabled = devToggle(argument, transport_state.metronome_enabled) orelse return devResponse(response, "error metronome expects on, off, or toggle", .{});
+            result_len = devResponse(response, "ok metronome={d}", .{transport_state.metronome_enabled});
+        } else if (commandArgument(input, "loop")) |argument| {
+            transport_state.loop_enabled = devToggle(argument, transport_state.loop_enabled) orelse return devResponse(response, "error loop expects on, off, or toggle", .{});
+            result_len = devResponse(response, "ok loop={d}", .{transport_state.loop_enabled});
+        } else if (commandArgument(input, "tool")) |argument| {
+            ui_state.tool = if (std.mem.eql(u8, argument, "read"))
+                .read
+            else if (std.mem.eql(u8, argument, "edit"))
+                .edit
+            else if (std.mem.eql(u8, argument, "ink"))
+                .annotate
+            else if (std.mem.eql(u8, argument, "practice"))
+                .practice
+            else
+                return devResponse(response, "error unknown tool", .{});
+            result_len = devResponse(response, "ok tool={s}", .{argument});
+        } else if (commandArgument(input, "plugin")) |argument| {
+            const callback = self.dev_command_callback orelse return devResponse(response, "error hot plugin has no command hook", .{});
+            var notes: [musicxml.max_import_notes]model.Note = undefined;
+            for (self.note_entities[0..self.note_count], 0..) |entity, index| {
+                notes[index] = (self.getConst(model.Note, entity, self.ids.note) orelse continue).*;
+            }
+            var context = hot.DevCommandContext{
+                .command = argument.ptr,
+                .command_len = @intCast(argument.len),
+                .response = response.ptr,
+                .response_capacity = @intCast(response.len),
+                .response_len = 0,
+                .transport = transport_state,
+                .ui_state = ui_state,
+                .practice = practice_state,
+                .document_meta = meta,
+                .playback_bounds = bounds,
+                .notes = &notes,
+                .note_count = @intCast(self.note_count),
+            };
+            callback(&context);
+            for (self.note_entities[0..self.note_count], 0..) |entity, index| {
+                if (self.getMut(model.Note, entity, self.ids.note)) |note| note.* = notes[index];
+                c.ecs_modified_id(self.world, entity, self.ids.note);
+            }
+            self.rebuildTimeline();
+            result_len = @min(response.len, context.response_len);
+            if (result_len == 0) result_len = devResponse(response, "ok plugin command completed", .{});
+        } else {
+            result_len = devResponse(response, "error unknown command; run help", .{});
+        }
+
+        c.ecs_modified_id(self.world, self.session, self.ids.transport);
+        c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        c.ecs_modified_id(self.world, self.session, self.ids.practice);
+        c.ecs_modified_id(self.world, self.session, self.ids.document_meta);
+        c.ecs_modified_id(self.world, self.session, self.ids.playback_bounds);
+        self.buildFrame();
+        return result_len;
+    }
+
     /// Installs or replaces a development module at a frame boundary. Flecs
     /// component storage remains untouched. Query changes recreate only the
     /// affected system entity; callback-only changes are pointer swaps.
     pub fn applySystemPlugin(self: *App, plugin: *const hot.PluginDescriptor) !void {
         if (!hot.compatible(plugin)) return error.IncompatiblePlugin;
+        if (plugin.glyph_atlas_hash != builtin_systems.descriptor().glyph_atlas_hash) return error.GlyphAtlasMismatch;
         for (plugin.systems[0..plugin.system_count]) |descriptor| {
             if (descriptor.term_count > hot.max_query_terms) return error.InvalidQuery;
             if (self.findRuntime(descriptor.stable_id)) |slot| {
@@ -558,6 +881,8 @@ pub const App = struct {
             }
         }
         if (plugin.draw) |draw_callback| self.draw_callback = draw_callback;
+        self.dev_command_callback = plugin.dev_command;
+        self.plugin_generation = plugin.generation;
     }
 
     pub fn restoreBuiltinSystems(self: *App) void {
@@ -623,29 +948,43 @@ pub const App = struct {
         self.rebuildTimeline();
     }
 
+    fn vocalStaffVisible(self: *const App, state: *const model.UiState) bool {
+        if (state.vocal_guide_visible == 0) return false;
+        for (self.note_entities[0..self.note_count]) |entity| {
+            const note = self.getConst(model.Note, entity, self.ids.note) orelse continue;
+            if ((note.flags & model.note_flag_vocal_guide) != 0) return true;
+        }
+        return false;
+    }
+
     fn insertNoteAt(self: *App, x: f32, y: f32, stage: ui.Rect) void {
         if (self.note_count == self.note_entities.len) return;
-        const geometry = ui.ScoreGeometry.calculate(stage);
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
-        const system_index: u8 = if (y < (geometry.treble_y[0] + geometry.bass_y[0] + 48 + geometry.treble_y[1]) / 3) 0 else 1;
+        const vocal_visible = self.vocalStaffVisible(state);
+        const geometry = ui.ScoreGeometry.calculateWithVocal(stage, vocal_visible);
+        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+        const measures = self.measures[0..self.measure_count];
+        const page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        const next_system_top = if (vocal_visible) geometry.vocal_y[1] else geometry.treble_y[1];
+        const system_index: u8 = if (y < (geometry.bass_y[0] + 48 + next_system_top) * 0.5) 0 else 1;
         const treble_distance = @abs(y - (geometry.treble_y[system_index] + 24));
         const bass_distance = @abs(y - (geometry.bass_y[system_index] + 24));
         const staff: u8 = if (bass_distance < treble_distance) 1 else 0;
-        const beat_in_system = std.math.clamp((x - geometry.music_x) / geometry.beat_width, 0, 7.75);
-        const quantized = @round(beat_in_system * 4) / 4 + @as(f32, @floatFromInt(system_index)) * 8;
+        const absolute_beat = ui.scoreBeatAtX(geometry, page, measures, system_index, x);
+        const quantized = @round(absolute_beat * 4) / 4;
         var pitch: u8 = 21;
         var pitch_distance: f32 = std.math.floatMax(f32);
         for (21..109) |candidate_value| {
             const candidate: u8 = @intCast(candidate_value);
-            const candidate_note = model.Note{ .stable_id = 0, .start_beat = state.view_start_beat + quantized, .duration_beats = 0.5, .pitch = candidate, .velocity = 88, .staff = staff, .voice = 0 };
-            const position = ui.notePosition(candidate_note, geometry, state.view_start_beat) orelse continue;
+            const candidate_note = model.Note{ .stable_id = 0, .start_beat = quantized, .duration_beats = 0.5, .pitch = candidate, .velocity = 88, .staff = staff, .voice = 0 };
+            const position = ui.scoreNotePosition(candidate_note, geometry, page, measures) orelse continue;
             const distance = @abs(position.y - y);
             if (distance < pitch_distance) {
                 pitch_distance = distance;
                 pitch = candidate;
             }
         }
-        const note = model.Note{ .stable_id = self.next_note_id, .start_beat = state.view_start_beat + quantized, .duration_beats = 0.5, .pitch = pitch, .velocity = 88, .staff = staff, .voice = 0, .selected = 1 };
+        const note = model.Note{ .stable_id = self.next_note_id, .start_beat = quantized, .duration_beats = 0.5, .pitch = pitch, .velocity = 88, .staff = staff, .voice = 0, .selected = 1 };
         self.next_note_id += 1;
         self.insertNote(note, true);
     }
@@ -715,13 +1054,17 @@ pub const App = struct {
 
     fn selectNearestNote(self: *App, x: f32, y: f32, stage: ui.Rect) void {
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
-        const geometry = ui.ScoreGeometry.calculate(stage);
+        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+        const geometry = ui.ScoreGeometry.calculateWithVocal(stage, self.vocalStaffVisible(state));
+        const measures = self.measures[0..self.measure_count];
+        const page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
         var best_entity: c.ecs_entity_t = 0;
         var best_distance_squared: f32 = std.math.floatMax(f32);
         for (self.note_entities[0..self.note_count]) |entity| {
             const note = self.getMut(model.Note, entity, self.ids.note) orelse continue;
             note.selected = 0;
-            const position = ui.notePosition(note.*, geometry, state.view_start_beat) orelse continue;
+            if ((note.flags & model.note_flag_vocal_guide) != 0 and state.vocal_guide_visible == 0) continue;
+            const position = ui.scoreNotePosition(note.*, geometry, page, measures) orelse continue;
             const dx = position.x - x;
             const dy = position.y - y;
             const distance_squared = dx * dx + dy * dy;
@@ -745,7 +1088,20 @@ pub const App = struct {
         for (self.note_entities[0..self.note_count]) |entity| {
             if (self.getConst(model.Note, entity, self.ids.note)) |note| result = @max(result, note.start_beat + note.duration_beats);
         }
+        for (self.pedals[0..self.pedal_count]) |event| result = @max(result, event.start_beat);
         return result;
+    }
+
+    fn nextScorePage(self: *const App, state: *model.UiState, meta: *const model.DocumentMeta) void {
+        const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
+        if (page.endBeat() < self.scoreEndBeat() - 0.0001) state.view_start_beat = page.endBeat();
+    }
+
+    fn previousScorePage(self: *const App, state: *model.UiState, meta: *const model.DocumentMeta) void {
+        const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
+        if (page.startBeat() > 0.0001) {
+            state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], page.startBeat() - 0.001, meta).startBeat();
+        }
     }
 
     fn toggleTransport(self: *App, transport: *model.Transport) void {
@@ -753,9 +1109,11 @@ pub const App = struct {
             transport.playing = 0;
             return;
         }
+        const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
+        if (transport.cursor_beat >= bounds.end_beat - 0.001) transport.cursor_beat = 0;
         if (transport.cursor_beat <= 0.001 and transport.count_in_bars != 0) {
             const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-            transport.cursor_beat = -@as(f32, @floatFromInt(transport.count_in_bars * @max(1, meta.beats_per_measure)));
+            transport.cursor_beat = -@as(f32, @floatFromInt(transport.count_in_bars)) * meta.measureBeats();
         }
         transport.playing = 1;
     }
@@ -771,7 +1129,7 @@ pub const App = struct {
         var nearest_distance: f32 = 1000;
         for (self.note_entities[0..self.note_count]) |entity| {
             const note = self.getConst(model.Note, entity, self.ids.note) orelse continue;
-            if ((note.flags & model.note_flag_vocal_guide) != 0) continue;
+            if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
             const distance = @abs(note.start_beat - transport_state.cursor_beat);
             if (distance < nearest_distance) {
                 nearest_distance = distance;
@@ -791,6 +1149,32 @@ pub const App = struct {
         }
         state.confidence = confidence;
         state.average_timing_ms = if (state.total_notes == 1) @abs(result.timing_delta_ms) else (state.average_timing_ms * @as(f32, @floatFromInt(state.total_notes - 1)) + @abs(result.timing_delta_ms)) / @as(f32, @floatFromInt(state.total_notes));
+        c.ecs_modified_id(self.world, self.session, self.ids.practice);
+    }
+
+    fn assessPedal(self: *App, pedal: u8, previous_value: u8, value: u8) void {
+        const was_down = previous_value >= 64;
+        const is_down = value >= 64;
+        if (was_down == is_down) return;
+        const transport_state = self.getConst(model.Transport, self.session, self.ids.transport) orelse return;
+        if (transport_state.cursor_beat < 0) return;
+        var nearest: ?model.PedalEvent = null;
+        var nearest_distance = std.math.inf(f32);
+        for (self.pedals[0..self.pedal_count]) |event| {
+            if (event.pedal != pedal or (event.value >= 64) != is_down) continue;
+            const distance = @abs(event.start_beat - transport_state.cursor_beat);
+            if (distance < nearest_distance) {
+                nearest_distance = distance;
+                nearest = event;
+            }
+        }
+        const expected = nearest orelse return;
+        const milliseconds_per_beat = 60_000.0 / @max(1, transport_state.tempo_bpm);
+        const delta_ms = (transport_state.cursor_beat - expected.start_beat) * milliseconds_per_beat;
+        const practice_state = self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return;
+        practice_state.pedal_changes += 1;
+        practice_state.last_pedal_timing_ms = delta_ms;
+        if (@abs(delta_ms) > 160) practice_state.pedal_errors += 1;
         c.ecs_modified_id(self.world, self.session, self.ids.practice);
     }
 
@@ -818,12 +1202,18 @@ pub const App = struct {
                 .note_count = @intCast(len),
                 .lyrics = self.lyrics[0..].ptr,
                 .lyric_count = @intCast(self.lyric_count),
+                .harmonies = self.harmonies[0..].ptr,
+                .harmony_count = @intCast(self.harmony_count),
+                .pedals = self.pedals[0..].ptr,
+                .pedal_count = @intCast(self.pedal_count),
+                .measures = self.measures[0..].ptr,
+                .measure_count = @intCast(self.measure_count),
                 .annotations = &self.annotations,
                 .time_seconds = self.time_seconds,
             };
             draw_callback(&context);
         } else {
-            ui.draw(&self.packet, state, transport, practice, meta, notes[0..len], self.lyrics[0..self.lyric_count], &self.annotations, self.time_seconds);
+            ui.draw(&self.packet, state, transport, practice, meta, notes[0..len], self.lyrics[0..self.lyric_count], self.harmonies[0..self.harmony_count], self.pedals[0..self.pedal_count], self.measures[0..self.measure_count], &self.annotations, self.time_seconds);
         }
         self.accessibility.build(state, transport, meta);
     }
@@ -838,22 +1228,39 @@ pub const App = struct {
             }
         }
         self.timeline = playback.Timeline.build(notes[0..len]) catch .{};
+        const bounds = self.getMut(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
+        bounds.end_beat = self.scoreEndBeat();
+        c.ecs_modified_id(self.world, self.session, self.ids.playback_bounds);
     }
 
     fn extractPlayback(self: *App, before: model.Transport, after: model.Transport) void {
         if (after.playing == 0) {
-            if (self.was_playing) self.pushPlayback(.{ .pitch = 0, .velocity = 0, .channel = 0, .on = 2 });
+            // A transport system may have stopped exactly at the document end.
+            // Emit the final slice before the all-notes-off event so a note
+            // beginning in the last host frame is not silently skipped.
+            if (before.playing != 0 and after.cursor_beat > before.cursor_beat) {
+                self.emitRange(before.cursor_beat, after.cursor_beat);
+                self.emitMetronomeRange(before.cursor_beat, after.cursor_beat, before);
+            }
+            if (self.was_playing) {
+                self.pushPedalReset();
+                self.pushPlayback(.{ .pitch = 0, .velocity = 0, .channel = 0, .on = 2 });
+            }
             self.was_playing = false;
             self.previous_cursor = after.cursor_beat;
             return;
         }
         var start = before.cursor_beat;
-        if (!self.was_playing) start -= 0.0001;
+        if (!self.was_playing) {
+            self.syncScorePedals(@max(0, start));
+            start -= 0.0001;
+        }
         if (after.cursor_beat < start) {
             self.pushPlayback(.{ .pitch = 0, .velocity = 0, .channel = 0, .on = 2 });
             self.emitRange(start, before.loop_end);
             self.emitMetronomeRange(start, before.loop_end - 0.0001, after);
             start = before.loop_start - 0.0001;
+            self.syncScorePedals(@max(0, before.loop_start));
         }
         self.emitRange(start, after.cursor_beat);
         self.emitMetronomeRange(start, after.cursor_beat, after);
@@ -865,14 +1272,55 @@ pub const App = struct {
         for (self.timeline.events[0..self.timeline.len]) |event| {
             if (event.beat > start and event.beat <= end) self.pushPlayback(.{ .pitch = event.pitch, .velocity = event.velocity, .channel = event.channel, .on = event.on });
         }
+        for (self.pedals[0..self.pedal_count]) |event| {
+            if (event.start_beat > start and event.start_beat <= end) self.pushPlayback(.{ .pitch = pedalController(event.pedal), .velocity = event.value, .channel = 0, .on = 4 });
+        }
+    }
+
+    fn syncScorePedals(self: *App, beat: f32) void {
+        for (0..3) |pedal| self.pushPlayback(.{ .pitch = pedalController(@intCast(pedal)), .velocity = self.scorePedalValueAt(@intCast(pedal), beat), .channel = 0, .on = 4 });
+    }
+
+    fn pushPedalReset(self: *App) void {
+        for (0..3) |pedal| self.pushPlayback(.{ .pitch = pedalController(@intCast(pedal)), .velocity = 0, .channel = 0, .on = 4 });
+    }
+
+    fn scorePedalValueAt(self: *const App, pedal: u8, beat: f32) u8 {
+        var value: u8 = 0;
+        for (self.pedals[0..self.pedal_count]) |event| {
+            if (event.start_beat > beat + 0.0001) break;
+            if (event.pedal == pedal) value = event.value;
+        }
+        return value;
     }
 
     fn emitMetronomeRange(self: *App, start: f32, end: f32, transport: model.Transport) void {
         if (transport.metronome_enabled == 0 or end < start) return;
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-        const beats_per_measure: i64 = @max(1, meta.beats_per_measure);
-        var beat_index: i64 = @as(i64, @intFromFloat(@floor(start))) + 1;
-        while (@as(f32, @floatFromInt(beat_index)) <= end + 0.00001) : (beat_index += 1) {
+        if (self.measure_count == 0) {
+            self.emitFixedMetronomeRange(start, end, 0, meta.beats_per_measure, meta.beat_unit);
+            return;
+        }
+        for (self.measures[0..self.measure_count]) |measure| {
+            const measure_end = measure.start_beat + @max(0.0001, measure.duration_beats);
+            if (measure_end <= start + 0.00001 or measure.start_beat > end + 0.00001) continue;
+            const beat_length = measure.beatLength();
+            var beat_index: u32 = 0;
+            while (measure.start_beat + @as(f32, @floatFromInt(beat_index)) * beat_length < measure_end - 0.00001) : (beat_index += 1) {
+                const click = measure.start_beat + @as(f32, @floatFromInt(beat_index)) * beat_length;
+                if (click > start + 0.00001 and click <= end + 0.00001) self.pushPlayback(.{ .pitch = 0, .velocity = if (beat_index == 0) 127 else 86, .channel = 0, .on = 3 });
+            }
+        }
+        const last = self.measures[self.measure_count - 1];
+        const authored_end = last.start_beat + @max(0.0001, last.duration_beats);
+        if (end > authored_end + 0.00001) self.emitFixedMetronomeRange(@max(start, authored_end - 0.0001), end, authored_end, meta.beats_per_measure, meta.beat_unit);
+    }
+
+    fn emitFixedMetronomeRange(self: *App, start: f32, end: f32, origin: f32, beats: u8, beat_unit: u8) void {
+        const beat_length = 4.0 / @as(f32, @floatFromInt(@max(1, beat_unit)));
+        const beats_per_measure: i64 = @max(1, beats);
+        var beat_index: i64 = @as(i64, @intFromFloat(@floor((start - origin) / beat_length))) + 1;
+        while (origin + @as(f32, @floatFromInt(beat_index)) * beat_length <= end + 0.00001) : (beat_index += 1) {
             const accent = @mod(beat_index, beats_per_measure) == 0;
             self.pushPlayback(.{ .pitch = 0, .velocity = if (accent) 127 else 86, .channel = 0, .on = 3 });
         }
@@ -897,8 +1345,12 @@ pub const App = struct {
         while (self.take_replay_index < self.take.midi_len) {
             const event = self.take.midi[self.take_replay_index];
             if (event.time_ns -| base > self.take_replay_elapsed_ns) break;
-            const on: u8 = if (event.kind == 0x90 and event.data2 != 0) 1 else 0;
-            self.pushPlayback(.{ .pitch = event.data1, .velocity = event.data2, .channel = event.channel, .on = on });
+            switch (event.kind) {
+                0x90 => self.pushPlayback(.{ .pitch = event.data1, .velocity = event.data2, .channel = event.channel, .on = if (event.data2 == 0) 0 else 1 }),
+                0x80 => self.pushPlayback(.{ .pitch = event.data1, .velocity = event.data2, .channel = event.channel, .on = 0 }),
+                0xb0 => self.pushPlayback(.{ .pitch = event.data1, .velocity = event.data2, .channel = event.channel, .on = 4 }),
+                else => {}, // Preserve unsupported messages in export; do not misplay them as notes.
+            }
             self.take_replay_index += 1;
         }
         if (self.take_replay_index == self.take.midi_len) self.take_replaying = false;
@@ -953,6 +1405,7 @@ pub const App = struct {
             .practice_state => .{ .id = self.ids.practice, .size = @sizeOf(model.PracticeState) },
             .note => .{ .id = self.ids.note, .size = @sizeOf(model.Note) },
             .document_meta => .{ .id = self.ids.document_meta, .size = @sizeOf(model.DocumentMeta) },
+            .playback_bounds => .{ .id = self.ids.playback_bounds, .size = @sizeOf(model.PlaybackBounds) },
             else => .{ .id = 0, .size = 0 },
         };
     }
@@ -967,6 +1420,33 @@ pub const App = struct {
         return @ptrCast(@alignCast(raw));
     }
 };
+
+fn commandArgument(input: []const u8, command_name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, input, command_name)) return null;
+    if (input.len == command_name.len) return "";
+    if (input[command_name.len] != ' ') return null;
+    return std.mem.trim(u8, input[command_name.len + 1 ..], " \t\r\n");
+}
+
+fn pedalController(pedal: u8) u8 {
+    return switch (pedal) {
+        model.pedal_sostenuto => 66,
+        model.pedal_soft => 67,
+        else => 64,
+    };
+}
+
+fn devToggle(argument: []const u8, current: u32) ?u32 {
+    if (std.mem.eql(u8, argument, "on")) return 1;
+    if (std.mem.eql(u8, argument, "off")) return 0;
+    if (std.mem.eql(u8, argument, "toggle")) return if (current == 0) 1 else 0;
+    return null;
+}
+
+fn devResponse(output: []u8, comptime format: []const u8, arguments: anytype) usize {
+    const value = std.fmt.bufPrint(output, format, arguments) catch return 0;
+    return value.len;
+}
 
 fn createEntity(world: *c.ecs_world_t, name: ?[*:0]const u8) c.ecs_entity_t {
     var descriptor: c.ecs_entity_desc_t = std.mem.zeroes(c.ecs_entity_desc_t);
@@ -1025,6 +1505,244 @@ test "Flecs world advances playback and produces a GPU packet" {
     try std.testing.expect(app.drawItems().len > 300);
 }
 
+test "hot-reloadable transport stops at score end and replay starts over" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const bounds = app.getConst(model.PlaybackBounds, app.session, app.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
+    const expected_end = bounds.end_beat;
+    const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
+    transport.count_in_bars = 0;
+    transport.cursor_beat = expected_end - 0.01;
+    transport.playing = 1;
+    app.was_playing = true;
+
+    app.tick(0.1);
+    const stopped = app.transportSnapshot();
+    try std.testing.expectEqual(@as(u32, 0), stopped.playing);
+    try std.testing.expectApproxEqAbs(expected_end, stopped.cursor_beat, 0.0001);
+    var events: [256]playback.HostEvent = undefined;
+    const event_count = app.drainPlaybackEvents(&events);
+    try std.testing.expect(event_count != 0);
+    try std.testing.expectEqual(@as(u8, 2), events[event_count - 1].on);
+
+    app.key(.{ .key = 32, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    const restarted = app.transportSnapshot();
+    try std.testing.expectEqual(@as(u32, 1), restarted.playing);
+    try std.testing.expectEqual(@as(f32, 0), restarted.cursor_beat);
+}
+
+test "accessible GPU pedal button toggles score and keyboard guidance" {
+    const app = try App.create(std.heap.c_allocator, 1440, 900, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const before_items = app.drawItems().len;
+    app.accessibilityActivate(accessibility.Id.pedal_guide);
+    const state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    try std.testing.expectEqual(@as(u32, 0), state.pedal_guide_visible);
+    try std.testing.expect(app.drawItems().len < before_items);
+    app.key(.{ .key = 'G', .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u32, 1), state.pedal_guide_visible);
+}
+
+test "development commands control live Flecs state and invoke hot Zig code" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    var response: [512]u8 = undefined;
+
+    var len = app.runDevCommand("tempo 91.5", &response);
+    try std.testing.expect(std.mem.startsWith(u8, response[0..len], "ok tempo=91.50"));
+    try std.testing.expectApproxEqAbs(@as(f32, 91.5), app.transportSnapshot().tempo_bpm, 0.001);
+
+    len = app.runDevCommand("keys off", &response);
+    try std.testing.expectEqualStrings("ok keys=0", response[0..len]);
+    const ui_state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    try std.testing.expectEqual(@as(u32, 0), ui_state.keyboard_visible);
+
+    len = app.runDevCommand("pedal off", &response);
+    try std.testing.expectEqualStrings("ok pedalguide=0", response[0..len]);
+    try std.testing.expectEqual(@as(u32, 0), ui_state.pedal_guide_visible);
+
+    const first_before = (app.getConst(model.Note, app.note_entities[0], app.ids.note) orelse return error.MissingNote).pitch;
+    len = app.runDevCommand("plugin transpose 1", &response);
+    try std.testing.expect(std.mem.startsWith(u8, response[0..len], "ok transposed="));
+    const first_after = (app.getConst(model.Note, app.note_entities[0], app.ids.note) orelse return error.MissingNote).pitch;
+    try std.testing.expectEqual(first_before + 1, first_after);
+
+    len = app.runDevCommand("state", &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "generation=11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "keys=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "pedalguide=0") != null);
+}
+
+test "MusicXML harmony survives app import GPU state and export re-import" {
+    const fixture =
+        \\<score-partwise version="4.0"><work><work-title>Harmony Study</work-title></work>
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list><part id="P1"><measure number="1">
+        \\<attributes><divisions>4</divisions><key><fifths>-5</fifths></key><time><beats>6</beats><beat-type>4</beat-type></time></attributes>
+        \\<harmony><root><root-step>B</root-step><root-alter>-1</root-alter></root><kind text="m7">minor-seventh</kind><bass><bass-step>D</bass-step><bass-alter>-1</bass-alter></bass></harmony>
+        \\<note><pitch><step>D</step><alter>-1</alter><octave>4</octave></pitch><duration>24</duration><staff>1</staff></note>
+        \\</measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(fixture);
+    try std.testing.expectEqual(@as(usize, 1), app.harmony_count);
+    try std.testing.expectEqualStrings("m7", app.harmonies[0].textSlice());
+    const draw_items_with_harmony = app.drawItems().len;
+    app.harmony_count = 0;
+    app.tick(0);
+    const draw_items_without_harmony = app.drawItems().len;
+    try std.testing.expect(draw_items_with_harmony > draw_items_without_harmony);
+    app.harmony_count = 1;
+    app.tick(0);
+
+    var exported: [64 * 1024]u8 = undefined;
+    const exported_len = try app.exportMusicXml(&exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported[0..exported_len], "<kind text=\"m7\">minor-seventh</kind>") != null);
+    const imported_again = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer imported_again.destroy(std.heap.c_allocator);
+    try imported_again.importMusicXml(exported[0..exported_len]);
+    try std.testing.expectEqual(@as(usize, 1), imported_again.harmony_count);
+    try std.testing.expectEqual(@as(i8, -1), imported_again.harmonies[0].bass_alter);
+}
+
+test "MusicXML sustain pedal survives app import practice and export re-import" {
+    const fixture =
+        \\<score-partwise version="4.0"><work><work-title>Pedal Study</work-title></work>
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list><part id="P1"><measure number="1">
+        \\<attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<direction placement="below"><direction-type><pedal type="start" line="yes"/></direction-type><staff>2</staff></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><staff>1</staff></note>
+        \\<direction placement="below"><direction-type><pedal type="stop" line="yes"/></direction-type><staff>2</staff></direction>
+        \\</measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(fixture);
+    try std.testing.expectEqual(@as(usize, 2), app.pedal_count);
+    app.emitRange(-0.001, 0.001);
+    var playback_batch: [8]playback.HostEvent = undefined;
+    const playback_count = app.drainPlaybackEvents(&playback_batch);
+    var emitted_sustain = false;
+    for (playback_batch[0..playback_count]) |event| emitted_sustain = emitted_sustain or (event.on == 4 and event.pitch == 64 and event.velocity == 127);
+    try std.testing.expect(emitted_sustain);
+    const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
+    transport.cursor_beat = app.pedals[0].start_beat;
+    app.midiInput(1, 0xb0, 64, 127);
+    const practice = app.getConst(model.PracticeState, app.session, app.ids.practice) orelse return error.MissingPracticeState;
+    try std.testing.expectEqual(@as(u32, 1), practice.pedal_changes);
+    try std.testing.expectEqual(@as(u32, 0), practice.pedal_errors);
+    transport.cursor_beat = app.pedals[1].start_beat + 1;
+    app.midiInput(2, 0xb0, 64, 0);
+    const late_practice = app.getConst(model.PracticeState, app.session, app.ids.practice) orelse return error.MissingPracticeState;
+    try std.testing.expectEqual(@as(u32, 2), late_practice.pedal_changes);
+    try std.testing.expectEqual(@as(u32, 1), late_practice.pedal_errors);
+
+    var exported: [64 * 1024]u8 = undefined;
+    const exported_len = try app.exportMusicXml(&exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported[0..exported_len], "<pedal type=\"start\" line=\"yes\"/>") != null);
+    const imported_again = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer imported_again.destroy(std.heap.c_allocator);
+    try imported_again.importMusicXml(exported[0..exported_len]);
+    try std.testing.expectEqual(@as(usize, 2), imported_again.pedal_count);
+    try std.testing.expectEqual(model.pedal_action_stop, imported_again.pedals[1].action);
+}
+
+test "Standard MIDI pedal automation reaches playback and document bounds" {
+    const fixture = [_]u8{
+        'M',  'T',  'h',  'd',  0,    0,  0, 6,    0,    0,    0,  1,   1,    0xe0,
+        'M',  'T',  'r',  'k',  0,    0,  0, 22,   0x00, 0xb0, 64, 127, 0x00, 0x90,
+        60,   100,  0x83, 0x60, 0x80, 60, 0, 0x8f, 0x00, 0xb0, 64, 0,   0x00, 0xff,
+        0x2f, 0x00,
+    };
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMidi(&fixture);
+    try std.testing.expectEqual(@as(usize, 2), app.pedal_count);
+    try std.testing.expectEqual(model.pedal_action_start, app.pedals[0].action);
+    try std.testing.expectEqual(model.pedal_action_stop, app.pedals[1].action);
+    const bounds = app.getConst(model.PlaybackBounds, app.session, app.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
+    try std.testing.expectApproxEqAbs(@as(f32, 5), bounds.end_beat, 0.001);
+
+    app.emitRange(-0.001, 0.001);
+    app.emitRange(4.9, 5.0);
+    var events: [16]playback.HostEvent = undefined;
+    const count = app.drainPlaybackEvents(&events);
+    var saw_down = false;
+    var saw_up = false;
+    for (events[0..count]) |event| {
+        if (event.on != 4 or event.pitch != 64) continue;
+        saw_down = saw_down or event.velocity == 127;
+        saw_up = saw_up or event.velocity == 0;
+    }
+    try std.testing.expect(saw_down and saw_up);
+}
+
+test "app Standard MIDI export re-imports notes metadata and pedal tail" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const source =
+        \\<?xml version="1.0"?><score-partwise version="4.0">
+        \\<work><work-title>MIDI Exchange</work-title></work><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions><key><fifths>-2</fifths></key><time><beats>3</beats><beat-type>4</beat-type></time><staves>2</staves></attributes>
+        \\<direction><sound tempo="96"/></direction><direction><direction-type><pedal type="start" line="yes"/></direction-type></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff></note>
+        \\<direction><offset>2</offset><direction-type><pedal type="stop" line="yes"/></direction-type></direction>
+        \\</measure></part></score-partwise>
+    ;
+    try app.importMusicXml(source);
+    const expected_end = app.scoreEndBeat();
+    var encoded: [8192]u8 = undefined;
+    const encoded_len = try app.exportMidi(&encoded);
+    const imported = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer imported.destroy(std.heap.c_allocator);
+    try imported.importMidi(encoded[0..encoded_len]);
+    const meta = imported.getConst(model.DocumentMeta, imported.session, imported.ids.document_meta) orelse return error.MissingDocumentMeta;
+    const transport = imported.getConst(model.Transport, imported.session, imported.ids.transport) orelse return error.MissingTransport;
+    try std.testing.expectEqualStrings("MIDI Exchange", meta.titleSlice());
+    try std.testing.expectEqual(@as(u8, 3), meta.beats_per_measure);
+    try std.testing.expectEqual(@as(u8, 4), meta.beat_unit);
+    try std.testing.expectEqual(@as(i8, -2), meta.key_fifths);
+    try std.testing.expectApproxEqAbs(@as(f32, 96), transport.tempo_bpm, 0.01);
+    try std.testing.expectEqual(@as(usize, 2), imported.pedal_count);
+    try std.testing.expectApproxEqAbs(expected_end, imported.scoreEndBeat(), 0.001);
+}
+
+test "captured take exports human MIDI timing through the accessible GPU action" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    app.take.tempo_bpm = 100;
+    app.take.pushMidi(.{ .time_ns = 2_000_000_000, .sequence = 0, .kind = 0x90, .channel = 3, .data1 = 65, .data2 = 88 });
+    app.take.pushMidi(.{ .time_ns = 2_300_000_000, .sequence = 1, .kind = 0x80, .channel = 3, .data1 = 65, .data2 = 0 });
+    var output: [4096]u8 = undefined;
+    const length = try app.exportTakeMidi(&output);
+    const report = try midi.parse(output[0..length]);
+    try std.testing.expectEqual(@as(usize, 1), report.note_count);
+    try std.testing.expectEqual(@as(u8, 3), report.notes[0].voice);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), report.notes[0].duration_beats, 0.001);
+
+    var found_accessible_export = false;
+    for (app.accessibilityItems()) |item| found_accessible_export = found_accessible_export or item.id == accessibility.Id.export_take;
+    try std.testing.expect(found_accessible_export);
+    app.accessibilityActivate(accessibility.Id.export_take);
+    try std.testing.expectEqual(platform.HostRequest.export_take, app.takeHostRequest());
+}
+
+test "recorded take replay sends pedal controllers instead of false note-offs" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    app.take.pushMidi(.{ .time_ns = 1_000, .sequence = 0, .kind = 0xb0, .channel = 0, .data1 = 64, .data2 = 100 });
+    app.take.pushMidi(.{ .time_ns = 2_000, .sequence = 1, .kind = 0x90, .channel = 0, .data1 = 60, .data2 = 90 });
+    app.beginTakeReplay();
+    app.advanceTakeReplay(1);
+    var events: [8]playback.HostEvent = undefined;
+    const count = app.drainPlaybackEvents(&events);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(u8, 4), events[0].on);
+    try std.testing.expectEqual(@as(u8, 64), events[0].pitch);
+    try std.testing.expectEqual(@as(u8, 100), events[0].velocity);
+    try std.testing.expectEqual(@as(u8, 1), events[1].on);
+}
+
 test "count-in produces accented metronome host events before notation" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
@@ -1033,8 +1751,9 @@ test "count-in produces accented metronome host events before notation" {
     var events: [16]playback.HostEvent = undefined;
     const count = app.drainPlaybackEvents(&events);
     try std.testing.expect(count >= 1);
-    try std.testing.expectEqual(@as(u8, 3), events[0].on);
-    try std.testing.expectEqual(@as(u8, 127), events[0].velocity);
+    var found_accent = false;
+    for (events[0..count]) |event| found_accent = found_accent or (event.on == 3 and event.velocity == 127);
+    try std.testing.expect(found_accent);
     try std.testing.expect(app.transportSnapshot().cursor_beat < 0);
 }
 
@@ -1048,6 +1767,14 @@ test "multiple Flecs system queries share the hot-reload plugin ABI" {
     try std.testing.expect(practice.confidence < 1);
 }
 
+test "hot reload rejects glyph metadata for a different host atlas" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    var mismatched = builtin_systems.descriptor().*;
+    mismatched.glyph_atlas_hash ^= 1;
+    try std.testing.expectError(error.GlyphAtlasMismatch, app.applySystemPlugin(&mismatched));
+}
+
 test "bundled public-domain score library imports offline" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
@@ -1055,13 +1782,37 @@ test "bundled public-domain score library imports offline" {
     try std.testing.expect(app.note_count > 20);
     try app.loadBundledScore(1);
     try std.testing.expect(app.note_count > 100);
+    try std.testing.expect(app.pedal_count > 20);
     const meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
     try std.testing.expect(std.mem.indexOf(u8, meta.titleSlice(), "Elise") != null);
+}
+
+test "importing a score resets document-scoped transport state" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
+    transport.cursor_beat = 9;
+    transport.playing = 1;
+    transport.recording = 1;
+    transport.loop_enabled = 1;
+    transport.loop_start = 8;
+    try app.importMusicXml(bundled_beethoven_fur_elise);
+    const imported = app.transportSnapshot();
+    try std.testing.expectEqual(@as(f32, 0), imported.cursor_beat);
+    try std.testing.expectEqual(@as(u32, 0), imported.playing);
+    try std.testing.expectEqual(@as(u32, 0), imported.recording);
+    try std.testing.expectEqual(@as(u32, 0), imported.loop_enabled);
+    try std.testing.expectEqual(@as(f32, 0), imported.loop_start);
+    try std.testing.expect(imported.loop_end > 4);
 }
 
 test "loop button isolates the current meter-aware measure" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
+    app.measures[0] = .{ .start_beat = 0, .duration_beats = 4, .number = 1, .beats = 4, .beat_unit = 4 };
+    app.measures[1] = .{ .start_beat = 4, .duration_beats = 2, .number = 2, .beats = 2, .beat_unit = 4 };
+    app.measures[2] = .{ .start_beat = 6, .duration_beats = 4, .number = 3, .beats = 4, .beat_unit = 4 };
+    app.measure_count = 3;
     const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
     transport.cursor_beat = 5.25;
     const button = ui.Layout.calculate(1280, 800, true).loop_toggle;
@@ -1080,7 +1831,21 @@ test "loop button isolates the current meter-aware measure" {
     });
     try std.testing.expectEqual(@as(u32, 1), transport.loop_enabled);
     try std.testing.expectEqual(@as(f32, 4), transport.loop_start);
-    try std.testing.expectEqual(@as(f32, 8), transport.loop_end);
+    try std.testing.expectEqual(@as(f32, 6), transport.loop_end);
+}
+
+test "metronome accents every authored variable-meter barline" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    app.measures[0] = .{ .start_beat = 0, .duration_beats = 4, .number = 1, .beats = 4, .beat_unit = 4 };
+    app.measures[1] = .{ .start_beat = 4, .duration_beats = 2, .number = 2, .beats = 2, .beat_unit = 4 };
+    app.measure_count = 2;
+    app.emitMetronomeRange(3.9, 4.1, .{ .metronome_enabled = 1 });
+    var events: [4]playback.HostEvent = undefined;
+    const count = app.drainPlaybackEvents(&events);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(u8, 3), events[0].on);
+    try std.testing.expectEqual(@as(u8, 127), events[0].velocity);
 }
 
 test "page navigation preserves the Flecs document and moves the GPU score window" {
@@ -1091,6 +1856,99 @@ test "page navigation preserves the Flecs document and moves the GPU score windo
     const state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
     try std.testing.expectEqual(@as(f32, 16), @floor(state.view_start_beat / 16) * 16);
     try std.testing.expect(app.drawItems().len > 100);
+}
+
+test "paged score responds to visible controls wheel gestures and reading arrows" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
+
+    app.pointer(.{ .kind = .down, .pointer_type = .mouse, .id = 1, .buttons = 1, .x = layout.page_next.x + 8, .y = layout.page_next.y + 8, .pressure = 1, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expect(state.view_start_beat > 0);
+    const second_page = state.view_start_beat;
+
+    app.pointer(.{ .kind = .down, .pointer_type = .mouse, .id = 1, .buttons = 1, .x = layout.page_previous.x + 8, .y = layout.page_previous.y + 8, .pressure = 1, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(f32, 0), state.view_start_beat);
+
+    app.pointer(.{ .kind = .scroll, .pointer_type = .mouse, .id = 1, .buttons = 0, .x = layout.stage.x + layout.stage.width * 0.5, .y = layout.stage.y + layout.stage.height * 0.5, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = -1 });
+    try std.testing.expectEqual(second_page, state.view_start_beat);
+    app.tick(0.1);
+    app.tick(0.1);
+    app.tick(0.1);
+    app.pointer(.{ .kind = .scroll, .pointer_type = .mouse, .id = 1, .buttons = 0, .x = layout.stage.x + layout.stage.width * 0.5, .y = layout.stage.y + layout.stage.height * 0.5, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 1 });
+    try std.testing.expectEqual(@as(f32, 0), state.view_start_beat);
+
+    app.key(.{ .key = 262, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(second_page, state.view_start_beat);
+    state.tool = .edit;
+    app.key(.{ .key = 262, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(second_page, state.view_start_beat);
+}
+
+test "clicking the GPU tempo readout edits and validates BPM" {
+    const app = try App.create(std.heap.c_allocator, 1440, 900, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
+    const click = platform.PointerEvent{
+        .kind = .down,
+        .pointer_type = .mouse,
+        .id = 1,
+        .buttons = 1,
+        .x = layout.tempo_value.x + layout.tempo_value.width * 0.5,
+        .y = layout.tempo_value.y + layout.tempo_value.height * 0.5,
+        .pressure = 1,
+        .tilt_x = 0,
+        .tilt_y = 0,
+        .scroll_x = 0,
+        .scroll_y = 0,
+    };
+    app.pointer(click);
+    try std.testing.expectEqual(@as(u32, 1), state.tempo_editing);
+    for ([_]u32{ '1', '4', '7', 257 }) |key_code| app.key(.{ .key = key_code, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u32, 0), state.tempo_editing);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), app.transportSnapshot().tempo_bpm, 0.001);
+
+    app.pointer(click);
+    for ([_]u32{ '2', '9', 257 }) |key_code| app.key(.{ .key = key_code, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u32, 2), state.tempo_editing);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), app.transportSnapshot().tempo_bpm, 0.001);
+    app.key(.{ .key = 256, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u32, 0), state.tempo_editing);
+}
+
+test "variable-meter page navigation and annotation anchors use authored systems" {
+    const app = try App.create(std.heap.c_allocator, 1024, 768, 2);
+    defer app.destroy(std.heap.c_allocator);
+    app.measures[0] = .{ .start_beat = 0, .duration_beats = 4, .number = 1, .beats = 4, .beat_unit = 4 };
+    app.measures[1] = .{ .start_beat = 4, .duration_beats = 4, .number = 2, .beats = 4, .beat_unit = 4 };
+    app.measures[2] = .{ .start_beat = 8, .duration_beats = 2, .number = 3, .beats = 2, .beat_unit = 4 };
+    app.measures[3] = .{ .start_beat = 10, .duration_beats = 4, .number = 4, .beats = 4, .beat_unit = 4 };
+    app.measures[4] = .{ .start_beat = 14, .duration_beats = 3, .number = 5, .beats = 3, .beat_unit = 4 };
+    app.measures[5] = .{ .start_beat = 17, .duration_beats = 5, .number = 6, .beats = 5, .beat_unit = 4 };
+    app.measures[6] = .{ .start_beat = 22, .duration_beats = 2, .number = 7, .beats = 2, .beat_unit = 4 };
+    app.measure_count = 7;
+
+    var response: [256]u8 = undefined;
+    var response_len = app.runDevCommand("page next", &response);
+    try std.testing.expectEqualStrings("ok page=2 start=17.000 end=24.000", response[0..response_len]);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    try std.testing.expectEqual(@as(f32, 17), state.view_start_beat);
+    state.tool = .annotate;
+    state.keyboard_visible = 0;
+    const stage = ui.Layout.calculate(state.viewport_width, state.viewport_height, false).stage;
+    app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 7, .buttons = 1, .x = stage.x + stage.width * 0.5, .y = stage.y + stage.height * 0.5, .pressure = 0.7, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 7, .buttons = 0, .x = stage.x + stage.width * 0.5, .y = stage.y + stage.height * 0.5, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.annotations.stroke_count);
+    try std.testing.expectEqual(@as(u32, 1), app.annotations.strokes[0].page_index);
+
+    response_len = app.runDevCommand("page previous", &response);
+    try std.testing.expectEqualStrings("ok page=1 start=0.000 end=17.000", response[0..response_len]);
+    try std.testing.expectEqual(@as(f32, 0), state.view_start_beat);
+
+    response_len = app.runDevCommand("page sideways", &response);
+    try std.testing.expectEqualStrings("error page expects next or previous", response[0..response_len]);
 }
 
 test "GPU top bar exposes MusicXML export action" {
