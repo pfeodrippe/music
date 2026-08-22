@@ -39,6 +39,13 @@ const ComponentIds = struct {
     playback_bounds: c.ecs_entity_t,
 };
 
+const ScoreHitContext = struct {
+    stage: ui.Rect,
+    page: ui.ScorePage,
+    x: f32,
+    y: f32,
+};
+
 const RuntimeSystem = struct {
     stable_id: u64,
     callback: hot.SystemCallback,
@@ -155,9 +162,25 @@ pub const App = struct {
         if (after.playing != 0 and after.cursor_beat >= 0) {
             if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| {
                 const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-                const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
-                if (after.cursor_beat < page.startBeat() or after.cursor_beat >= page.endBeat()) {
-                    state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], after.cursor_beat, meta).startBeat();
+                const measures = self.measures[0..self.measure_count];
+                var window = if (state.score_view_mode == .continuous)
+                    ui.scoreContinuousForBeat(measures, state.view_start_beat, meta)
+                else
+                    ui.scorePageForBeat(measures, state.view_start_beat, meta);
+                var visible_end = window.endBeat();
+                if (state.score_view_mode == .spread) {
+                    const right = ui.scorePageForBeat(measures, window.endBeat(), meta);
+                    if (right.page_index != window.page_index) visible_end = right.endBeat();
+                }
+                if (after.cursor_beat < window.startBeat() or after.cursor_beat >= visible_end) {
+                    window = if (state.score_view_mode == .continuous)
+                        ui.scoreContinuousForBeat(measures, after.cursor_beat, meta)
+                    else
+                        ui.scorePageForBeat(measures, after.cursor_beat, meta);
+                    if (state.score_view_mode == .spread and (window.page_index & 1) != 0 and window.startBeat() > 0.0001) {
+                        window = ui.scorePageForBeat(measures, window.startBeat() - 0.001, meta);
+                    }
+                    state.view_start_beat = window.startBeat();
                     c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
                 }
             }
@@ -183,7 +206,7 @@ pub const App = struct {
         state.pointer_x = event.x;
         state.pointer_y = event.y;
         if (event.kind == .scroll) {
-            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
+            const layout = ui.Layout.calculateForState(state);
             if (layout.stage.contains(event.x, event.y) and self.time_seconds - self.last_page_scroll_seconds >= 0.24) {
                 const dominant_delta = if (@abs(event.scroll_y) >= @abs(event.scroll_x)) event.scroll_y else -event.scroll_x;
                 if (self.page_scroll_accumulator != 0 and std.math.sign(self.page_scroll_accumulator) != std.math.sign(dominant_delta)) self.page_scroll_accumulator = 0;
@@ -200,7 +223,7 @@ pub const App = struct {
                 }
             }
         } else if (event.kind == .down) {
-            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
+            const layout = ui.Layout.calculateForState(state);
             const transport = self.getMut(model.Transport, self.session, self.ids.transport) orelse return;
             if (state.library_open != 0) {
                 if (layout.library_items[0].contains(event.x, event.y)) {
@@ -264,6 +287,19 @@ pub const App = struct {
             } else if (layout.tempo_plus.contains(event.x, event.y)) {
                 state.tempo_editing = 0;
                 transport.tempo_bpm = @min(240, transport.tempo_bpm + 1);
+            } else if (layout.view_mode_toggle.contains(event.x, event.y)) {
+                state.score_view_mode = switch (state.score_view_mode) {
+                    .paged => .continuous,
+                    .continuous => .spread,
+                    .spread => .paged,
+                };
+                state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return).startBeat();
+            } else if (layout.zoom_minus.contains(event.x, event.y)) {
+                state.zoom = @max(0.65, state.zoom - 0.1);
+            } else if (layout.zoom_plus.contains(event.x, event.y)) {
+                state.zoom = @min(1.05, state.zoom + 0.1);
+            } else if (layout.focus_toggle.contains(event.x, event.y)) {
+                state.focus_score = if (state.focus_score == 0) 1 else 0;
             } else if (layout.input_quick.contains(event.x, event.y)) {
                 self.host_request = .choose_microphone;
             } else if (layout.export_score.contains(event.x, event.y)) {
@@ -291,8 +327,8 @@ pub const App = struct {
                     .read, .practice => self.selectNearestNote(event.x, event.y, layout.stage),
                     .annotate => {
                         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-                        const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
-                        self.annotations.begin(annotationPoint(event, layout.stage, self.time_seconds), page.page_index);
+                        const hit = self.scoreHitContext(state, meta, layout.stage, event.x, event.y);
+                        self.annotations.begin(annotationPoint(hit.x, hit.y, event.pressure, hit.stage, self.time_seconds), hit.page.page_index);
                     },
                 };
                 for (layout.tool_buttons, 0..) |button, index| {
@@ -301,8 +337,15 @@ pub const App = struct {
             }
             c.ecs_modified_id(self.world, self.session, self.ids.transport);
         } else if (event.kind == .move and state.tool == .annotate and self.annotations.active != null) {
-            const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
-            if (layout.stage.contains(event.x, event.y)) self.annotations.append(annotationPoint(event, layout.stage, self.time_seconds));
+            const layout = ui.Layout.calculateForState(state);
+            if (layout.stage.contains(event.x, event.y)) {
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                const hit = self.scoreHitContext(state, meta, layout.stage, event.x, event.y);
+                const active = self.annotations.active orelse return;
+                if (self.annotations.strokes[active].page_index == hit.page.page_index) {
+                    self.annotations.append(annotationPoint(hit.x, hit.y, event.pressure, hit.stage, self.time_seconds));
+                }
+            }
         } else if (event.kind == .up or event.kind == .cancel) {
             if (self.audition_pitch != 255) {
                 self.pushPlayback(.{ .pitch = self.audition_pitch, .velocity = 0, .channel = 0, .on = 0 });
@@ -375,6 +418,30 @@ pub const App = struct {
         if (event.key == 71 or event.key == 103) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
             state.pedal_guide_visible = if (state.pedal_guide_visible == 0) 1 else 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 70 or event.key == 102) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.focus_score = if (state.focus_score == 0) 1 else 0;
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 77 or event.key == 109) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.score_view_mode = switch (state.score_view_mode) {
+                .paged => .continuous,
+                .continuous => .spread,
+                .spread => .paged,
+            };
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 91) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.zoom = @max(0.65, state.zoom - 0.1);
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
+        if (event.key == 93) {
+            const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+            state.zoom = @min(1.05, state.zoom + 0.1);
             c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         }
         if (event.key == 27 or event.key == 256) {
@@ -711,16 +778,19 @@ pub const App = struct {
 
         var result_len: usize = 0;
         if (std.mem.eql(u8, input, "help")) {
-            result_len = devResponse(response, "ok commands: state | load FILE | export FILE | export-take FILE | capture FILE | record start|stop | midi STATUS DATA1 DATA2 | sampler state | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
+            result_len = devResponse(response, "ok commands: state | load FILE | export FILE | export-take FILE | capture FILE | record start|stop | midi STATUS DATA1 DATA2 | sampler state | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | view paged|continuous|spread | zoom 0.65..1.05 | focus on|off|toggle | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
         } else if (std.mem.eql(u8, input, "state")) {
             const position = model.barBeatAt(self.measures[0..self.measure_count], transport_state.cursor_beat, meta);
-            result_len = devResponse(response, "ok generation={d} playing={d} cursor={d:.3} tempo={d:.2} end={d:.3} page={d:.3} bar={d} beat={d} measures={d} keys={d} voice={d} pedalguide={d} notes={d} harmonies={d} pedals={d} take={d} title={s}", .{
+            result_len = devResponse(response, "ok generation={d} playing={d} cursor={d:.3} tempo={d:.2} end={d:.3} page={d:.3} view={s} zoom={d:.2} focus={d} bar={d} beat={d} measures={d} keys={d} voice={d} pedalguide={d} notes={d} harmonies={d} pedals={d} take={d} title={s}", .{
                 self.plugin_generation,
                 transport_state.playing,
                 transport_state.cursor_beat,
                 transport_state.tempo_bpm,
                 bounds.end_beat,
                 ui_state.view_start_beat,
+                @tagName(ui_state.score_view_mode),
+                ui_state.zoom,
+                ui_state.focus_score,
                 position.bar,
                 position.beat,
                 self.measure_count,
@@ -789,6 +859,23 @@ pub const App = struct {
             const bpm = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error tempo expects a number", .{});
             transport_state.tempo_bpm = std.math.clamp(bpm, 30, 240);
             result_len = devResponse(response, "ok tempo={d:.2}", .{transport_state.tempo_bpm});
+        } else if (commandArgument(input, "view")) |argument| {
+            ui_state.score_view_mode = if (std.mem.eql(u8, argument, "paged"))
+                .paged
+            else if (std.mem.eql(u8, argument, "continuous"))
+                .continuous
+            else if (std.mem.eql(u8, argument, "spread"))
+                .spread
+            else
+                return devResponse(response, "error view expects paged, continuous, or spread", .{});
+            result_len = devResponse(response, "ok view={s}", .{@tagName(ui_state.score_view_mode)});
+        } else if (commandArgument(input, "zoom")) |argument| {
+            const zoom = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error zoom expects a number", .{});
+            ui_state.zoom = std.math.clamp(zoom, 0.65, 1.05);
+            result_len = devResponse(response, "ok zoom={d:.2}", .{ui_state.zoom});
+        } else if (commandArgument(input, "focus")) |argument| {
+            ui_state.focus_score = devToggle(argument, ui_state.focus_score) orelse return devResponse(response, "error focus expects on, off, or toggle", .{});
+            result_len = devResponse(response, "ok focus={d}", .{ui_state.focus_score});
         } else if (commandArgument(input, "keys")) |argument| {
             ui_state.keyboard_visible = devToggle(argument, ui_state.keyboard_visible) orelse return devResponse(response, "error keys expects on, off, or toggle", .{});
             result_len = devResponse(response, "ok keys={d}", .{ui_state.keyboard_visible});
@@ -957,20 +1044,50 @@ pub const App = struct {
         return false;
     }
 
+    fn scoreHitContext(self: *const App, state: *const model.UiState, meta: *const model.DocumentMeta, stage: ui.Rect, x: f32, y: f32) ScoreHitContext {
+        const measures = self.measures[0..self.measure_count];
+        var pane = stage;
+        var page = if (state.score_view_mode == .continuous)
+            ui.scoreContinuousForBeat(measures, state.view_start_beat, meta)
+        else
+            ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        if (state.score_view_mode == .spread and stage.width >= 760) {
+            const gap: f32 = 12;
+            const pane_width = (stage.width - gap) * 0.5;
+            if (x >= stage.x + pane_width + gap) {
+                pane = .{ .x = stage.x + pane_width + gap, .y = stage.y, .width = pane_width, .height = stage.height };
+                const right = ui.scorePageForBeat(measures, page.endBeat(), meta);
+                if (right.page_index != page.page_index) page = right;
+            } else {
+                pane.width = pane_width;
+            }
+        }
+        const zoom = std.math.clamp(state.zoom, 0.65, 1.05);
+        const center_x = pane.x + pane.width * 0.5;
+        const center_y = pane.y + pane.height * 0.5;
+        return .{
+            .stage = pane,
+            .page = page,
+            .x = center_x + (x - center_x) / zoom,
+            .y = center_y + (y - center_y) / zoom,
+        };
+    }
+
     fn insertNoteAt(self: *App, x: f32, y: f32, stage: ui.Rect) void {
         if (self.note_count == self.note_entities.len) return;
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
         const vocal_visible = self.vocalStaffVisible(state);
-        const geometry = ui.ScoreGeometry.calculateWithVocal(stage, vocal_visible);
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
         const measures = self.measures[0..self.measure_count];
-        const page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        const hit = self.scoreHitContext(state, meta, stage, x, y);
+        const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, vocal_visible);
+        const page = hit.page;
         const next_system_top = if (vocal_visible) geometry.vocal_y[1] else geometry.treble_y[1];
-        const system_index: u8 = if (y < (geometry.bass_y[0] + 48 + next_system_top) * 0.5) 0 else 1;
-        const treble_distance = @abs(y - (geometry.treble_y[system_index] + 24));
-        const bass_distance = @abs(y - (geometry.bass_y[system_index] + 24));
+        const system_index: u8 = if (hit.y < (geometry.bass_y[0] + 48 + next_system_top) * 0.5) 0 else 1;
+        const treble_distance = @abs(hit.y - (geometry.treble_y[system_index] + 24));
+        const bass_distance = @abs(hit.y - (geometry.bass_y[system_index] + 24));
         const staff: u8 = if (bass_distance < treble_distance) 1 else 0;
-        const absolute_beat = ui.scoreBeatAtX(geometry, page, measures, system_index, x);
+        const absolute_beat = ui.scoreBeatAtX(geometry, page, measures, system_index, hit.x);
         const quantized = @round(absolute_beat * 4) / 4;
         var pitch: u8 = 21;
         var pitch_distance: f32 = std.math.floatMax(f32);
@@ -978,7 +1095,7 @@ pub const App = struct {
             const candidate: u8 = @intCast(candidate_value);
             const candidate_note = model.Note{ .stable_id = 0, .start_beat = quantized, .duration_beats = 0.5, .pitch = candidate, .velocity = 88, .staff = staff, .voice = 0 };
             const position = ui.scoreNotePosition(candidate_note, geometry, page, measures) orelse continue;
-            const distance = @abs(position.y - y);
+            const distance = @abs(position.y - hit.y);
             if (distance < pitch_distance) {
                 pitch_distance = distance;
                 pitch = candidate;
@@ -1055,9 +1172,10 @@ pub const App = struct {
     fn selectNearestNote(self: *App, x: f32, y: f32, stage: ui.Rect) void {
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-        const geometry = ui.ScoreGeometry.calculateWithVocal(stage, self.vocalStaffVisible(state));
         const measures = self.measures[0..self.measure_count];
-        const page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        const hit = self.scoreHitContext(state, meta, stage, x, y);
+        const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, self.vocalStaffVisible(state));
+        const page = hit.page;
         var best_entity: c.ecs_entity_t = 0;
         var best_distance_squared: f32 = std.math.floatMax(f32);
         for (self.note_entities[0..self.note_count]) |entity| {
@@ -1065,8 +1183,8 @@ pub const App = struct {
             note.selected = 0;
             if ((note.flags & model.note_flag_vocal_guide) != 0 and state.vocal_guide_visible == 0) continue;
             const position = ui.scoreNotePosition(note.*, geometry, page, measures) orelse continue;
-            const dx = position.x - x;
-            const dy = position.y - y;
+            const dx = position.x - hit.x;
+            const dy = position.y - hit.y;
             const distance_squared = dx * dx + dy * dy;
             if (distance_squared < best_distance_squared) {
                 best_distance_squared = distance_squared;
@@ -1093,14 +1211,34 @@ pub const App = struct {
     }
 
     fn nextScorePage(self: *const App, state: *model.UiState, meta: *const model.DocumentMeta) void {
-        const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
-        if (page.endBeat() < self.scoreEndBeat() - 0.0001) state.view_start_beat = page.endBeat();
+        const measures = self.measures[0..self.measure_count];
+        if (state.score_view_mode == .continuous) {
+            const window = ui.scoreContinuousForBeat(measures, state.view_start_beat, meta);
+            if (window.system_count > 1) state.view_start_beat = window.systems[1].start_beat;
+            return;
+        }
+        var page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        const advances: usize = if (state.score_view_mode == .spread) 2 else 1;
+        for (0..advances) |_| {
+            if (page.endBeat() >= self.scoreEndBeat() - 0.0001) break;
+            state.view_start_beat = page.endBeat();
+            page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        }
     }
 
     fn previousScorePage(self: *const App, state: *model.UiState, meta: *const model.DocumentMeta) void {
-        const page = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, meta);
-        if (page.startBeat() > 0.0001) {
-            state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], page.startBeat() - 0.001, meta).startBeat();
+        const measures = self.measures[0..self.measure_count];
+        if (state.score_view_mode == .continuous) {
+            const window = ui.scoreContinuousForBeat(measures, state.view_start_beat, meta);
+            if (window.startBeat() > 0.0001) state.view_start_beat = ui.scoreContinuousForBeat(measures, window.startBeat() - 0.001, meta).startBeat();
+            return;
+        }
+        var page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        const retreats: usize = if (state.score_view_mode == .spread) 2 else 1;
+        for (0..retreats) |_| {
+            if (page.startBeat() <= 0.0001) break;
+            state.view_start_beat = ui.scorePageForBeat(measures, page.startBeat() - 0.001, meta).startBeat();
+            page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
         }
     }
 
@@ -1454,11 +1592,11 @@ fn createEntity(world: *c.ecs_world_t, name: ?[*:0]const u8) c.ecs_entity_t {
     return c.ecs_entity_init(world, &descriptor);
 }
 
-fn annotationPoint(event: platform.PointerEvent, stage: ui.Rect, time_seconds: f32) annotation.Point {
+fn annotationPoint(x: f32, y: f32, pressure: f32, stage: ui.Rect, time_seconds: f32) annotation.Point {
     return .{
-        .u = std.math.clamp((event.x - stage.x) / stage.width, 0, 1),
-        .v = std.math.clamp((event.y - stage.y) / stage.height, 0, 1),
-        .pressure = if (event.pressure > 0) event.pressure else 0.5,
+        .u = std.math.clamp((x - stage.x) / stage.width, 0, 1),
+        .v = std.math.clamp((y - stage.y) / stage.height, 0, 1),
+        .pressure = if (pressure > 0) pressure else 0.5,
         .time_ms = time_seconds * 1000,
     };
 }
@@ -1884,6 +2022,63 @@ test "paged score responds to visible controls wheel gestures and reading arrows
     state.tool = .edit;
     app.key(.{ .key = 262, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
     try std.testing.expectEqual(second_page, state.view_start_beat);
+}
+
+test "score viewport modes navigate at page system and spread granularity" {
+    const app = try App.create(std.heap.c_allocator, 1440, 900, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    var response: [256]u8 = undefined;
+
+    _ = app.runDevCommand("view continuous", &response);
+    _ = app.runDevCommand("page next", &response);
+    const continuous_start = state.view_start_beat;
+    try std.testing.expectEqual(model.ScoreViewMode.continuous, state.score_view_mode);
+    try std.testing.expect(continuous_start > 0);
+
+    state.view_start_beat = 0;
+    _ = app.runDevCommand("view paged", &response);
+    _ = app.runDevCommand("page next", &response);
+    const paged_start = state.view_start_beat;
+    try std.testing.expect(paged_start > continuous_start);
+
+    state.view_start_beat = 0;
+    _ = app.runDevCommand("view spread", &response);
+    _ = app.runDevCommand("page next", &response);
+    try std.testing.expect(state.view_start_beat >= paged_start);
+
+    _ = app.runDevCommand("zoom 0.75", &response);
+    _ = app.runDevCommand("focus on", &response);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), state.zoom, 0.001);
+    try std.testing.expectEqual(@as(u32, 1), state.focus_score);
+    const focused = ui.Layout.calculateForState(state);
+    try std.testing.expectEqual(@as(f32, 0), focused.top.height);
+    try std.testing.expectEqual(@as(f32, 0), focused.keyboard_panel.height);
+    try std.testing.expect(focused.stage.height > 800);
+}
+
+test "spread annotations attach to the clicked page in unscaled score coordinates" {
+    const app = try App.create(std.heap.c_allocator, 1440, 900, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    state.tool = .annotate;
+    state.keyboard_visible = 0;
+    state.score_view_mode = .spread;
+    state.zoom = 0.75;
+    const layout = ui.Layout.calculateForState(state);
+    const gap: f32 = 12;
+    const pane_width = (layout.stage.width - gap) * 0.5;
+    const pane = ui.Rect{ .x = layout.stage.x + pane_width + gap, .y = layout.stage.y, .width = pane_width, .height = layout.stage.height };
+    const target_x = pane.x + pane.width * 0.25;
+    const target_y = pane.y + pane.height * 0.4;
+    const screen_x = pane.x + pane.width * 0.5 + (target_x - (pane.x + pane.width * 0.5)) * state.zoom;
+    const screen_y = pane.y + pane.height * 0.5 + (target_y - (pane.y + pane.height * 0.5)) * state.zoom;
+    app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 9, .buttons = 1, .x = screen_x, .y = screen_y, .pressure = 0.5, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 9, .buttons = 0, .x = screen_x, .y = screen_y, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.annotations.stroke_count);
+    try std.testing.expectEqual(@as(u32, 1), app.annotations.strokes[0].page_index);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), app.annotations.points[0].u, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), app.annotations.points[0].v, 0.001);
 }
 
 test "clicking the GPU tempo readout edits and validates BPM" {

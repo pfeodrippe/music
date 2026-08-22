@@ -66,7 +66,11 @@ iOS remain later portability targets and must not distract from native quality.
   for note timing adjustments.
 - [ ] Add responsive arbitrary system counts, vertical justification, and
   true multi-page breaking for every viewport and print size.
-- [ ] Add zoom, pan, page/continuous modes, part selection, and print layout.
+- [x] Add GPU controls, hot keys, accessibility actions, and Debug socket
+  commands for paged, continuous-system, two-page spread, score zoom, and
+  distraction-free focus modes. Navigation advances one system in continuous
+  mode, one page in paged mode, and one spread in two-page mode.
+- [ ] Add free pan, part selection, and print layout.
 - [x] Add Debug-only readback of the real native Dawn/Metal framebuffer through
   `score-devctl capture`; use it for deterministic GPU visual regression.
 - [ ] Run repeated native visual QA at desktop and narrow widths, then perform
@@ -198,6 +202,10 @@ iOS remain later portability targets and must not distract from native quality.
   not merely against the supplied arrangement.
 - [x] Preserve MusicXML lyric syllables/words as timed GPU-rendered text and
   round-trip them through MusicXML and portable `.score` documents.
+- [x] Give lyrics a dedicated engraving lane below the optional VOICE staff,
+  with a tested minimum clearance from its notation and the piano grand staff;
+  when semantic per-note lyrics exist, suppress duplicate MusicXML direction
+  phrases instead of painting both representations into that lane.
 - [x] Tag named vocal parts/cue notes as an optional VOICE guide. Exclude guide
   pitches from piano playback, virtual-key fingering, and piano mistake scoring
   while retaining them as visible singer pitch cues; never fold them into the
@@ -233,18 +241,30 @@ iOS remain later portability targets and must not distract from native quality.
   from beat zero/count-in when Play is pressed at the end. Cover this with a
   regression test and native visual verification.
 - [x] Add `score-audio-analyze`, a Zig 0.16 offline WAV analyzer with local
-  downmix/resampling, onset and tempo evidence, bass/chroma/polyphonic pitch
-  candidates, JSON output, and MusicXML/MXL alignment that ignores vocal-guide
-  notes. Validate the end-to-end CLI on generated PCM audio; label its output as
+  downmix/resampling, leading/trailing silence detection, ranked global tempo
+  plus a rolling 16-second tempo trace, bass/chroma/polyphonic pitch candidates,
+  JSON output, and MusicXML/MXL alignment that ignores vocal-guide notes.
+  Validate the end-to-end CLI on generated PCM audio; label its output as
   evidence rather than an authoritative transcription.
 - [x] Add a reusable macOS Chrome/app -> BlackHole -> PCM24 WAV -> Zig analysis
   workflow. Discover the current AVFoundation loopback index, refuse accidental
   overwrite, accept any optional MXL/MusicXML comparison, and restore the user's
   original output device from success, failure, or signal paths.
+- [x] Add deterministic chroma-overlap alignment for split reference captures,
+  including active-audio offsets, best/runner-up similarity evidence, and a
+  deliberately non-certifying review status. Cover the timing map and frame-rate
+  validation with standalone regression tests.
 - [ ] Add phase-aware source separation, learned multi-pitch transcription,
   section/beat alignment, confidence heatmaps, and manual correction workflow
   for user-owned reference audio. Never download/rip protected streaming audio;
   accept lawful local exports and keep them ignored/private.
+- [ ] Finish a measure-by-measure, recording-led arrangement audit for the
+  private Holocene study score. The playable piano part must be a musically
+  coherent two-hand reduction of the recording's piano/harp accompaniment—not
+  a direct copy of one scanned staff—and must carry note, rhythm, voicing,
+  dynamics, articulation, and pedal evidence. Keep the vocal melody and lyrics
+  on their independent optional singer-guide staff. Leave every unaudited bar
+  marked `REVIEW_REQUIRED`; structural MusicXML validity is not musical proof.
 - [ ] Build the production audio path as a general multi-sampled instrument
   engine, not a piano-only special case: reusable key/velocity zones,
   round-robin groups, articulations, envelopes, filters, LFO/modulation matrix,

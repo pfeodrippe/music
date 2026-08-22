@@ -139,7 +139,12 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
         }
     }.convert;
 
-    try parseDirectionLyrics(source, report, measure_start, divisions);
+    // Some engraving tools duplicate a sung phrase as both direction words
+    // and per-note `<lyric>` syllables. The per-note events carry the precise
+    // timing; importing both draws the same sentence twice in one lyric lane.
+    // Direction words remain a useful fallback for lead sheets that have no
+    // semantic lyric elements in this measure.
+    if (findOpenTag(source, 0, "lyric") == null) try parseDirectionLyrics(source, report, measure_start, divisions);
 
     var cursor: usize = 0;
     var local_beat: f32 = 0;
@@ -675,6 +680,19 @@ test "imports timed lyrics and marks named vocal parts as guides" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), report.lyrics[0].start_beat, 0.001);
     try std.testing.expectEqualStrings("Some way", report.lyrics[0].textSlice());
     try std.testing.expect((report.notes[1].flags & model.note_flag_vocal_guide) != 0);
+}
+
+test "semantic note lyrics suppress duplicate direction-word phrases" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Vocal guide</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<direction><direction-type><words>same sung phrase</words></direction-type></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><lyric><text>same</text></lyric></note>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 1), report.lyric_count);
+    try std.testing.expectEqualStrings("same", report.lyrics[0].textSlice());
 }
 
 test "imports semantic MusicXML harmony with slash bass and offset" {

@@ -70,6 +70,12 @@ pub const InputSource = enum(u32) {
     microphone,
 };
 
+pub const ScoreViewMode = enum(u32) {
+    paged,
+    continuous,
+    spread,
+};
+
 pub const Note = extern struct {
     stable_id: u64,
     start_beat: f32,
@@ -228,6 +234,8 @@ pub const UiState = extern struct {
     zoom: f32 = 1,
     tool: Tool = .read,
     input_source: InputSource = .none,
+    score_view_mode: ScoreViewMode = .paged,
+    focus_score: u32 = 0,
     notice: u32 = 0,
     sidebar_open: u32 = 1,
     keyboard_visible: u32 = 1,
@@ -365,7 +373,7 @@ test "portable score components have deterministic layouts" {
     try std.testing.expectEqual(@as(usize, 68), @sizeOf(Harmony));
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Transport));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(PlaybackBounds));
-    try std.testing.expectEqual(@as(usize, 80), @sizeOf(UiState));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(UiState));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Measure));
 }
 

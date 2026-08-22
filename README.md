@@ -57,7 +57,11 @@ zig build ios-simulator
 - Space or the center transport button: play/pause with count-in
 - `-` / `+`: tempo down/up; the GPU buttons do the same
 - Loop: isolate/toggle the measure containing the cursor; Click: toggle the metronome
-- Page Up / Page Down or scroll: move through score pages
+- Page Up / Page Down, Left / Right in Read mode, or scroll: advance the score
+- `M` or the view button: cycle paged, continuous-system, and two-page spread views
+- `[` / `]` or the GPU minus/plus controls: zoom the score between 65% and 105%
+- `F` or Focus: dedicate the window to the score and transport; the piano,
+  library, tool rail, and coach return when focus mode is exited
 - Read: select a note; Edit: insert a note
 - Arrow keys: move the selected note in pitch or quarter-beat time
 - Delete/Backspace: delete selection; Command/Ctrl-Z and Command/Ctrl-Y: undo/redo
@@ -65,7 +69,9 @@ zig build ios-simulator
 - Play: compare MIDI or microphone input with the score
 - Record: capture real audio and timestamped MIDI together
 - Voice button or `V`: show/hide the optional singer pitch guide; guide notes do
-  not enter piano playback, keyboard fingering, or piano assessment
+  not enter piano playback, keyboard fingering, or piano assessment. Imported
+  lyrics occupy a dedicated lane below that guide staff and cannot share the
+  piano grand staff.
 
 ## Offline reference-audio analysis
 
@@ -77,11 +83,26 @@ zig build audio-analyze -Doptimize=ReleaseFast -- reference.wav \
   --score authorized-score.mxl --output local-content/analysis.json
 ```
 
-The versioned JSON contains onset/tempo evidence, bass and polyphonic pitch
-candidates, normalized chroma, and an alignment summary. It is deliberately
-labeled a review aid rather than an authoritative automatic transcription.
+The versioned JSON contains the detected active-audio range (so leading capture
+silence does not shift the score), global and ranked tempo evidence, a rolling
+16-second tempo trace, bass and polyphonic pitch candidates, normalized chroma,
+and an alignment summary. It is deliberately labeled a review aid rather than
+an authoritative automatic transcription.
 The tool does not download streaming audio; keep private recordings and reports
 under the ignored `local-content/` tree.
+
+When a long reference must be captured in overlapping pieces, align their
+analysis reports before doing score review:
+
+```sh
+python3 scripts/align-audio-evidence.py first.analysis.json later.analysis.json \
+  --output local-content/reference/overlap.json
+```
+
+The result maps the later capture onto the first capture's active-audio
+timeline using a weighted chroma comparison. It reports both the best match
+and an independent runner-up; the result establishes capture timing only and
+never claims that the score itself is correct.
 
 On macOS, an authorized browser or application stream can be captured through
 an installed **BlackHole 16ch** loopback device and analyzed with one command:

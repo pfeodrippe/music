@@ -4,6 +4,8 @@ pub const target_sample_rate: u32 = 8_000;
 pub const feature_hz: u32 = 4;
 pub const max_candidates: usize = 6;
 pub const max_tempo_candidates: usize = 5;
+pub const tempo_window_seconds: f32 = 16;
+pub const tempo_hop_seconds: f32 = 8;
 const tempo_sample_rate: u32 = 44_100;
 const onset_fft_size: usize = 4_096;
 const onset_hop: usize = 512;
@@ -11,6 +13,13 @@ const onset_hop: usize = 512;
 pub const TempoCandidate = struct {
     bpm: f32,
     relative_score: f32,
+};
+
+pub const TempoSegment = struct {
+    start_seconds: f32,
+    end_seconds: f32,
+    bpm: f32,
+    confidence: f32,
 };
 
 pub const FeatureFrame = struct {
@@ -29,6 +38,9 @@ pub const Analysis = struct {
     tempo_confidence: f32,
     tempo_candidate_count: u8,
     tempo_candidates: [max_tempo_candidates]TempoCandidate,
+    active_start_seconds: f32,
+    active_end_seconds: f32,
+    tempo_segments: []TempoSegment,
     frames: []FeatureFrame,
     onsets: []f32,
     allocator: std.mem.Allocator,
@@ -36,6 +48,7 @@ pub const Analysis = struct {
     pub fn deinit(self: *Analysis) void {
         self.allocator.free(self.frames);
         self.allocator.free(self.onsets);
+        self.allocator.free(self.tempo_segments);
         self.* = undefined;
     }
 };
@@ -47,6 +60,7 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
     const tempo_samples = try resample(allocator, source, source_rate, tempo_sample_rate);
     defer allocator.free(tempo_samples);
     const duration = @as(f32, @floatFromInt(samples.len)) / @as(f32, @floatFromInt(target_sample_rate));
+    const active_range = detectActiveRange(source, source_rate);
 
     const envelope = try spectralFluxEnvelope(allocator, tempo_samples);
     defer allocator.free(envelope);
@@ -70,6 +84,8 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
     }
     const envelope_rate = @as(f32, @floatFromInt(tempo_sample_rate)) / @as(f32, @floatFromInt(onset_hop));
     const tempo = if (onset_list.items.len >= 4) estimateTempo(envelope, envelope_rate, envelope_mean) else Tempo{ .bpm = 0, .confidence = 0 };
+    const tempo_segments = try estimateTempoSegments(allocator, envelope, envelope_rate, active_range.start_seconds, active_range.end_seconds);
+    errdefer allocator.free(tempo_segments);
 
     const frame_hop: usize = target_sample_rate / feature_hz;
     const window_size: usize = 1024;
@@ -161,10 +177,76 @@ pub fn analyze(allocator: std.mem.Allocator, source: []const f32, source_rate: u
         .tempo_confidence = tempo.confidence,
         .tempo_candidate_count = tempo.candidate_count,
         .tempo_candidates = tempo.candidates,
+        .active_start_seconds = active_range.start_seconds,
+        .active_end_seconds = active_range.end_seconds,
+        .tempo_segments = tempo_segments,
         .frames = frames,
         .onsets = try onset_list.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+}
+
+const ActiveRange = struct { start_seconds: f32, end_seconds: f32 };
+
+fn detectActiveRange(source: []const f32, source_rate: u32) ActiveRange {
+    const frame_size = @max(1, source_rate / 20);
+    var maximum_rms: f32 = 0;
+    var frame_start: usize = 0;
+    while (frame_start < source.len) : (frame_start += frame_size) {
+        const end = @min(source.len, frame_start + frame_size);
+        var energy: f64 = 0;
+        for (source[frame_start..end]) |sample| energy += @as(f64, sample) * @as(f64, sample);
+        maximum_rms = @max(maximum_rms, @as(f32, @floatCast(@sqrt(energy / @as(f64, @floatFromInt(end - frame_start))))));
+    }
+    const threshold = @max(0.0005, maximum_rms * 0.01);
+    var first: ?usize = null;
+    var last: usize = 0;
+    frame_start = 0;
+    while (frame_start < source.len) : (frame_start += frame_size) {
+        const end = @min(source.len, frame_start + frame_size);
+        var energy: f64 = 0;
+        for (source[frame_start..end]) |sample| energy += @as(f64, sample) * @as(f64, sample);
+        const rms: f32 = @floatCast(@sqrt(energy / @as(f64, @floatFromInt(end - frame_start))));
+        if (rms >= threshold) {
+            if (first == null) first = frame_start;
+            last = end;
+        }
+    }
+    const start = first orelse 0;
+    return .{
+        .start_seconds = @as(f32, @floatFromInt(start)) / @as(f32, @floatFromInt(source_rate)),
+        .end_seconds = @as(f32, @floatFromInt(if (first == null) 0 else last)) / @as(f32, @floatFromInt(source_rate)),
+    };
+}
+
+fn estimateTempoSegments(allocator: std.mem.Allocator, envelope: []const f32, envelope_rate: f32, active_start_seconds: f32, active_end_seconds: f32) ![]TempoSegment {
+    var segments: std.ArrayList(TempoSegment) = .empty;
+    errdefer segments.deinit(allocator);
+    const window_len: usize = @intFromFloat(@round(tempo_window_seconds * envelope_rate));
+    const hop_len: usize = @intFromFloat(@round(tempo_hop_seconds * envelope_rate));
+    if (window_len == 0 or hop_len == 0) return segments.toOwnedSlice(allocator);
+    var start: usize = @min(envelope.len, @as(usize, @intFromFloat(@max(0, @round(active_start_seconds * envelope_rate)))));
+    const active_end: usize = @min(envelope.len, @as(usize, @intFromFloat(@max(0, @round(active_end_seconds * envelope_rate)))));
+    while (start + window_len <= active_end) : (start += hop_len) {
+        const window = envelope[start .. start + window_len];
+        var mean: f32 = 0;
+        var maximum: f32 = 0;
+        for (window) |value| {
+            mean += value;
+            maximum = @max(maximum, value);
+        }
+        mean /= @as(f32, @floatFromInt(window.len));
+        if (maximum <= 0.0001 or maximum < mean * 2) continue;
+        const tempo = estimateTempo(window, envelope_rate, mean);
+        if (tempo.bpm <= 0) continue;
+        try segments.append(allocator, .{
+            .start_seconds = @as(f32, @floatFromInt(start)) / envelope_rate,
+            .end_seconds = @as(f32, @floatFromInt(start + window_len)) / envelope_rate,
+            .bpm = tempo.bpm,
+            .confidence = tempo.confidence,
+        });
+    }
+    return segments.toOwnedSlice(allocator);
 }
 
 fn resample(allocator: std.mem.Allocator, source: []const f32, source_rate: u32, destination_rate: u32) ![]f32 {
@@ -362,4 +444,34 @@ test "tempo estimator handles distinct song pulses" {
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expected_bpm)), tempo.bpm, 1);
         try std.testing.expect(tempo.candidate_count >= 1);
     }
+}
+
+test "active audio range excludes leading and trailing capture silence" {
+    var samples = [_]f32{0} ** 1_000;
+    for (samples[250..750], 0..) |*sample, index| sample.* = if ((index & 1) == 0) 0.2 else -0.2;
+    const active = detectActiveRange(&samples, 100);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), active.start_seconds, 0.051);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.5), active.end_seconds, 0.051);
+}
+
+test "windowed tempo evidence exposes a recording tempo trace" {
+    const rate: f32 = 100;
+    var envelope = [_]f32{0} ** 4_000;
+    var pulse: usize = 0;
+    while (true) : (pulse += 1) {
+        const index: usize = @intFromFloat(@round(@as(f32, @floatFromInt(pulse)) * rate * 60 / 120));
+        if (index >= 2_000) break;
+        envelope[index] = 1;
+    }
+    pulse = 0;
+    while (true) : (pulse += 1) {
+        const index: usize = 2_000 + @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(pulse)) * rate * 60 / 147)));
+        if (index >= envelope.len) break;
+        envelope[index] = 1;
+    }
+    const segments = try estimateTempoSegments(std.testing.allocator, &envelope, rate, 0, 40);
+    defer std.testing.allocator.free(segments);
+    try std.testing.expect(segments.len >= 4);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), segments[0].bpm, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), segments[segments.len - 1].bpm, 1);
 }

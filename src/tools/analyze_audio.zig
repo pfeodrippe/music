@@ -2,9 +2,13 @@ const std = @import("std");
 const score = @import("score");
 
 const Alignment = struct {
-    expected_notes: usize = 0,
+    score_instrument_notes: usize = 0,
+    compared_notes: usize = 0,
     exact_pitch_matches: usize = 0,
     pitch_class_matches: usize = 0,
+    assumed_tempo_bpm: f32 = 0,
+    score_duration_seconds: f32 = 0,
+    active_audio_duration_seconds: f32 = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -51,12 +55,18 @@ pub fn main(init: std.process.Init) !void {
     var allocating: std.Io.Writer.Allocating = .init(init.gpa);
     defer allocating.deinit();
     const writer = &allocating.writer;
-    try writer.writeAll("{\n  \"schema\": 1,\n  \"analysis_kind\": \"polyphonic-evidence-not-authoritative-transcription\",");
-    try writer.print("\n  \"sample_rate\": {d},\n  \"duration_seconds\": {d:.4},\n  \"estimated_tempo_bpm\": {d:.2},\n  \"tempo_confidence\": {d:.4},", .{ decoded.sample_rate, analysis.duration_seconds, analysis.estimated_tempo_bpm, analysis.tempo_confidence });
+    try writer.writeAll("{\n  \"schema\": 2,\n  \"analysis_kind\": \"polyphonic-evidence-not-authoritative-transcription\",");
+    try writer.print("\n  \"sample_rate\": {d},\n  \"duration_seconds\": {d:.4},\n  \"active_audio\": {{\"start_seconds\":{d:.4},\"end_seconds\":{d:.4}}},\n  \"estimated_tempo_bpm\": {d:.2},\n  \"tempo_confidence\": {d:.4},", .{ decoded.sample_rate, analysis.duration_seconds, analysis.active_start_seconds, analysis.active_end_seconds, analysis.estimated_tempo_bpm, analysis.tempo_confidence });
     try writer.writeAll("\n  \"tempo_candidates\": [");
     for (analysis.tempo_candidates[0..analysis.tempo_candidate_count], 0..) |candidate, index| {
         if (index != 0) try writer.writeAll(", ");
         try writer.print("{{\"bpm\":{d:.2},\"relative_score\":{d:.4}}}", .{ candidate.bpm, candidate.relative_score });
+    }
+    try writer.writeAll("],");
+    try writer.writeAll("\n  \"tempo_segments\": [");
+    for (analysis.tempo_segments, 0..) |segment, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try writer.print("{{\"start_seconds\":{d:.3},\"end_seconds\":{d:.3},\"bpm\":{d:.2},\"confidence\":{d:.4}}}", .{ segment.start_seconds, segment.end_seconds, segment.bpm, segment.confidence });
     }
     try writer.writeAll("],");
     try writer.writeAll("\n  \"onsets_seconds\": [");
@@ -83,9 +93,9 @@ pub fn main(init: std.process.Init) !void {
     }
     try writer.writeAll("\n  ],\n  \"score_alignment\": ");
     if (alignment) |value| {
-        const exact_ratio = if (value.expected_notes == 0) 0 else @as(f32, @floatFromInt(value.exact_pitch_matches)) / @as(f32, @floatFromInt(value.expected_notes));
-        const class_ratio = if (value.expected_notes == 0) 0 else @as(f32, @floatFromInt(value.pitch_class_matches)) / @as(f32, @floatFromInt(value.expected_notes));
-        try writer.print("{{\"expected_instrument_notes\":{d},\"exact_pitch_matches\":{d},\"pitch_class_matches\":{d},\"exact_ratio\":{d:.4},\"pitch_class_ratio\":{d:.4}}}", .{ value.expected_notes, value.exact_pitch_matches, value.pitch_class_matches, exact_ratio, class_ratio });
+        const exact_ratio = if (value.compared_notes == 0) 0 else @as(f32, @floatFromInt(value.exact_pitch_matches)) / @as(f32, @floatFromInt(value.compared_notes));
+        const class_ratio = if (value.compared_notes == 0) 0 else @as(f32, @floatFromInt(value.pitch_class_matches)) / @as(f32, @floatFromInt(value.compared_notes));
+        try writer.print("{{\"score_instrument_notes\":{d},\"compared_notes\":{d},\"assumed_tempo_bpm\":{d:.2},\"score_duration_seconds\":{d:.3},\"active_audio_duration_seconds\":{d:.3},\"duration_delta_seconds\":{d:.3},\"exact_pitch_matches\":{d},\"pitch_class_matches\":{d},\"exact_ratio\":{d:.4},\"pitch_class_ratio\":{d:.4}}}", .{ value.score_instrument_notes, value.compared_notes, value.assumed_tempo_bpm, value.score_duration_seconds, value.active_audio_duration_seconds, value.active_audio_duration_seconds - value.score_duration_seconds, value.exact_pitch_matches, value.pitch_class_matches, exact_ratio, class_ratio });
     } else {
         try writer.writeAll("null");
     }
@@ -104,10 +114,18 @@ fn alignScore(analysis: *const score.transcribe.Analysis, report: *const score.m
     var result: Alignment = .{};
     if (analysis.frames.len == 0) return result;
     const tempo = if (report.tempo_bpm > 1) report.tempo_bpm else analysis.estimated_tempo_bpm;
+    result.assumed_tempo_bpm = tempo;
+    result.active_audio_duration_seconds = @max(0, analysis.active_end_seconds - analysis.active_start_seconds);
+    if (report.measure_count != 0) {
+        const last = report.measures[report.measure_count - 1];
+        result.score_duration_seconds = (last.start_beat + last.duration_beats) * 60.0 / tempo;
+    }
     for (report.notes[0..report.note_count]) |note| {
         if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0) continue;
-        result.expected_notes += 1;
-        const time = note.start_beat * 60.0 / tempo;
+        result.score_instrument_notes += 1;
+        const time = analysis.active_start_seconds + note.start_beat * 60.0 / tempo;
+        if (time < analysis.active_start_seconds or time > analysis.active_end_seconds) continue;
+        result.compared_notes += 1;
         var nearest = &analysis.frames[0];
         var nearest_distance = @abs(nearest.time_seconds - time);
         for (analysis.frames[1..]) |*frame| {

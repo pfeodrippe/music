@@ -1,7 +1,7 @@
 const model = @import("model.zig");
 const ui = @import("ui.zig");
 
-pub const max_items = 28;
+pub const max_items = 32;
 
 pub const Role = enum(u32) {
     document = 0,
@@ -38,6 +38,10 @@ pub const Id = struct {
     pub const page_previous: u32 = 24;
     pub const page_next: u32 = 25;
     pub const tempo_value: u32 = 26;
+    pub const view_mode: u32 = 27;
+    pub const zoom_down: u32 = 28;
+    pub const zoom_up: u32 = 29;
+    pub const focus_score: u32 = 30;
 };
 
 pub const Item = extern struct {
@@ -59,7 +63,7 @@ pub const Snapshot = struct {
 
     pub fn build(self: *Snapshot, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta) void {
         self.len = 0;
-        const layout = ui.Layout.calculate(state.viewport_width, state.viewport_height, state.keyboard_visible != 0);
+        const layout = ui.Layout.calculateForState(state);
         self.add(Id.document, .document, layout.stage, meta.titleSlice(), 0);
         if (state.library_open != 0) {
             self.add(Id.library_close, .button, layout.library_close, "Close score library", 0);
@@ -87,6 +91,16 @@ pub const Snapshot = struct {
             self.add(Id.tempo_up, .button, layout.tempo_plus, "Increase tempo", 0);
         }
         self.add(Id.tempo_value, .button, layout.tempo_value, if (state.tempo_editing != 0) "Editing tempo; type 30 to 240 and press Enter" else "Edit tempo", 0);
+        if (layout.view_mode_toggle.width > 0) self.add(Id.view_mode, .button, layout.view_mode_toggle, switch (state.score_view_mode) {
+            .paged => "Use continuous score view",
+            .continuous => "Use two-page score view",
+            .spread => "Use paged score view",
+        }, 0);
+        if (layout.zoom_minus.width > 0) {
+            self.add(Id.zoom_down, .button, layout.zoom_minus, "Zoom score out", 0);
+            self.add(Id.zoom_up, .button, layout.zoom_plus, "Zoom score in", 0);
+        }
+        if (layout.focus_toggle.width > 0) self.add(Id.focus_score, .button, layout.focus_toggle, if (state.focus_score != 0) "Exit score focus mode" else "Enter score focus mode", Flag.toggle | (if (state.focus_score != 0) Flag.pressed else 0));
         if (layout.replay_take.width > 0) self.add(Id.replay, .button, layout.replay_take, "Replay latest audio and MIDI take", 0);
         if (layout.export_take.width > 0) self.add(Id.export_take, .button, layout.export_take, "Export latest MIDI take", 0);
         self.add(Id.page_previous, .button, layout.page_previous, "Previous score page", 0);
