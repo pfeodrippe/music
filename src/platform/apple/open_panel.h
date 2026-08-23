@@ -6,6 +6,9 @@ const char *score_save_score_panel(void);
 const char *score_save_take_panel(void);
 const char *score_application_support_path(void);
 void score_replay_audio_file(const char *path);
+void *score_pdf_begin(const char *path, double width_points, double height_points);
+int score_pdf_append_bgra(void *context, const unsigned char *pixels, unsigned int width, unsigned int height, unsigned int stride);
+void score_pdf_end(void *context);
 
 typedef struct ScoreAccessibilityItemNative {
     unsigned int id;

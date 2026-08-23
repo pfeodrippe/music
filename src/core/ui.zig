@@ -166,6 +166,9 @@ pub const Layout = struct {
     }
 };
 
+pub const min_score_zoom: f32 = 0.45;
+pub const max_score_zoom: f32 = 1.05;
+
 pub const ScoreGeometry = struct {
     page_x: f32,
     page_y: f32,
@@ -177,16 +180,21 @@ pub const ScoreGeometry = struct {
     music_x: f32,
     music_width: f32,
     beat_width: f32,
-    vocal_y: [2]f32,
-    lyric_y: [2]f32,
-    treble_y: [2]f32,
-    bass_y: [2]f32,
+    vocal_y: [max_score_systems]f32,
+    lyric_y: [max_score_systems]f32,
+    treble_y: [max_score_systems]f32,
+    bass_y: [max_score_systems]f32,
 
     pub fn calculate(stage: Rect) ScoreGeometry {
-        return calculateWithVocal(stage, false);
+        return calculateForSystems(stage, false, 2);
     }
 
     pub fn calculateWithVocal(stage: Rect, vocal_visible: bool) ScoreGeometry {
+        return calculateForSystems(stage, vocal_visible, 2);
+    }
+
+    pub fn calculateForSystems(stage: Rect, vocal_visible: bool, requested_systems: usize) ScoreGeometry {
+        const system_count = std.math.clamp(requested_systems, 1, max_score_systems);
         const margin: f32 = if (stage.width < 700) 20 else 46;
         const page_width = @max(280, stage.width - margin * 2);
         // The paper must remain inside the stage. A previous 280 px minimum
@@ -204,29 +212,46 @@ pub const ScoreGeometry = struct {
         const music_x = staff_x + notation_lead;
         const music_width = staff_width - notation_lead;
         const ultra_compact = page_height < 340;
-        const first_treble = page_y + @as(f32, if (ultra_compact) 76 else if (page_height < 440) 96 else 112);
-        const piano_group_height: f32 = 140;
-        const system_gap = @max(150, page_height - (first_treble - page_y) - piano_group_height - 28);
+        // The Bravura treble clef reaches roughly 34 px above the top staff
+        // line.  Keep that real ink bound below the 60 px source-label lane;
+        // using the staff line itself as the bound made compact first pages
+        // look as though the title, source, clef, key and meter were one blob.
+        const first_treble = page_y + @as(f32, if (ultra_compact) 76 else if (page_height < 440) 116 else 124);
+        const piano_group_extent: f32 = 117;
+        const piano_minimum_gap: f32 = 150;
         const compact_vocal = page_height < 680;
         // The first singer staff starts below the complete page heading. SMuFL
         // treble clefs extend well above the top staff line, so anchoring this
         // at the old 84 px offset let the clef collide with the source label.
-        const first_vocal = page_y + 88;
+        const first_vocal = page_y + @as(f32, if (ultra_compact) 76 else if (page_height < 440) 116 else 124);
         // Lyrics own the lane immediately below the vocal staff. Keep enough
         // clearance for descenders, note stems/dynamics, and the next piano
         // staff instead of allowing text to collide with either notation row.
         const vocal_to_treble: f32 = if (ultra_compact) 78 else if (compact_vocal) 102 else 110;
         const treble_to_bass: f32 = if (ultra_compact) 56 else if (compact_vocal) 56 else 58;
-        const vocal_group_height = vocal_to_treble + treble_to_bass + 48;
-        // When two systems fit, distribute them down the page so the next
-        // clef and time signature cannot intrude into the previous bass staff.
-        const vocal_system_gap = @max(
-            vocal_group_height + 48,
-            page_height - (first_vocal - page_y) - vocal_group_height - @as(f32, if (compact_vocal) 24 else 32),
-        );
+        const vocal_group_extent = vocal_to_treble + treble_to_bass + 49;
+        const vocal_minimum_gap = vocal_to_treble + treble_to_bass + 96;
         const resolved_treble = if (vocal_visible) first_vocal + vocal_to_treble else first_treble;
         const resolved_bass = if (vocal_visible) resolved_treble + treble_to_bass else first_treble + 68;
-        const resolved_gap = if (vocal_visible) vocal_system_gap else system_gap;
+        const first_top = if (vocal_visible) first_vocal else first_treble;
+        const group_extent = if (vocal_visible) vocal_group_extent else piano_group_extent;
+        const bottom_margin: f32 = if (vocal_visible) (if (compact_vocal) 24 else 32) else 28;
+        const minimum_gap = if (vocal_visible) vocal_minimum_gap else piano_minimum_gap;
+        const resolved_gap = if (system_count > 1)
+            @max(minimum_gap, (page_height - (first_top - page_y) - group_extent - bottom_margin) / @as(f32, @floatFromInt(system_count - 1)))
+        else
+            minimum_gap;
+        var vocal_y = [_]f32{0} ** max_score_systems;
+        var lyric_y = [_]f32{0} ** max_score_systems;
+        var treble_y = [_]f32{0} ** max_score_systems;
+        var bass_y = [_]f32{0} ** max_score_systems;
+        for (0..max_score_systems) |system| {
+            const offset = @as(f32, @floatFromInt(system)) * resolved_gap;
+            vocal_y[system] = (if (vocal_visible) first_vocal else first_treble) + offset;
+            lyric_y[system] = (if (vocal_visible) first_vocal + vocal_to_treble - 20 else first_treble + 82) + offset;
+            treble_y[system] = resolved_treble + offset;
+            bass_y[system] = resolved_bass + offset;
+        }
         return .{
             .page_x = page_x,
             .page_y = page_y,
@@ -238,12 +263,12 @@ pub const ScoreGeometry = struct {
             .music_x = music_x,
             .music_width = music_width,
             .beat_width = music_width / 8,
-            .vocal_y = if (vocal_visible) .{ first_vocal, first_vocal + vocal_system_gap } else .{ first_treble, first_treble + system_gap },
+            .vocal_y = vocal_y,
             // The lyric baseline is a distinct engraving lane: 34 px below
             // the lowest staff line and still above the piano grand staff.
-            .lyric_y = if (vocal_visible) .{ first_vocal + vocal_to_treble - 20, first_vocal + vocal_system_gap + vocal_to_treble - 20 } else .{ first_treble + 82, first_treble + system_gap + 82 },
-            .treble_y = .{ resolved_treble, resolved_treble + resolved_gap },
-            .bass_y = .{ resolved_bass, resolved_bass + resolved_gap },
+            .lyric_y = lyric_y,
+            .treble_y = treble_y,
+            .bass_y = bass_y,
         };
     }
 };
@@ -261,8 +286,10 @@ pub const ScoreSystem = struct {
     }
 };
 
+pub const max_score_systems: usize = 6;
+
 pub const ScorePage = struct {
-    systems: [2]ScoreSystem,
+    systems: [max_score_systems]ScoreSystem = [_]ScoreSystem{.{}} ** max_score_systems,
     system_count: usize = 2,
     page_index: u32 = 0,
 
@@ -275,13 +302,50 @@ pub const ScorePage = struct {
     }
 };
 
+/// Spread is deliberately the familiar fixed two-sheet arrangement. Zoomed
+/// paged mode reflows additional systems onto one sheet; it must not silently
+/// turn a two-sheet desk into three or four horizontal thumbnails.
+pub fn spreadVisiblePageCount(stage: Rect, zoom: f32) usize {
+    _ = zoom;
+    if (stage.width < 760) return 1;
+    return 2;
+}
+
+pub fn spreadPageStage(stage: Rect, zoom: f32, page_offset: usize) Rect {
+    const count = spreadVisiblePageCount(stage, zoom);
+    const gap: f32 = 12;
+    const width = (stage.width - gap * @as(f32, @floatFromInt(count - 1))) / @as(f32, @floatFromInt(count));
+    return .{
+        .x = stage.x + @as(f32, @floatFromInt(page_offset)) * (width + gap),
+        .y = stage.y,
+        .width = width,
+        .height = stage.height,
+    };
+}
+
+/// Virtual engraving area for semantic zoom.  It grows inversely with zoom,
+/// then the resulting notation is transformed back into the one physical
+/// paper sheet.  More complete systems therefore merge onto that same sheet
+/// as the user zooms out.
+pub fn zoomedScoreStage(stage: Rect, zoom: f32) Rect {
+    const resolved_zoom = std.math.clamp(zoom, min_score_zoom, max_score_zoom);
+    const width = stage.width / resolved_zoom;
+    const height = stage.height / resolved_zoom;
+    return .{
+        .x = stage.x + (stage.width - width) * 0.5,
+        .y = stage.y,
+        .width = width,
+        .height = height,
+    };
+}
+
 pub const ScoreBeatPosition = struct { x: f32, system: usize };
 
 fn scoreSystemBeatCapacity(zoom: f32) f32 {
     // Zooming out must reveal more authored measures, not merely shrink the
     // same sparse page. Keep the density bounded so note spacing remains
     // readable and zooming in still has a useful optical effect.
-    return std.math.clamp(9.0 / std.math.clamp(zoom, 0.65, 1.05), 8.0, 14.0);
+    return std.math.clamp(9.0 / std.math.clamp(zoom, min_score_zoom, max_score_zoom), 8.0, 20.0);
 }
 
 fn nextScoreSystem(measures: []const model.Measure, first_measure: usize, beat_capacity: f32) ScoreSystem {
@@ -307,10 +371,15 @@ fn nextScoreSystem(measures: []const model.Measure, first_measure: usize, beat_c
 /// staff and lyric lane are independent from the piano grand staff.
 pub fn scoreSystemsPerPage(stage_height: f32, vocal_visible: bool) usize {
     const page_height = @max(220, stage_height - 20);
-    return if (vocal_visible)
-        (if (page_height >= 680) 2 else 1)
-    else
-        (if (page_height >= 430) 2 else 1);
+    // Preserve the established one/two-system breakpoints (680 vocal, 430
+    // piano). Beyond that breakpoint, use the actual engraved group extent so
+    // tall pages do not waste enough white space to hold another full system.
+    const two_system_breakpoint: f32 = if (vocal_visible) 680 else 430;
+    const single_system_height: f32 = if (vocal_visible) 373 else 269;
+    const additional_system_height: f32 = if (vocal_visible) 264 else 150;
+    if (page_height < two_system_breakpoint) return 1;
+    const extra = @as(usize, @intFromFloat(@floor((page_height - single_system_height) / additional_system_height)));
+    return std.math.clamp(1 + extra, 1, max_score_systems);
 }
 
 pub fn scorePageForBeat(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32) ScorePage {
@@ -318,16 +387,17 @@ pub fn scorePageForBeat(measures: []const model.Measure, requested_beat: f32, me
 }
 
 pub fn scorePageForBeatLimited(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32, requested_systems: usize) ScorePage {
-    const systems_per_page = std.math.clamp(requested_systems, 1, 2);
+    const systems_per_page = std.math.clamp(requested_systems, 1, max_score_systems);
     if (measures.len == 0) {
         const system_beats = meta.systemBeats();
         const page_beats = system_beats * @as(f32, @floatFromInt(systems_per_page));
         const page_start = @floor(@max(0, requested_beat) / page_beats) * page_beats;
-        const second_start = page_start + system_beats;
-        return .{ .systems = .{
-            .{ .start_beat = page_start, .end_beat = page_start + system_beats },
-            .{ .start_beat = second_start, .end_beat = if (systems_per_page == 2) second_start + system_beats else second_start },
-        }, .system_count = systems_per_page, .page_index = @intFromFloat(@floor(page_start / page_beats)) };
+        var page: ScorePage = .{ .system_count = systems_per_page, .page_index = @intFromFloat(@floor(page_start / page_beats)) };
+        for (0..systems_per_page) |system| {
+            const start = page_start + @as(f32, @floatFromInt(system)) * system_beats;
+            page.systems[system] = .{ .start_beat = start, .end_beat = start + system_beats };
+        }
+        return page;
     }
 
     const target = @max(measures[0].start_beat, requested_beat);
@@ -335,17 +405,22 @@ pub fn scorePageForBeatLimited(measures: []const model.Measure, requested_beat: 
     var first_measure: usize = 0;
     var page_index: u32 = 0;
     while (true) : (page_index += 1) {
-        const first = nextScoreSystem(measures, first_measure, beat_capacity);
-        const second = if (systems_per_page == 2)
-            nextScoreSystem(measures, first.measure_end, beat_capacity)
-        else
-            ScoreSystem{ .start_beat = first.end_beat, .end_beat = first.end_beat, .first_measure = first.measure_end, .measure_end = first.measure_end };
-        const page = ScorePage{
-            .systems = .{ first, second },
-            .system_count = if (systems_per_page == 2 and second.measure_end > second.first_measure) 2 else 1,
-            .page_index = page_index,
-        };
+        var page: ScorePage = .{ .system_count = 0, .page_index = page_index };
+        var measure_cursor = first_measure;
+        while (page.system_count < systems_per_page and measure_cursor < measures.len) {
+            const system = nextScoreSystem(measures, measure_cursor, beat_capacity);
+            page.systems[page.system_count] = system;
+            page.system_count += 1;
+            measure_cursor = system.measure_end;
+        }
         const page_measure_end = page.systems[page.system_count - 1].measure_end;
+        const page_end = page.endBeat();
+        for (page.system_count..max_score_systems) |system| page.systems[system] = .{
+            .start_beat = page_end,
+            .end_beat = page_end,
+            .first_measure = page_measure_end,
+            .measure_end = page_measure_end,
+        };
         if (target < page.endBeat() - 0.0001 or page_measure_end >= measures.len) return page;
         first_measure = page_measure_end;
     }
@@ -356,7 +431,7 @@ pub fn scoreContinuousForBeat(measures: []const model.Measure, requested_beat: f
 }
 
 pub fn scoreContinuousForBeatLimited(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32, requested_systems: usize) ScorePage {
-    const systems_per_page = std.math.clamp(requested_systems, 1, 2);
+    const systems_per_page = std.math.clamp(requested_systems, 1, max_score_systems);
     if (measures.len == 0) return scorePageForBeatLimited(measures, requested_beat, meta, zoom, systems_per_page);
     const target = @max(measures[0].start_beat, requested_beat);
     const beat_capacity = scoreSystemBeatCapacity(zoom);
@@ -365,15 +440,23 @@ pub fn scoreContinuousForBeatLimited(measures: []const model.Measure, requested_
     while (first_measure < measures.len) : (system_index += 1) {
         const first = nextScoreSystem(measures, first_measure, beat_capacity);
         if (target < first.end_beat - 0.0001 or first.measure_end >= measures.len) {
-            const second = if (systems_per_page == 2)
-                nextScoreSystem(measures, first.measure_end, beat_capacity)
-            else
-                ScoreSystem{ .start_beat = first.end_beat, .end_beat = first.end_beat, .first_measure = first.measure_end, .measure_end = first.measure_end };
-            return .{
-                .systems = .{ first, second },
-                .system_count = if (systems_per_page == 2 and second.measure_end > second.first_measure) 2 else 1,
-                .page_index = system_index,
+            var page: ScorePage = .{ .system_count = 0, .page_index = system_index };
+            var measure_cursor = first_measure;
+            while (page.system_count < systems_per_page and measure_cursor < measures.len) {
+                const system = nextScoreSystem(measures, measure_cursor, beat_capacity);
+                page.systems[page.system_count] = system;
+                page.system_count += 1;
+                measure_cursor = system.measure_end;
+            }
+            const page_measure_end = page.systems[page.system_count - 1].measure_end;
+            const page_end = page.endBeat();
+            for (page.system_count..max_score_systems) |system| page.systems[system] = .{
+                .start_beat = page_end,
+                .end_beat = page_end,
+                .first_measure = page_measure_end,
+                .measure_end = page_measure_end,
             };
+            return page;
         }
         first_measure = first.measure_end;
     }
@@ -395,14 +478,15 @@ pub fn scorePageCount(measures: []const model.Measure, meta: *const model.Docume
 
 pub fn scorePageCountLimited(measures: []const model.Measure, meta: *const model.DocumentMeta, zoom: f32, requested_systems: usize) u32 {
     if (measures.len == 0) return 1;
-    const systems_per_page = std.math.clamp(requested_systems, 1, 2);
+    const systems_per_page = std.math.clamp(requested_systems, 1, max_score_systems);
     const beat_capacity = scoreSystemBeatCapacity(zoom);
     var page_count: u32 = 0;
     var first_measure: usize = 0;
     while (first_measure < measures.len) {
-        const first = nextScoreSystem(measures, first_measure, beat_capacity);
-        first_measure = first.measure_end;
-        if (systems_per_page == 2 and first_measure < measures.len) first_measure = nextScoreSystem(measures, first_measure, beat_capacity).measure_end;
+        var systems: usize = 0;
+        while (systems < systems_per_page and first_measure < measures.len) : (systems += 1) {
+            first_measure = nextScoreSystem(measures, first_measure, beat_capacity).measure_end;
+        }
         page_count += 1;
     }
     _ = meta;
@@ -499,6 +583,20 @@ pub fn scoreBeatAtX(geometry: ScoreGeometry, page: ScorePage, measures: []const 
         return std.math.clamp(measure.start_beat + local * measure_duration, measure.start_beat, measure_end - 0.0001);
     }
     return system.end_beat - 0.0001;
+}
+
+/// Resolve a pointer to the closest visible system. The boundary is the
+/// optical midpoint between adjacent systems, so editing and score-space ink
+/// remain stable when a tall window fits three or more systems.
+pub fn scoreSystemAtY(geometry: ScoreGeometry, page: ScorePage, vocal_visible: bool, y: f32) usize {
+    const count = std.math.clamp(page.system_count, 1, max_score_systems);
+    for (0..count) |system| {
+        if (system + 1 == count) return system;
+        const bottom = geometry.bass_y[system] + 49;
+        const next_top = if (vocal_visible) geometry.vocal_y[system + 1] else geometry.treble_y[system + 1];
+        if (y < (bottom + next_top) * 0.5) return system;
+    }
+    return count - 1;
 }
 
 fn measurePadding(geometry: ScoreGeometry, measure_beats: f32) f32 {
@@ -889,6 +987,68 @@ test "roomy vocal pages retain two systems with collision-safe vertical spacing"
     try std.testing.expect(geometry.bass_y[1] + 49 <= geometry.page_y + geometry.page_height + 0.001);
 }
 
+test "page heading owns a real clef-ink clearance lane" {
+    const stage = Rect{ .x = 0, .y = 0, .width = 1200, .height = 760 };
+    const vocal_geometry = ScoreGeometry.calculateForSystems(stage, true, 2);
+    const piano_geometry = ScoreGeometry.calculateForSystems(stage, false, 2);
+    const source_label_ink_bottom = vocal_geometry.page_y + 78;
+    try std.testing.expect(vocal_geometry.vocal_y[0] - 34 >= source_label_ink_bottom + 10);
+    try std.testing.expect(piano_geometry.treble_y[0] - 34 >= source_label_ink_bottom + 10);
+}
+
+test "paged zoom merges more systems onto one sheet while spread stays two-up" {
+    const stage = Rect{ .x = 80, .y = 64, .width = 1800, .height = 1000 };
+    const normal = zoomedScoreStage(stage, 1);
+    const overview = zoomedScoreStage(stage, 0.65);
+    const deep_overview = zoomedScoreStage(stage, min_score_zoom);
+    try std.testing.expectEqual(stage.height, normal.height);
+    try std.testing.expect(overview.height > normal.height);
+    try std.testing.expect(deep_overview.height > overview.height);
+    try std.testing.expect(scoreSystemsPerPage(overview.height, true) > scoreSystemsPerPage(normal.height, true));
+    try std.testing.expect(scoreSystemsPerPage(deep_overview.height, true) > scoreSystemsPerPage(overview.height, true));
+    try std.testing.expectEqual(@as(usize, 2), spreadVisiblePageCount(stage, 0.65));
+}
+
+test "tall score pages paginate and hit-test six complete systems" {
+    var measures: [48]model.Measure = undefined;
+    for (&measures, 0..) |*measure, index| {
+        measure.* = .{
+            .start_beat = @as(f32, @floatFromInt(index)) * 4,
+            .duration_beats = 4,
+            .number = @intCast(index + 1),
+            .beats = 4,
+            .beat_unit = 4,
+        };
+    }
+    const stage = Rect{ .x = 0, .y = 0, .width = 1400, .height = 1100 };
+    const systems_per_page = scoreSystemsPerPage(stage.height, false);
+    try std.testing.expectEqual(@as(usize, 6), systems_per_page);
+    const page = scorePageForBeatLimited(&measures, 0, &.{}, 1, systems_per_page);
+    try std.testing.expectEqual(@as(usize, 6), page.system_count);
+    try std.testing.expectEqual(@as(f32, 48), page.endBeat());
+    try std.testing.expectEqual(@as(u32, 4), scorePageCountLimited(&measures, &.{}, 1, systems_per_page));
+
+    const geometry = ScoreGeometry.calculateForSystems(stage, false, page.system_count);
+    for (0..page.system_count) |system| {
+        const center_y = (geometry.treble_y[system] + geometry.bass_y[system] + 49) * 0.5;
+        try std.testing.expectEqual(system, scoreSystemAtY(geometry, page, false, center_y));
+        if (system > 0) try std.testing.expect(geometry.treble_y[system] >= geometry.bass_y[system - 1] + 82);
+    }
+    try std.testing.expect(geometry.bass_y[page.system_count - 1] + 49 <= geometry.page_y + geometry.page_height + 0.001);
+}
+
+test "tall vocal pages add systems without crossing lyric or page lanes" {
+    const stage = Rect{ .x = 0, .y = 0, .width = 1400, .height = 1500 };
+    const systems = scoreSystemsPerPage(stage.height, true);
+    try std.testing.expectEqual(@as(usize, 5), systems);
+    const geometry = ScoreGeometry.calculateForSystems(stage, true, systems);
+    for (0..systems) |system| {
+        try std.testing.expect(geometry.lyric_y[system] + 16 <= geometry.treble_y[system]);
+        if (system > 0) try std.testing.expect(geometry.vocal_y[system] >= geometry.bass_y[system - 1] + 96);
+    }
+    try std.testing.expect(geometry.bass_y[systems - 1] + 49 <= geometry.page_y + geometry.page_height + 0.001);
+}
+
 test "zooming out reflows more complete measures onto each score page" {
     var measures: [12]model.Measure = undefined;
     for (&measures, 0..) |*measure, index| {
@@ -1013,41 +1173,119 @@ pub fn hasVocalGuide(notes: []const model.Note) bool {
 /// in the native host while this function rebuilds the frame packet.
 fn drawScore(packet: *render.Packet, stage: Rect, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta, notes: []const model.Note, lyrics: []const model.Lyric, harmonies: []const model.Harmony, pedals: []const model.PedalEvent, measures: []const model.Measure, annotations: *const annotation.Store, time_seconds: f32) void {
     packet.rect(stage.x, stage.y, stage.width, stage.height, .{ 0.045, 0.052, 0.064, 1 });
-    const zoom = std.math.clamp(state.zoom, 0.65, 1.05);
+    const zoom = std.math.clamp(state.zoom, min_score_zoom, max_score_zoom);
     const vocal_visible = state.vocal_guide_visible != 0 and hasVocalGuide(notes);
-    const systems_per_page = scoreSystemsPerPage(stage.height, vocal_visible);
+    const reflow_stage = if (state.score_view_mode == .spread) stage else zoomedScoreStage(stage, zoom);
+    const systems_per_page = scoreSystemsPerPage(reflow_stage.height, vocal_visible);
     const page_count = scorePageCountLimited(measures, meta, zoom, systems_per_page);
     if (state.score_view_mode == .spread and stage.width >= 760) {
-        const gap: f32 = 12;
-        const page_stage_width = (stage.width - gap) * 0.5;
-        const left_stage = Rect{ .x = stage.x, .y = stage.y, .width = page_stage_width, .height = stage.height };
-        const right_stage = Rect{ .x = stage.x + page_stage_width + gap, .y = stage.y, .width = page_stage_width, .height = stage.height };
-        const left_page = scorePageForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
-        var start = packet.len;
-        drawScorePage(packet, left_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, left_page, page_count);
-        drawAnnotationsPage(packet, left_stage, left_page, vocal_visible, measures, annotations);
-        transformScoreItems(packet, start, left_stage, zoom);
-        const right_page = scorePageForBeatLimited(measures, left_page.endBeat(), meta, zoom, systems_per_page);
-        if (right_page.page_index != left_page.page_index) {
-            start = packet.len;
-            drawScorePage(packet, right_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, right_page, page_count);
-            drawAnnotationsPage(packet, right_stage, right_page, vocal_visible, measures, annotations);
-            transformScoreItems(packet, start, right_stage, zoom);
+        const visible_pages = spreadVisiblePageCount(stage, zoom);
+        var page = scorePageForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
+        const first_page_number = page.page_index + 1;
+        var last_page_number = first_page_number;
+        for (0..visible_pages) |page_offset| {
+            const page_stage = spreadPageStage(stage, zoom, page_offset);
+            const start = packet.len;
+            drawScorePage(packet, page_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, page, page_count, page.system_count);
+            drawAnnotationsPage(packet, page_stage, page, vocal_visible, measures, annotations);
+            transformScoreItems(packet, start, page_stage, zoom);
+            last_page_number = page.page_index + 1;
+            if (page.endBeat() >= (if (measures.len == 0) page.endBeat() else measures[measures.len - 1].start_beat + measures[measures.len - 1].duration_beats) - 0.0001) break;
+            const next_page = scorePageForBeatLimited(measures, page.endBeat(), meta, zoom, systems_per_page);
+            if (next_page.page_index == page.page_index) break;
+            page = next_page;
         }
-        drawPageNavigation(packet, Layout.calculateForState(state), state, left_page.page_index + 1, page_count);
+        drawPageNavigation(packet, Layout.calculateForState(state), state, first_page_number, last_page_number, page_count);
         return;
     }
 
-    const page = if (state.score_view_mode == .continuous)
-        scoreContinuousForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page)
-    else
-        scorePageForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
-    const displayed_count = if (state.score_view_mode == .continuous) scoreSystemCount(measures, zoom) else page_count;
+    if (state.score_view_mode == .paged) {
+        const page = scorePageForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
+        const start = packet.len;
+        drawScorePage(packet, reflow_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, page, page_count, page.system_count);
+        drawAnnotationsPage(packet, reflow_stage, page, vocal_visible, measures, annotations);
+        transformScoreItemsTopAnchored(packet, start, stage, zoom);
+        drawPageNavigation(packet, Layout.calculateForState(state), state, page.page_index + 1, page.page_index + 1, page_count);
+        return;
+    }
+
+    const page = scoreContinuousForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
+    const displayed_count = scoreSystemCount(measures, zoom);
+    // The continuous paper is the viewport surface, not a transformed page.
+    // Keep it edge-to-edge while its notation layer responds to zoom.
+    packet.rect(stage.x, stage.y, stage.width, stage.height, palette.paper);
     const start = packet.len;
-    drawScorePage(packet, stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, page, displayed_count);
+    drawScorePage(packet, reflow_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, page, displayed_count, page.system_count);
+    drawAnnotationsPage(packet, reflow_stage, page, vocal_visible, measures, annotations);
+    transformScoreItemsTopAnchored(packet, start, stage, zoom);
+    drawPageNavigation(packet, Layout.calculateForState(state), state, page.page_index + 1, page.page_index + 1, displayed_count);
+}
+
+/// Build one clean, complete authored sheet for print/PDF export.  This uses
+/// the exact GPU engraving path used on screen, but excludes all application
+/// chrome, navigation controls and playback highlights.
+pub fn drawPrintablePage(
+    packet: *render.Packet,
+    width: f32,
+    height: f32,
+    requested_beat: f32,
+    source_state: *const model.UiState,
+    source_transport: *const model.Transport,
+    meta: *const model.DocumentMeta,
+    notes: []const model.Note,
+    lyrics: []const model.Lyric,
+    harmonies: []const model.Harmony,
+    pedals: []const model.PedalEvent,
+    measures: []const model.Measure,
+    annotations: *const annotation.Store,
+) ScorePage {
+    packet.reset();
+    var state = source_state.*;
+    state.viewport_width = width;
+    state.viewport_height = height;
+    state.zoom = 1;
+    state.score_view_mode = .paged;
+    state.pointer_x = -10_000;
+    state.pointer_y = -10_000;
+    var transport = source_transport.*;
+    transport.playing = 0;
+    transport.cursor_beat = -10_000;
+    const vocal_visible = state.vocal_guide_visible != 0 and hasVocalGuide(notes);
+    // Expanding the source stage by the normal screen margins makes the
+    // resulting paper exactly fill the PDF page while retaining its internal
+    // 48 px notation padding.
+    const stage = Rect{ .x = -46, .y = -10, .width = width + 92, .height = height + 20 };
+    const systems_per_page = scoreSystemsPerPage(stage.height, vocal_visible);
+    const page = scorePageForBeatLimited(measures, requested_beat, meta, 1, systems_per_page);
+    const page_count = scorePageCountLimited(measures, meta, 1, systems_per_page);
+    // Keep the same top-down system spacing on the final partial PDF page as
+    // on every full page. Only authored systems are drawn; the layout count
+    // merely prevents a short final page from stretching them to both edges.
+    drawScorePage(packet, stage, &state, &transport, meta, notes, lyrics, harmonies, pedals, measures, 0, page, page_count, systems_per_page);
     drawAnnotationsPage(packet, stage, page, vocal_visible, measures, annotations);
-    transformScoreItems(packet, start, stage, zoom);
-    drawPageNavigation(packet, Layout.calculateForState(state), state, page.page_index + 1, displayed_count);
+    return page;
+}
+
+fn transformScoreItemsTopAnchored(packet: *render.Packet, start: usize, stage: Rect, scale: f32) void {
+    if (@abs(scale - 1) < 0.0001) return;
+    const center_x = stage.x + stage.width * 0.5;
+    const top_y = stage.y;
+    for (packet.items[start..packet.len]) |*item| {
+        const kind: render.Kind = @enumFromInt(@as(u32, @intFromFloat(item.params[0] + 0.5)));
+        if (kind == .line) {
+            item.rect[0] = center_x + (item.rect[0] - center_x) * scale;
+            item.rect[1] = top_y + (item.rect[1] - top_y) * scale;
+            item.rect[2] = center_x + (item.rect[2] - center_x) * scale;
+            item.rect[3] = top_y + (item.rect[3] - top_y) * scale;
+            item.params[1] *= scale;
+        } else {
+            item.rect[0] = center_x + (item.rect[0] - center_x) * scale;
+            item.rect[1] = top_y + (item.rect[1] - top_y) * scale;
+            item.rect[2] *= scale;
+            item.rect[3] *= scale;
+            if (kind == .rounded_rect) item.params[1] *= scale;
+        }
+    }
 }
 
 fn transformScoreItems(packet: *render.Packet, start: usize, stage: Rect, scale: f32) void {
@@ -1072,13 +1310,16 @@ fn transformScoreItems(packet: *render.Packet, start: usize, stage: Rect, scale:
     }
 }
 
-fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta, notes: []const model.Note, lyrics: []const model.Lyric, harmonies: []const model.Harmony, pedals: []const model.PedalEvent, measures: []const model.Measure, time_seconds: f32, page: ScorePage, page_count: u32) void {
+fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta, notes: []const model.Note, lyrics: []const model.Lyric, harmonies: []const model.Harmony, pedals: []const model.PedalEvent, measures: []const model.Measure, time_seconds: f32, page: ScorePage, page_count: u32, layout_system_count: usize) void {
     const vocal_visible = state.vocal_guide_visible != 0 and hasVocalGuide(notes);
-    var geometry = ScoreGeometry.calculateWithVocal(stage, vocal_visible);
+    var geometry = ScoreGeometry.calculateForSystems(stage, vocal_visible, @max(page.system_count, layout_system_count));
     const compact_header = geometry.page_height < 340;
+    const continuous = state.score_view_mode == .continuous;
     geometry.beat_width = geometry.music_width / page.systems[0].duration();
-    packet.glow(geometry.page_x - 10, geometry.page_y + 8, geometry.page_width + 20, geometry.page_height + 10, 18, .{ 0, 0, 0, 0.34 }, 0);
-    packet.rounded(geometry.page_x, geometry.page_y, geometry.page_width, geometry.page_height, 5, palette.paper);
+    if (!continuous) {
+        packet.glow(geometry.page_x - 10, geometry.page_y + 8, geometry.page_width + 20, geometry.page_height + 10, 18, .{ 0, 0, 0, 0.34 }, 0);
+        packet.rounded(geometry.page_x, geometry.page_y, geometry.page_width, geometry.page_height, 5, palette.paper);
+    }
     packet.text(geometry.page_x + geometry.page_padding - 6, geometry.page_y + if (compact_header) @as(f32, 30) else 36, meta.titleSlice(), if (compact_header or geometry.page_width < 500) 1.55 else 2.45, palette.ink);
     const source_label: []const u8 = switch (meta.source_kind) {
         1 => "IMPORTED MUSICXML - REVIEW WARNINGS",
@@ -1086,14 +1327,14 @@ fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiStat
         else => "BUILT-IN PRACTICE SCORE",
     };
     if (!compact_header) packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 60, if (geometry.page_width < 500) "SCORE PRACTICE" else source_label, if (geometry.page_width < 500) 0.9 else 1.2, .{ 0.30, 0.31, 0.31, 1 });
-    var page_buffer: [24]u8 = undefined;
+    var page_buffer: [40]u8 = undefined;
     const page_number = page.page_index + 1;
-    const page_label = if (state.score_view_mode == .continuous)
-        std.fmt.bufPrint(&page_buffer, "SYSTEM {d} / {d}", .{ page_number, page_count }) catch "SYSTEM"
+    const page_label = if (continuous)
+        std.fmt.bufPrint(&page_buffer, "SYSTEMS {d}-{d} / {d}", .{ page_number, page_number + @as(u32, @intCast(page.system_count)) - 1, page_count }) catch "SYSTEMS"
     else
         std.fmt.bufPrint(&page_buffer, "PAGE {d} / {d}", .{ page_number, page_count }) catch "PAGE";
-    packet.text(geometry.page_x + geometry.page_width - geometry.page_padding - 88, geometry.page_y + 38, page_label, if (state.score_view_mode == .continuous) 0.72 else 0.95, .{ 0.35, 0.36, 0.36, 1 });
-    if (geometry.page_width >= 620) packet.text(geometry.page_x + geometry.page_width - geometry.page_padding - 124, geometry.page_y + 57, "SCROLL  /  LEFT-RIGHT", 0.62, .{ 0.46, 0.47, 0.48, 1 });
+    packet.text(geometry.page_x + geometry.page_width - geometry.page_padding - (if (continuous) @as(f32, 128) else 88), geometry.page_y + 38, page_label, if (continuous) 0.72 else 0.95, .{ 0.35, 0.36, 0.36, 1 });
+    if (geometry.page_width >= 620) packet.text(geometry.page_x + geometry.page_width - geometry.page_padding - 124, geometry.page_y + 57, if (continuous) "SCROLL VERTICALLY" else "SCROLL  /  LEFT-RIGHT", 0.62, .{ 0.46, 0.47, 0.48, 1 });
 
     for (0..page.system_count) |system| {
         const score_system = page.systems[system];
@@ -1220,9 +1461,9 @@ fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiStat
     }
 }
 
-fn drawPageNavigation(packet: *render.Packet, layout: Layout, state: *const model.UiState, page_number: u32, page_count: u32) void {
-    const previous_enabled = page_number > 1;
-    const next_enabled = page_number < page_count;
+fn drawPageNavigation(packet: *render.Packet, layout: Layout, state: *const model.UiState, first_page_number: u32, last_page_number: u32, page_count: u32) void {
+    const previous_enabled = first_page_number > 1;
+    const next_enabled = last_page_number < page_count;
     const previous_hovered = previous_enabled and layout.page_previous.contains(state.pointer_x, state.pointer_y);
     const next_hovered = next_enabled and layout.page_next.contains(state.pointer_x, state.pointer_y);
     const disabled: Color = .{ 0.22, 0.24, 0.27, 0.42 };
@@ -1841,11 +2082,17 @@ fn nextPedalEvent(events: []const model.PedalEvent, pedal: u8, cursor_beat: f32)
     return null;
 }
 
+fn pedalGapNeedsReview(events: []const model.PedalEvent, pedal: u8, cursor_beat: f32, max_gap_beats: f32) bool {
+    if (expectedPedalValue(events, pedal, cursor_beat) == 0) return false;
+    const next = nextPedalEvent(events, pedal, cursor_beat) orelse return true;
+    return next.start_beat - cursor_beat > max_gap_beats + 0.0001;
+}
+
 fn drawPedalNotation(packet: *render.Packet, events: []const model.PedalEvent, notes: []const model.Note, geometry: ScoreGeometry, page: ScorePage, measures: []const model.Measure, transport: *const model.Transport) void {
     for (0..page.system_count) |system| {
         const system_start = page.systems[system].start_beat;
         const system_end = page.systems[system].end_beat;
-        const next_treble = if (system == 0) geometry.treble_y[1] else geometry.page_y + geometry.page_height;
+        const next_treble = if (system + 1 < page.system_count) geometry.treble_y[system + 1] else geometry.page_y + geometry.page_height;
         // Pedal is a separate expression lane, not text painted on top of the
         // lowest bass stem. Estimate the rendered bass ink (including beams,
         // flags, articulation space, and dynamics), then place the lane below
@@ -1958,14 +2205,18 @@ fn drawPedalStatus(packet: *render.Packet, panel: Rect, state: *const model.UiSt
     if (panel.width >= 800) {
         packet.text(start_x - 128, panel.y + 18, "LIVE / SCORE", 0.68, palette.muted);
         if (nextPedalEvent(pedals, model.pedal_sustain, @max(0, transport.cursor_beat))) |next| {
-            var instruction_buffer: [64]u8 = undefined;
-            const action: []const u8 = switch (next.action) {
-                model.pedal_action_stop, model.pedal_action_discontinue => "UP",
-                model.pedal_action_change => "CHANGE",
-                else => "DOWN",
-            };
-            const instruction = std.fmt.bufPrint(&instruction_buffer, "NEXT SUST {s}  {d:.1} BEATS", .{ action, next.start_beat - @max(0, transport.cursor_beat) }) catch "NEXT PEDAL CHANGE";
-            packet.text(start_x - 330, panel.y + 18, instruction, 0.72, palette.amber);
+            if (pedalGapNeedsReview(pedals, model.pedal_sustain, @max(0, transport.cursor_beat), 16)) {
+                packet.text(start_x - 330, panel.y + 18, "PEDAL PLAN REVIEW / LONG HOLD", 0.72, palette.rose);
+            } else {
+                var instruction_buffer: [64]u8 = undefined;
+                const action: []const u8 = switch (next.action) {
+                    model.pedal_action_stop, model.pedal_action_discontinue => "UP",
+                    model.pedal_action_change => "CHANGE",
+                    else => "DOWN",
+                };
+                const instruction = std.fmt.bufPrint(&instruction_buffer, "NEXT SUST {s}  {d:.1} BEATS", .{ action, next.start_beat - @max(0, transport.cursor_beat) }) catch "NEXT PEDAL CHANGE";
+                packet.text(start_x - 330, panel.y + 18, instruction, 0.72, palette.amber);
+            }
         }
     }
     for (labels, values, kinds, 0..) |label, value, kind, index| {
@@ -2021,7 +2272,7 @@ fn drawKeyboard(packet: *render.Packet, panel: Rect, state: *const model.UiState
 }
 
 fn drawAnnotationsPage(packet: *render.Packet, stage: Rect, page: ScorePage, vocal_visible: bool, measures: []const model.Measure, annotations: *const annotation.Store) void {
-    const geometry = ScoreGeometry.calculateWithVocal(stage, vocal_visible);
+    const geometry = ScoreGeometry.calculateForSystems(stage, vocal_visible, page.system_count);
     for (annotations.strokes[0..annotations.stroke_count]) |stroke| {
         if (!annotation.isScoreSpace(stroke) and annotation.pageIndex(stroke) != page.page_index) continue;
         const start: usize = @intCast(stroke.first_point);
@@ -2055,10 +2306,9 @@ test "score ink follows its page through zoom transforms" {
     var packet: render.Packet = undefined;
     packet.reset();
     const stage = Rect{ .x = 100, .y = 50, .width = 800, .height = 600 };
-    const page = ScorePage{ .systems = .{
-        .{ .start_beat = 0, .end_beat = 8 },
-        .{ .start_beat = 8, .end_beat = 16 },
-    }, .page_index = 3 };
+    var page: ScorePage = .{ .page_index = 3 };
+    page.systems[0] = .{ .start_beat = 0, .end_beat = 8 };
+    page.systems[1] = .{ .start_beat = 8, .end_beat = 16 };
     drawAnnotationsPage(&packet, stage, page, false, &.{}, &annotations);
     try std.testing.expectEqual(@as(usize, 1), packet.len);
     transformScoreItems(&packet, 0, stage, 0.75);
@@ -2244,7 +2494,7 @@ fn drawTransport(packet: *render.Packet, layout: Layout, state: *const model.UiS
     if (transport.cursor_beat < 0) {
         const beats_left: u32 = @intFromFloat(@ceil(-transport.cursor_beat));
         packet.text(28, layout.transport.y + 23, "COUNT IN", 1.3, palette.amber);
-        packet.text(28, layout.transport.y + 44, std.fmt.bufPrint(&beat_buffer, "{d} BEATS", .{beats_left}) catch "READY", 1.6, palette.text);
+        packet.text(28, layout.transport.y + 44, countInBeatsLabel(&beat_buffer, beats_left), 1.6, palette.text);
     } else {
         const position = model.barBeatAt(measures, transport.cursor_beat, meta);
         packet.text(28, layout.transport.y + 23, std.fmt.bufPrint(&bar_buffer, "BAR {d}", .{position.bar}) catch "BAR", 1.3, palette.muted);
@@ -2261,6 +2511,19 @@ fn drawTransport(packet: *render.Packet, layout: Layout, state: *const model.UiS
     } else {
         packet.text(layout.transport.width - 134, layout.transport.y + 45, std.fmt.bufPrint(&tempo_buffer, "1/{d} = {d:.0} BPM", .{ meta.tempo_beat_unit, transport.tempo_bpm }) catch "BPM", 1.25, if (tempo_hovered) palette.cyan else palette.text);
     }
+}
+
+fn countInBeatsLabel(buffer: []u8, beats_left: u32) []const u8 {
+    return if (beats_left == 1)
+        std.fmt.bufPrint(buffer, "1 BEAT LEFT", .{}) catch "READY"
+    else
+        std.fmt.bufPrint(buffer, "{d} BEATS LEFT", .{beats_left}) catch "READY";
+}
+
+test "count-in label makes remaining beats explicit" {
+    var buffer: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("1 BEAT LEFT", countInBeatsLabel(&buffer, 1));
+    try std.testing.expectEqualStrings("6 BEATS LEFT", countInBeatsLabel(&buffer, 6));
 }
 
 test "engraving honors D-flat spelling and emits analytic beams and ties" {
@@ -2330,6 +2593,13 @@ test "score pedal guide tracks expected controller state and emits analytic mark
     try std.testing.expectEqual(@as(u8, 127), expectedPedalValue(&events, model.pedal_sustain, 2));
     try std.testing.expectEqual(@as(u8, 0), expectedPedalValue(&events, model.pedal_sustain, 4));
     try std.testing.expectEqual(model.pedal_action_stop, (nextPedalEvent(&events, model.pedal_sustain, 2) orelse return error.TestUnexpectedResult).action);
+    try std.testing.expect(!pedalGapNeedsReview(&events, model.pedal_sustain, 2, 16));
+    const long_hold = [_]model.PedalEvent{
+        .{ .start_beat = 0, .pedal = model.pedal_sustain, .value = 72, .action = model.pedal_action_start },
+        .{ .start_beat = 32, .pedal = model.pedal_sustain, .value = 0, .action = model.pedal_action_stop },
+    };
+    try std.testing.expect(pedalGapNeedsReview(&long_hold, model.pedal_sustain, 1, 16));
+    try std.testing.expect(!pedalGapNeedsReview(&long_hold, model.pedal_sustain, 33, 16));
     var packet: render.Packet = undefined;
     packet.reset();
     const geometry = ScoreGeometry.calculate(.{ .x = 0, .y = 0, .width = 900, .height = 620 });

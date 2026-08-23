@@ -14,6 +14,7 @@ zig build score-workbench -- splice-opening TARGET.mxl FRAGMENT.mxl OUTPUT.mxl -
 zig build score-workbench -- opening-performance INPUT.mxl OUTPUT.mxl
 zig build score-workbench -- enrich-opening TARGET.mxl FRAGMENT.mxl OUTPUT.mxl
 zig build score-workbench -- evidence SCORE.mxl --csv EVENTS.csv
+zig build score-workbench -- evidence SCORE.mxl --csv EVENTS.csv --anchors ANCHORS.json --output REPORT.json --detail-measure N
 zig build score-workbench -- audio-evidence INPUT.wav --score SCORE.mxl
 zig build score-workbench -- shape-performance INPUT.mxl AUDIO.wav OUTPUT.mxl --start-beat N --end-beat N
 zig build score-workbench -- compare-performance REFERENCE.wav CANDIDATE.wav --output REPORT.json
@@ -22,8 +23,14 @@ zig build score-workbench -- shape-performance INPUT.mxl AUDIO.wav OUTPUT.mxl --
 zig build score-workbench -- compare-performance REFERENCE.wav CANDIDATE.wav --score SCORE.mxl --anchors ANCHORS.json --output REPORT.json
 zig build score-workbench -- enrich-evidence TARGET.mxl OUTPUT.mxl --anchors REVIEW.json --csv EVENTS.csv --start-beat N --end-beat N
 zig build score-workbench -- playability SCORE.mxl
+zig build score-workbench -- dedupe INPUT.mxl OUTPUT.mxl
 zig build score-workbench -- revoice INPUT.mxl OUTPUT.mxl --beat N --pitch MIDI --from-staff N --to-staff N
-zig build && ./zig-out/bin/score-sampler-workbench render-score SCORE.mxl OUTPUT.wav --start-beat N --end-beat N
+zig build score-workbench -- retune INPUT.mxl OUTPUT.mxl --replace BEAT:STAFF:FROM_MIDI:TO_MIDI
+zig build score-workbench -- pedalize INPUT.mxl OUTPUT.mxl --preserve-existing
+zig build score-workbench -- pedalize INPUT.mxl OUTPUT.mxl --preserve-existing --max-refresh-beats 12 --normalize-restarts
+zig build score-workbench -- pedalize INPUT.mxl OUTPUT.mxl --preserve-existing --harmony-refresh-min-beats 4 --normalize-restarts
+zig build score-workbench -- pedalize INPUT.mxl OUTPUT.mxl --harmonic-midpoint
+zig build && ./zig-out/bin/score-sampler-workbench render-score SCORE.mxl OUTPUT.wav --start-beat N --end-beat N --detail 64:64:64:64
 ```
 
 The only other Zig tool sources are `dev_control.zig` for the Debug control

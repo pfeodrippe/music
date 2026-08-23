@@ -66,6 +66,153 @@ iOS remain later portability targets and must not distract from native quality.
   measure 15. Native autosave recovery/export preserves 195 measures, 2,760
   events, 40 velocity levels (52..94), and 14 pedal events. Candidate SHA-256:
   `9eb1f6b0b2e690cee4b428cf81163774a09d0fbb9027bed297045c178d2a1878`.
+- [x] Add an anchor-aware, per-measure multi-stem pitch audit and use it to
+  repair target measure 107 without altering rhythm, dynamics, articulation,
+  lyrics, or pedal data. The stale C/A-flat/E-flat cell scored only 10% exact
+  and 20% pitch-class agreement in that measure; the v12 D-flat/A-flat/F to
+  G-flat transition scores 80% exact and 90% pitch-class agreement at the same
+  attacks. A pitch-preserving hand redistribution keeps the correction within
+  a one-octave maximum hand span. Across the full score, the same three-source
+  120 ms gate improves exact matches 1,070 -> 1,077, pitch-class matches
+  1,431 -> 1,438, corroborated exact 394 -> 396, and corroborated pitch class
+  882 -> 886. Native Dawn/Metal hot-load, sampled playback, the 322.449-second
+  render, and the 1,704-region sampler pass with all 40 velocity levels, all 14
+  pedal events, and zero drops/overloads. This remains an ignored private v12
+  candidate pending a pianist/ear gate, not a published authoritative score.
+- [x] Correct target measure 99's octave/voicing mismatch without changing its
+  rhythm: the former high G-flat3/D-flat5/A-flat5 loop had 0/8 exact and 5/8
+  pitch-class matches, while the retained guitar/accompaniment evidence carries
+  a low G-flat2 foundation under F4/A-flat4 then D-flat4/F4. Private v13 reaches
+  8/8 exact and pitch-class matches locally and raises the full-score totals to
+  1,085 exact and 1,441 pitch-class matches. The complete render improves v12's
+  envelope/attack/sustain correlations 0.718134/0.698165/0.665215 to
+  0.719289/0.699302/0.668347 and reduces normalized error 0.179165 -> 0.178189.
+  Native hot-load, a controlled three-second 147-QPM playback, GPU capture,
+  autosave/export round trip, and mechanical playability pass with 40 velocity
+  levels, 14 pedal events, and zero sampler faults. SHA-256:
+  `14c3f2f471beb5488cea84229c4caa0f3af5ddde600f2b2a3dea083c75e3a4c4`.
+  Evidence is mainly the separated guitar stem, so pianist/ear approval remains
+  mandatory despite the non-regressing quantitative gate.
+- [x] Reject the first target-measure-92 retuning despite strong local pitch
+  evidence. Its A-flat2/E-flat4/C4/E-flat4 transition improves the measure from
+  0/4 to 4/4 exact matches (three corroborated), but the complete render lowers
+  envelope/sustain correlation from v13's 0.719289/0.668347 to
+  0.716907/0.663048. An anchor-shaped velocity retry recovers attack correlation
+  to 0.699482 but still regresses envelope/sustain to 0.717720/0.663361, so v13
+  stays canonical and hot-loaded. Keep the ignored v14 reports as rejection
+  provenance; do not promote local detector agreement over whole-phrase sound.
+- [x] Make authored MusicXML `change` pedals perform a real ordered CC64 lift
+  and redepress in both live playback and the offline sampler. The former path
+  resent only the nonzero value, so its visible repedal marks did not operate
+  the dampers. Preserve v13's accepted pedal plan and add only the missing
+  terminal lift: private v15 round-trips as 195 measures, 2,760 events, 40
+  instrumental velocity levels, and 15 pedal events. Under the corrected
+  semantics its complete 322.449-second render exactly preserves the fresh
+  v13 baseline metrics (0.684191 envelope, 0.587277 attack, 0.687069 sustain,
+  0.185801 normalized error), peaks at -3.86 dBFS, and reports zero overloads.
+  It is now the ignored `Holocene-private-study.mxl` canonical file, byte-equal
+  to the live export, with SHA-256
+  `9d31da3d2f1b809c2e390696e53226ebd0e9bf922e2edc2bddefbbaf3016324d`.
+  Reject the automatic 96-, 196-, and 222-event pedal candidates because their
+  frequent damper changes materially regress the complete envelope/sustain;
+  keep them only as ignored negative provenance.
+- [x] Prevent stale development windows from restoring an older score after a
+  host rebuild. Only the Debug process that owns `/tmp/score-dev-<uid>.sock`
+  may write `autosave-dev.score`; duplicate comparison windows are read-only
+  for that journal. After closing the two stale 193-measure hosts, cold-start
+  QA without an explicit score recovered v15 at exactly 195 measures / 2,760
+  events / 75 harmonies / 15 pedals, followed by a clean Dawn/Metal capture
+  and zero sampler drops or overloads.
+- [x] Extend the per-measure Zig audit with source-by-source active pitch lists
+  and investigate the next two weakest bars without guessing. Measure 64 is
+  deferred because the supplied page marks the corresponding harp bar empty
+  while the recording contains accompaniment, and the three separators do not
+  agree on a single replacement voicing. At target measure 137, supplied-page
+  OMR plus the recording support an F3 and lower D-flat register correction;
+  the six-note v16 candidate improves full exact/corroborated totals by four
+  and local pitch-class agreement from 6/8 to 8/8. Both unchanged and locally
+  reshaped velocities nevertheless regress complete-render envelope/attack
+  correlation, so v16 remains ignored rejection/review provenance and v15
+  stayed canonical through that rejected trial.
+- [x] Promote a narrowly scoped, recording-led measure-174 correction as
+  private v17. At beat 702, three separated sources agree on the low A-flat2
+  foundation and support the E-flat4/A-flat4/D-flat5 playable right-hand
+  voicing over the former unsupported B-flat4/F5 shell. The three retuned
+  pitches preserve every onset, duration, velocity, articulation, lyric,
+  fingering, harmony, and pedal event; full evidence improves 1,085 -> 1,088
+  exact and 1,441 -> 1,443 pitch-class matches. A first two-note variant was
+  rejected for creating a 14-semitone right-hand span; v17 passes with no
+  over-octave spans. Against a freshly rerun same-reference v15 baseline, the
+  complete sampled render improves envelope 0.683432 -> 0.685471, attack
+  0.585911 -> 0.587140, sustain 0.685043 -> 0.688738, and normalized error
+  0.185807 -> 0.185337. Onset matches remain 790 while one extra detected
+  candidate onset lowers precision by 0.000535; retain that caveat for the ear
+  gate. Native sampled playback, GPU engraving, exact MXL export/re-import,
+  system/WGSL reload, and 1,704-region sampler telemetry pass with zero faults.
+  This accepted intermediate v17 SHA-256 is
+  `77ade1f49911291aa5f97ae75f73fc0bd3371e1062f71ecc7ff730a3217e2d22`.
+- [x] Promote the exact repeated-phrase correction at measures 38 and 55 as
+  private v18. Both phrases formerly ended on E-flat4; at the corresponding
+  authored onsets, two different separated-source pairs independently detect
+  F4. Retuning only those two pitch nodes raises full evidence from v17's
+  1,088/1,443 exact/pitch-class and 397/888 corroborated matches to
+  1,090/1,445 and 399/890. Against v17, the complete sampled render improves
+  envelope 0.685471 -> 0.686662, attack 0.587140 -> 0.587878, sustain
+  0.688738 -> 0.690823, normalized error 0.185337 -> 0.185066, and matched
+  onsets 790 -> 791. Both live phrase auditions, both GPU pages, exact MXL
+  export/re-import, mechanical playability, and sampler telemetry pass. The
+  ignored canonical SHA-256 is
+  `924edd2d067936a0c4255c4c3e5fa4076d7d813cd1ef4102fb9567df123e0a2c`.
+- [x] Remove the two same-voice duplicate piano notes at measure 62 as private
+  v19. B-flat4 and D-flat5 at beat 264 were literal duplicate MusicXML chord
+  nodes, not unisons in independent voices. Extend the single Zig workbench's
+  playability gate to report this defect and add a conservative `dedupe`
+  transform that touches only semantically identical instrumental copies;
+  tests prove separate voices and the vocal guide survive. The result passes
+  mechanical playability with 195 measures, 2,758 events, 2,018 pitches,
+  1,663 instrumental notes, 485 vocal-guide notes, 75 harmonies, 15 pedal
+  events, and quarter-note = 147. Full three-source exact/pitch-class rates
+  improve slightly to 65.48%/86.83%; its complete 322.449-second Salamander
+  render remains clean at -3.86 dBFS and rounded recording-performance metrics
+  are unchanged. Native measure-62 audition, GPU engraving, system/WGSL hot
+  reload, zero-fault sampler telemetry, and byte-identical live export pass.
+  The ignored canonical SHA-256 is
+  `8f4e0d9efdcbf59207912031b7a224b6726b8728603ded3e7657c4f825f574bd`.
+- [x] Make incomplete pedal interpretation measurable instead of hiding it
+  behind technical playability. The consolidated Zig report now distinguishes
+  40 performed velocity layers (52..94) from two visible dynamic glyphs and
+  reports pedal starts/changes/stops, active restarts, refresh gaps, and gaps
+  beyond 16 quarter notes. Canonical v19 exposes one active restart and one
+  713.99-beat gap, so publication remains `REVIEW_REQUIRED`.
+- [x] Reject naive bounded-repedal v20 candidates. A tested Zig-only transform
+  preserves the opening performance, normalizes the active restart, and adds
+  pedal changes only on real attacks after 8-, 12-, or 16-beat gaps. All full
+  renders are clean, but the best 12-beat candidate regresses envelope
+  0.687406 -> 0.644380, sustain 0.692831 -> 0.572780, normalized error
+  0.185055 -> 0.205943, and candidate onsets 1,215 -> 328. Keep all three
+  ignored as rejection provenance and leave v19 canonical. Next pedaling work
+  must use phrase/harmony boundaries plus a real ear/piano gate rather than a
+  fixed timer.
+- [x] Stop the native pedal guide from teaching an unreviewed 713.99-beat hold
+  as though it were authoritative. The GPU footer now replaces a next-event
+  countdown with `PEDAL PLAN REVIEW / LONG HOLD` whenever sustain is active
+  and no refresh occurs within 16 quarter notes. A focused core test and live
+  beat-262 systems/WGSL hot reload verify the warning; canonical audio and MXL
+  remain unchanged.
+- [x] Reject the first harmony-aware v21 pedal candidate and identify its data
+  prerequisite. The Zig transform changes pedal only at a different authored
+  harmony and a real piano attack, but nearly every post-opening label through
+  measure 91 is B-flat minor seventh and the harmony map ends there. The three-
+  change min-4 candidate is clean but regresses envelope 0.687406 -> 0.676200,
+  attack 0.589182 -> 0.569262, sustain 0.692831 -> 0.680762, normalized error
+  0.185055 -> 0.188025, and matches 837 -> 801. Keep v21 ignored and v19
+  canonical. Build a recording/page-supported complete harmony map before the
+  next phrase-aware pedaling attempt.
+- [x] Clarify the live count-in readout as `N BEATS LEFT` (with a singular
+  one-beat form). The transport already used the real current meter—one 6/4
+  bar in the private score—but the former transient `2 BEATS` screenshot could
+  be mistaken for the configured count-in length. A focused Zig test and live
+  Dawn/Metal capture verify the new wording during the same stateful hot reload.
 - [ ] Complete the ear-and-pianist gate for the second opening candidate before
   promotion. Refine its attack contour, voicing, hand assignment, velocity,
   articulation, and pedal against the retained recording. Keep the canonical
@@ -117,7 +264,8 @@ iOS remain later portability targets and must not distract from native quality.
   the right hand while G-flat2 remains in the left, preserving pitch and
   timing but reducing the maximum one-hand span from a major tenth to one
   octave. The score now passes its mechanical piano-range, duration, chord
-  size, attack-rate, and hand-span gates; multiply escaped apostrophes in two
+  size, attack-rate, hand-span, and same-voice duplicate gates; multiply
+  escaped apostrophes in two
   singer-guide words are repaired during the same MusicXML round trip. The
   canonical private SHA-256 is
   `39fc2d9234db1553aca62dfaf54544fb74408da5393586dbd8800c7b14a8f720`.
@@ -235,35 +383,46 @@ iOS remain later portability targets and must not distract from native quality.
 - [x] Make native pagination height-aware across rendering, playback follow,
   page counts, scrolling, selection, and editing. Constrained windows show one
   complete voice-plus-piano system instead of painting a second system below
-  the paper or into the keyboard; sufficiently tall pages show two vertically
-  justified systems. Real Dawn/Metal readback passed at 720x540 and 1440x900,
-  including the private score's opening 2/4-to-4/4 transition.
-- [ ] Add responsive arbitrary system counts, vertical justification, and
-  true multi-page breaking for every viewport and print size.
+  the paper or into the keyboard.
+- [x] Replace the remaining two-system ceiling with responsive one-to-six
+  system pages, vertically justify every complete system, and share the same
+  page map across rendering, page counts, turns, playback following, note
+  selection/insertion, and score-space ink hit-testing. Focused Zig tests cover
+  six piano systems and five voice-plus-piano systems. Real Dawn/Metal readback
+  passes with four piano systems and three independent voice-plus-piano systems
+  in a 1400x1100 window; next/previous preserve authored measure boundaries.
 - [x] Add GPU controls, hot keys, accessibility actions, and Debug socket
   commands for paged, continuous-system, two-page spread, score zoom, and
   distraction-free focus modes. Navigation advances one system in continuous
   mode, one page in paged mode, and one spread in two-page mode.
-- [x] Make score zoom control actual reading density. Reflow only at authored
-  measure boundaries, and use the same zoom-aware page map for GPU drawing,
-  playback following, turns, spread/continuous navigation, annotations,
-  selection, and editing. Real Metal QA at 65% shows six opening measures and
-  33 pages instead of the former tiny four-measure/49-page layout.
+- [x] Make score zoom control actual reading density. In paged mode, reflow
+  complete authored measures and successively merge additional complete score
+  systems onto the same paper sheet; never reveal a second sheet below or turn
+  paged mode into a spread. Use the same zoom-aware page map for GPU drawing,
+  playback following, turns, continuous navigation, annotations, selection,
+  and editing. With the piano and vocal guide visible in the native 1440x900
+  app, real Dawn/Metal QA shows one system at 100%, two on the same page at
+  65%, and four on the same page at 45%.
 - [x] Anchor all newly authored ink to absolute score beat and normalized
   system height so it follows the same music across zoom, keyboard visibility,
-  and one-/two-system pagination. Preserve legacy page-relative strokes in
+  and responsive one-to-six-system pagination. Preserve legacy page-relative strokes in
   `.score` v15, regression-test persistence and reflow, and expose removable
   Debug `ink dot` marks for native framebuffer QA. Real Dawn/Metal readbacks
   confirm beat 10 moves from the second system on page 1 to the only system on
   page 2 when the guided piano changes the available page height.
-- [ ] Add free pan, part selection, and print layout.
+- [x] Export the complete authored score—not merely the visible page—as a
+  paginated A4 PDF from the existing Export panel. Render each page through the
+  native Dawn/Metal engraving path, omit application chrome and playback
+  highlights, preserve normal spacing on a short final page, and validate an
+  18-page artifact by rendering its first, middle, and final pages.
+- [ ] Add free pan and part selection.
 - [x] Add Debug-only readback of the real native Dawn/Metal framebuffer through
   `score-devctl capture`; use it for deterministic GPU visual regression. The
   command requires a `.bmp` path so the artifact's extension matches the actual
   top-down BGRA bitmap encoding.
 - [x] Run repeated native Dawn/Metal visual QA at desktop and the minimum
   720x540 window, including page turns, keyboard-visible one-system layout,
-  keyboard-hidden two-system layout, compact controls, and meter changes.
+  keyboard-hidden multi-system layout, compact controls, and meter changes.
 - [ ] Perform the deferred iPad visual/input pass after native is release-ready.
 
 ## Guided piano

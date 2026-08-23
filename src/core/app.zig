@@ -167,17 +167,29 @@ pub const App = struct {
                 else
                     self.scorePageForState(state, meta, state.view_start_beat);
                 var visible_end = window.endBeat();
-                if (state.score_view_mode == .spread) {
-                    const right = self.scorePageForState(state, meta, window.endBeat());
-                    if (right.page_index != window.page_index) visible_end = right.endBeat();
+                const layout = ui.Layout.calculateForState(state);
+                const visible_pages: usize = switch (state.score_view_mode) {
+                    .spread => ui.spreadVisiblePageCount(layout.stage, state.zoom),
+                    .paged, .continuous => 1,
+                };
+                var visible_page = window;
+                for (1..visible_pages) |_| {
+                    const next = self.scorePageForState(state, meta, visible_page.endBeat());
+                    if (next.page_index == visible_page.page_index) break;
+                    visible_page = next;
+                    visible_end = visible_page.endBeat();
                 }
                 if (after.cursor_beat < window.startBeat() or after.cursor_beat >= visible_end) {
                     window = if (state.score_view_mode == .continuous)
                         self.scoreContinuousForState(state, meta, after.cursor_beat)
                     else
                         self.scorePageForState(state, meta, after.cursor_beat);
-                    if (state.score_view_mode == .spread and (window.page_index & 1) != 0 and window.startBeat() > 0.0001) {
-                        window = self.scorePageForState(state, meta, window.startBeat() - 0.001);
+                    if (state.score_view_mode == .spread) {
+                        const spread_pages: u32 = @intCast(ui.spreadVisiblePageCount(layout.stage, state.zoom));
+                        var retreat = window.page_index % spread_pages;
+                        while (retreat > 0 and window.startBeat() > 0.0001) : (retreat -= 1) {
+                            window = self.scorePageForState(state, meta, window.startBeat() - 0.001);
+                        }
                     }
                     state.view_start_beat = window.startBeat();
                     c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
@@ -299,9 +311,9 @@ pub const App = struct {
                 };
                 state.view_start_beat = self.scorePageForState(state, self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return, state.view_start_beat).startBeat();
             } else if (layout.zoom_minus.contains(event.x, event.y)) {
-                state.zoom = @max(0.65, state.zoom - 0.1);
+                state.zoom = @max(ui.min_score_zoom, state.zoom - 0.1);
             } else if (layout.zoom_plus.contains(event.x, event.y)) {
-                state.zoom = @min(1.05, state.zoom + 0.1);
+                state.zoom = @min(ui.max_score_zoom, state.zoom + 0.1);
             } else if (layout.focus_toggle.contains(event.x, event.y)) {
                 state.focus_score = if (state.focus_score == 0) 1 else 0;
                 const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
@@ -442,12 +454,12 @@ pub const App = struct {
         }
         if (event.key == 91) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
-            state.zoom = @max(0.65, state.zoom - 0.1);
+            state.zoom = @max(ui.min_score_zoom, state.zoom - 0.1);
             c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         }
         if (event.key == 93) {
             const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
-            state.zoom = @min(1.05, state.zoom + 0.1);
+            state.zoom = @min(ui.max_score_zoom, state.zoom + 0.1);
             c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         }
         if (event.key == 27 or event.key == 256) {
@@ -479,6 +491,39 @@ pub const App = struct {
 
     pub fn drawItems(self: *const App) []const render.DrawItem {
         return self.packet.slice();
+    }
+
+    pub fn buildPrintablePage(self: *const App, packet: *render.Packet, width: f32, height: f32, requested_beat: f32) !ui.ScorePage {
+        const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return error.MissingUiState;
+        const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
+        const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
+        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        var len: usize = 0;
+        for (self.note_entities[0..self.note_count]) |entity| {
+            if (self.getConst(model.Note, entity, self.ids.note)) |note| {
+                notes[len] = note.*;
+                len += 1;
+            }
+        }
+        return ui.drawPrintablePage(
+            packet,
+            width,
+            height,
+            requested_beat,
+            state,
+            transport,
+            meta,
+            notes[0..len],
+            self.lyrics[0..self.lyric_count],
+            self.harmonies[0..self.harmony_count],
+            self.pedals[0..self.pedal_count],
+            self.measures[0..self.measure_count],
+            &self.annotations,
+        );
+    }
+
+    pub fn printableEndBeat(self: *const App) f32 {
+        return self.scoreEndBeat();
     }
 
     pub fn accessibilityItems(self: *const App) []const accessibility.Item {
@@ -798,7 +843,7 @@ pub const App = struct {
 
         var result_len: usize = 0;
         if (std.mem.eql(u8, input, "help")) {
-            result_len = devResponse(response, "ok commands: state | fingering state|chord|set NOTE_ID 1..5|clear | ink dot BEAT HEIGHT|undo | load FILE | export FILE | export-take FILE | capture FILE.bmp | window WIDTH HEIGHT | record start|stop | midi STATUS DATA1 DATA2 | sampler state | sampler detail studio|dry|RELEASE HAMMER PEDAL_NOISE RESONANCE | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | view paged|continuous|spread | zoom 0.65..1.05 | focus on|off|toggle | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
+            result_len = devResponse(response, "ok commands: state | fingering state|chord|set NOTE_ID 1..5|clear | ink dot BEAT HEIGHT|undo | load FILE | export FILE | export-take FILE | capture FILE.bmp | window WIDTH HEIGHT | record start|stop | midi STATUS DATA1 DATA2 | sampler state | sampler detail studio|dry|RELEASE HAMMER PEDAL_NOISE RESONANCE | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | view paged|continuous|spread | zoom 0.45..1.05 | focus on|off|toggle | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
         } else if (std.mem.eql(u8, input, "state")) {
             const position = model.barBeatAt(self.measures[0..self.measure_count], transport_state.cursor_beat, meta);
             result_len = devResponse(response, "ok generation={d} playing={d} cursor={d:.3} tempo={d:.2} pulse_unit={d} quarter={d:.2} end={d:.3} loop={d} loop_start={d:.3} loop_end={d:.3} page={d:.3} view={s} zoom={d:.2} focus={d} bar={d} beat={d} measures={d} keys={d} voice={d} pedalguide={d} notes={d} harmonies={d} pedals={d} ink={d} take={d} title={s}", .{
@@ -956,7 +1001,7 @@ pub const App = struct {
             result_len = devResponse(response, "ok view={s}", .{@tagName(ui_state.score_view_mode)});
         } else if (commandArgument(input, "zoom")) |argument| {
             const zoom = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error zoom expects a number", .{});
-            ui_state.zoom = std.math.clamp(zoom, 0.65, 1.05);
+            ui_state.zoom = std.math.clamp(zoom, ui.min_score_zoom, ui.max_score_zoom);
             result_len = devResponse(response, "ok zoom={d:.2}", .{ui_state.zoom});
         } else if (commandArgument(input, "focus")) |argument| {
             ui_state.focus_score = devToggle(argument, ui_state.focus_score) orelse return devResponse(response, "error focus expects on, off, or toggle", .{});
@@ -1131,7 +1176,8 @@ pub const App = struct {
 
     fn scoreSystemsForState(self: *const App, state: *const model.UiState) usize {
         const layout = ui.Layout.calculateForState(state);
-        return ui.scoreSystemsPerPage(layout.stage.height, self.vocalStaffVisible(state));
+        const stage = if (state.score_view_mode == .spread) layout.stage else ui.zoomedScoreStage(layout.stage, state.zoom);
+        return ui.scoreSystemsPerPage(stage.height, self.vocalStaffVisible(state));
     }
 
     fn scorePageForState(self: *const App, state: *const model.UiState, meta: *const model.DocumentMeta, beat: f32) ui.ScorePage {
@@ -1148,18 +1194,43 @@ pub const App = struct {
             self.scoreContinuousForState(state, meta, state.view_start_beat)
         else
             self.scorePageForState(state, meta, state.view_start_beat);
+        const zoom = std.math.clamp(state.zoom, ui.min_score_zoom, ui.max_score_zoom);
         if (state.score_view_mode == .spread and stage.width >= 760) {
-            const gap: f32 = 12;
-            const pane_width = (stage.width - gap) * 0.5;
-            if (x >= stage.x + pane_width + gap) {
-                pane = .{ .x = stage.x + pane_width + gap, .y = stage.y, .width = pane_width, .height = stage.height };
-                const right = self.scorePageForState(state, meta, page.endBeat());
-                if (right.page_index != page.page_index) page = right;
-            } else {
-                pane.width = pane_width;
+            const visible_pages = ui.spreadVisiblePageCount(stage, zoom);
+            var selected_offset: usize = 0;
+            for (0..visible_pages) |page_offset| {
+                const candidate = ui.spreadPageStage(stage, zoom, page_offset);
+                if (candidate.contains(x, y)) {
+                    pane = candidate;
+                    selected_offset = page_offset;
+                    break;
+                }
             }
+            for (0..selected_offset) |_| {
+                const next = self.scorePageForState(state, meta, page.endBeat());
+                if (next.page_index == page.page_index) break;
+                page = next;
+            }
+        } else if (state.score_view_mode == .paged) {
+            pane = ui.zoomedScoreStage(stage, zoom);
+            const center_x = stage.x + stage.width * 0.5;
+            return .{
+                .stage = pane,
+                .page = page,
+                .x = center_x + (x - center_x) / zoom,
+                .y = stage.y + (y - stage.y) / zoom,
+            };
         }
-        const zoom = std.math.clamp(state.zoom, 0.65, 1.05);
+        if (state.score_view_mode == .continuous) {
+            pane = ui.zoomedScoreStage(stage, zoom);
+            const center_x = pane.x + pane.width * 0.5;
+            return .{
+                .stage = pane,
+                .page = page,
+                .x = center_x + (x - center_x) / zoom,
+                .y = pane.y + (y - pane.y) / zoom,
+            };
+        }
         const center_x = pane.x + pane.width * 0.5;
         const center_y = pane.y + pane.height * 0.5;
         return .{
@@ -1172,13 +1243,8 @@ pub const App = struct {
 
     fn annotationPointForHit(self: *const App, state: *const model.UiState, hit: ScoreHitContext, pressure: f32) annotation.Point {
         const vocal_visible = self.vocalStaffVisible(state);
-        const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, vocal_visible);
-        var system: usize = 0;
-        if (hit.page.system_count > 1) {
-            const first_bottom = geometry.bass_y[0] + 49;
-            const second_top = if (vocal_visible) geometry.vocal_y[1] else geometry.treble_y[1];
-            if (hit.y >= (first_bottom + second_top) * 0.5) system = 1;
-        }
+        const geometry = ui.ScoreGeometry.calculateForSystems(hit.stage, vocal_visible, hit.page.system_count);
+        const system = ui.scoreSystemAtY(geometry, hit.page, vocal_visible, hit.y);
         const top = if (vocal_visible) geometry.vocal_y[system] else geometry.treble_y[system];
         const bottom = geometry.bass_y[system] + 49;
         const score_system = hit.page.systems[system];
@@ -1202,10 +1268,9 @@ pub const App = struct {
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
         const measures = self.measures[0..self.measure_count];
         const hit = self.scoreHitContext(state, meta, stage, x, y);
-        const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, vocal_visible);
+        const geometry = ui.ScoreGeometry.calculateForSystems(hit.stage, vocal_visible, hit.page.system_count);
         const page = hit.page;
-        const next_system_top = if (vocal_visible) geometry.vocal_y[1] else geometry.treble_y[1];
-        const system_index: u8 = if (page.system_count == 1 or hit.y < (geometry.bass_y[0] + 48 + next_system_top) * 0.5) 0 else 1;
+        const system_index = ui.scoreSystemAtY(geometry, page, vocal_visible, hit.y);
         const treble_distance = @abs(hit.y - (geometry.treble_y[system_index] + 24));
         const bass_distance = @abs(hit.y - (geometry.bass_y[system_index] + 24));
         const staff: u8 = if (bass_distance < treble_distance) 1 else 0;
@@ -1318,7 +1383,7 @@ pub const App = struct {
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
         const measures = self.measures[0..self.measure_count];
         const hit = self.scoreHitContext(state, meta, stage, x, y);
-        const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, self.vocalStaffVisible(state));
+        const geometry = ui.ScoreGeometry.calculateForSystems(hit.stage, self.vocalStaffVisible(state), hit.page.system_count);
         const page = hit.page;
         var best_entity: c.ecs_entity_t = 0;
         var best_distance_squared: f32 = std.math.floatMax(f32);
@@ -1575,7 +1640,16 @@ pub const App = struct {
             if (event.beat > start and event.beat <= end) self.pushPlayback(.{ .pitch = event.pitch, .velocity = event.velocity, .channel = event.channel, .on = event.on });
         }
         for (self.pedals[0..self.pedal_count]) |event| {
-            if (event.start_beat > start and event.start_beat <= end) self.pushPlayback(.{ .pitch = pedalController(event.pedal), .velocity = event.value, .channel = 0, .on = 4 });
+            if (event.start_beat <= start or event.start_beat > end) continue;
+            const controller = pedalController(event.pedal);
+            // A MusicXML pedal "change" means lift and immediately depress,
+            // not merely resend the same non-zero CC value. The latter leaves
+            // every previously released note held forever in samplers that
+            // correctly ignore redundant controller values.
+            if (event.action == model.pedal_action_change and event.value != 0) {
+                self.pushPlayback(.{ .pitch = controller, .velocity = 0, .channel = 0, .on = 4 });
+            }
+            self.pushPlayback(.{ .pitch = controller, .velocity = event.value, .channel = 0, .on = 4 });
         }
     }
 
@@ -2082,6 +2156,34 @@ test "MusicXML sustain pedal survives app import practice and export re-import" 
     try std.testing.expectEqual(model.pedal_action_stop, imported_again.pedals[1].action);
 }
 
+test "MusicXML pedal change emits an ordered CC64 lift and redepress" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list><part id="P1"><measure number="1">
+        \\<attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<direction placement="below"><direction-type><pedal type="start" line="yes"/></direction-type><sound damper-pedal="56.693"/><staff>2</staff></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><staff>1</staff></note>
+        \\<direction placement="below"><direction-type><pedal type="change" line="yes"/></direction-type><sound damper-pedal="56.693"/><staff>2</staff></direction>
+        \\</measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(fixture);
+    try std.testing.expectEqual(@as(usize, 2), app.pedal_count);
+    app.emitRange(0.9, 1.1);
+    var events: [4]playback.HostEvent = undefined;
+    const count = app.drainPlaybackEvents(&events);
+    var controller_values: [2]u8 = undefined;
+    var controller_count: usize = 0;
+    for (events[0..count]) |event| {
+        if (event.on != 4 or event.pitch != 64) continue;
+        controller_values[controller_count] = event.velocity;
+        controller_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), controller_count);
+    try std.testing.expectEqual(@as(u8, 0), controller_values[0]);
+    try std.testing.expectEqual(@as(u8, 72), controller_values[1]);
+}
+
 test "Standard MIDI pedal automation reaches playback and document bounds" {
     const fixture = [_]u8{
         'M',  'T',  'h',  'd',  0,    0,  0, 6,    0,    0,    0,  1,   1,    0xe0,
@@ -2506,13 +2608,13 @@ test "variable-meter page navigation and annotation anchors use authored systems
     app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 7, .buttons = 1, .x = stage.x + stage.width * 0.5, .y = stage.y + stage.height * 0.5, .pressure = 0.7, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 7, .buttons = 0, .x = stage.x + stage.width * 0.5, .y = stage.y + stage.height * 0.5, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     try std.testing.expectEqual(@as(usize, 1), app.annotations.stroke_count);
-    // Hiding the keyboard gives the page enough height for both authored
-    // systems, so the second system correctly reflows onto page index zero.
+    // Hiding the keyboard gives the page enough height for all three authored
+    // systems, so the ink correctly reflows onto page index zero.
     try std.testing.expect(annotation.isScoreSpace(app.annotations.strokes[0]));
     try std.testing.expectEqual(@as(u32, 0), annotation.pageIndex(app.annotations.strokes[0]));
 
     response_len = app.runDevCommand("page previous", &response);
-    try std.testing.expectEqualStrings("ok page=1 start=0.000 end=17.000", response[0..response_len]);
+    try std.testing.expectEqualStrings("ok page=1 start=0.000 end=24.000", response[0..response_len]);
     try std.testing.expectEqual(@as(f32, 0), state.view_start_beat);
 
     response_len = app.runDevCommand("page sideways", &response);

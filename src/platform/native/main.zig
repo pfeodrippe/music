@@ -562,6 +562,57 @@ const Renderer = struct {
         defer readback.unmap();
         try writeTopDownBmp(path, physical_width, physical_height, padded_row_bytes, bytes);
     }
+
+    fn appendPdfPage(self: *Renderer, pdf: *anyopaque, items: []const score.render.DrawItem, width: u32, height: u32) !void {
+        if (!self.context.canRender()) return error.SurfaceUnavailable;
+        const row_bytes = width * 4;
+        const padded_row_bytes = std.mem.alignForward(u32, row_bytes, 256);
+        const mapped_size: usize = @as(usize, padded_row_bytes) * height;
+        const frame = Uniforms{
+            .viewport = .{ @floatFromInt(width), @floatFromInt(height) },
+            .time = 0,
+            .pixel_ratio = 1,
+        };
+        self.context.queue.writeBuffer(self.uniforms, 0, Uniforms, (&[_]Uniforms{frame})[0..]);
+        if (items.len != 0) self.context.queue.writeBuffer(self.instances, 0, score.render.DrawItem, items);
+
+        const texture = self.context.device.createTexture(.{
+            .label = "score printable GPU page",
+            .usage = .{ .render_attachment = true, .copy_src = true },
+            .size = .{ .width = width, .height = height },
+            .format = zgpu.GraphicsContext.swapchain_format,
+        });
+        defer texture.release();
+        const view = texture.createView(.{});
+        defer view.release();
+        const readback = self.context.device.createBuffer(.{
+            .label = "score printable GPU readback",
+            .usage = .{ .copy_dst = true, .map_read = true },
+            .size = mapped_size,
+        });
+        defer readback.release();
+        const encoder = self.context.device.createCommandEncoder(null);
+        defer encoder.release();
+        self.encodePass(encoder, view, items);
+        encoder.copyTextureToBuffer(
+            .{ .texture = texture },
+            .{ .layout = .{ .bytes_per_row = padded_row_bytes, .rows_per_image = height }, .buffer = readback },
+            .{ .width = width, .height = height },
+        );
+        const commands = encoder.finish(null);
+        defer commands.release();
+        self.context.submit(&.{commands});
+
+        var state: CaptureMapState = .{};
+        readback.mapAsync(.{ .read = true }, 0, mapped_size, captureMapped, &state);
+        const deadline = zglfw.getTime() + 5;
+        while (!state.done.load(.acquire) and zglfw.getTime() < deadline) self.context.device.tick();
+        if (!state.done.load(.acquire)) return error.GpuReadbackTimedOut;
+        if (state.status.load(.monotonic) != @intFromEnum(wgpu.BufferMapAsyncStatus.success)) return error.GpuReadbackFailed;
+        const bytes = readback.getConstMappedRange(u8, 0, mapped_size) orelse return error.GpuReadbackFailed;
+        defer readback.unmap();
+        try appendPdfBgra(pdf, width, height, padded_row_bytes, bytes);
+    }
 };
 
 const DevShaderReloader = if (build_options.hot_reload) struct {
@@ -652,6 +703,15 @@ fn putLe32(destination: []u8, value: u32) void {
     for (0..4) |index| destination[index] = @truncate(value >> @intCast(index * 8));
 }
 
+const pdf_width_pixels: u32 = 1240;
+const pdf_height_pixels: u32 = 1754;
+const pdf_width_points: f64 = 595;
+const pdf_height_points: f64 = 842;
+
+fn appendPdfBgra(pdf: *anyopaque, width: u32, height: u32, stride: u32, bytes: []const u8) !void {
+    if (native_c.score_pdf_append_bgra(pdf, bytes.ptr, width, height, stride) == 0) return error.PdfPageWriteFailed;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.c_allocator;
     var arguments = std.process.Args.Iterator.init(init.minimal.args);
@@ -733,6 +793,12 @@ pub fn main(init: std.process.Init) !void {
         };
         if (dev_server) |*server| std.log.info("development control listening at {s}", .{server.pathSlice()});
     }
+    // A Debug host which does not own the single live control socket is an
+    // older/duplicate window. It may remain useful for visual comparison, but
+    // it must never overwrite the authoritative development recovery journal.
+    // This prevents a stale score from reappearing after a watcher restart.
+    const autosave_writer = !build_options.hot_reload or dev_server != null;
+    if (!autosave_writer) std.log.warn("duplicate development host is read-only for autosave recovery", .{});
     defer if (dev_server) |*server| server.deinit();
     window.setUserPointer(app);
     _ = window.setCursorPosCallback(cursorCallback);
@@ -778,7 +844,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .export_score => {
                 const selected = native_c.score_save_score_panel();
-                if (selected != null and selected[0] != 0) saveScorePath(app, allocator, selected) catch |err| {
+                if (selected != null and selected[0] != 0) exportScorePath(app, &renderer, allocator, selected) catch |err| {
                     app.setHostStatus(3);
                     std.log.err("score export failed: {s}", .{@errorName(err)});
                 };
@@ -816,7 +882,7 @@ pub fn main(init: std.process.Init) !void {
         pumpMicrophone(app, &microphone_monitor);
         pumpPlayback(app, sampler, midi_service);
         renderer.draw(app, logical_size, scale, @floatCast(now));
-        if (now >= next_autosave) {
+        if (autosave_writer and now >= next_autosave) {
             saveAutosave(app, allocator) catch |err| std.log.warn("autosave failed: {s}", .{@errorName(err)});
             next_autosave = now + 2;
         }
@@ -922,7 +988,7 @@ fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzS
         } else {
             @memcpy(path_buffer[0..path.len], path);
             path_buffer[path.len] = 0;
-            saveScorePath(app, std.heap.c_allocator, path_buffer[0..path.len :0].ptr) catch |err| {
+            exportScorePath(app, renderer, std.heap.c_allocator, path_buffer[0..path.len :0].ptr) catch |err| {
                 response_len = hostDevResponse(&response, "error export failed: {s}", .{@errorName(err)});
             };
             if (response_len == 0) response_len = hostDevResponse(&response, "ok exported {s}", .{path});
@@ -1182,6 +1248,31 @@ fn appDataPath(buffer: *[4096]u8, basename: []const u8) ![:0]u8 {
     const root_pointer = native_c.score_application_support_path();
     if (root_pointer == null or root_pointer[0] == 0) return error.ApplicationSupportUnavailable;
     return std.fmt.bufPrintZ(buffer, "{s}/{s}", .{ std.mem.span(root_pointer), basename });
+}
+
+fn exportScorePath(app: *score.App, renderer: *Renderer, allocator: std.mem.Allocator, path: [*:0]const u8) !void {
+    const extension = std.fs.path.extension(std.mem.span(path));
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return savePdfPath(app, renderer, allocator, path);
+    return saveScorePath(app, allocator, path);
+}
+
+fn savePdfPath(app: *score.App, renderer: *Renderer, allocator: std.mem.Allocator, path: [*:0]const u8) !void {
+    const pdf = native_c.score_pdf_begin(path, pdf_width_points, pdf_height_points) orelse return error.PdfContextFailed;
+    defer native_c.score_pdf_end(pdf);
+    const packet = try allocator.create(score.render.Packet);
+    defer allocator.destroy(packet);
+    var beat: f32 = 0;
+    var page_guard: usize = 0;
+    const end_beat = app.printableEndBeat();
+    while (page_guard < 2048) : (page_guard += 1) {
+        const page = try app.buildPrintablePage(packet, @floatFromInt(pdf_width_pixels), @floatFromInt(pdf_height_pixels), beat);
+        try renderer.appendPdfPage(pdf, packet.slice(), pdf_width_pixels, pdf_height_pixels);
+        const next_beat = page.endBeat();
+        if (next_beat >= end_beat - 0.0001) break;
+        if (next_beat <= beat + 0.0001) return error.PdfPaginationStalled;
+        beat = next_beat;
+    } else return error.PdfPageLimitExceeded;
+    app.setHostStatus(8);
 }
 
 fn saveScorePath(app: *score.App, allocator: std.mem.Allocator, path: [*:0]const u8) !void {

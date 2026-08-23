@@ -77,7 +77,7 @@ pub const Snapshot = struct {
         } else if (layout.input_setup.width > 0) {
             self.add(Id.input, .button, layout.input_setup, "Set up music input", 0);
         }
-        self.add(Id.save, .button, layout.export_score, "Export score or MIDI", 0);
+        self.add(Id.save, .button, layout.export_score, "Export score, PDF, or MIDI", 0);
         self.add(Id.import_score, .button, layout.import_score, "Import score", 0);
         self.add(Id.record, .button, layout.record, if (transport.recording != 0) "Stop recording" else "Start recording", Flag.toggle | (if (transport.recording != 0) Flag.pressed else 0));
         self.add(Id.play, .button, layout.play, if (transport.playing != 0) "Pause score" else "Play score", Flag.toggle | (if (transport.playing != 0) Flag.pressed else 0));

@@ -137,6 +137,8 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
     });
     native.root_module.linkFramework("AppKit", .{});
+    native.root_module.linkFramework("CoreFoundation", .{});
+    native.root_module.linkFramework("CoreGraphics", .{});
     native.root_module.linkFramework("AudioToolbox", .{});
     native.root_module.linkFramework("AudioUnit", .{});
     native.root_module.linkFramework("CoreAudio", .{});

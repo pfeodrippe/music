@@ -2,7 +2,7 @@
 
 Score is a game-style, local-first notation and piano-practice application. The score scene, product UI, hit testing, transport, recording model, assessment, persistence, and hot-reloadable systems are Zig/Flecs code. macOS presents the shared render packets through Dawn/Metal; the browser presents them through WebGPU. There is no DOM application UI, Canvas 2D, WebGL, or software renderer.
 
-The current build can import MusicXML/XML/MXL, standard MIDI, and portable `.score` documents; preserve timed lyrics and optional vocal-guide cues separately from instrument notes; render and page through a properly braced piano grand staff; insert, select, move, delete, undo, annotate, loop, count in, adjust tempo, play, record microphone audio plus synchronized MIDI, replay a take, and assess live MIDI or detected microphone pitch. The shared semantic control tree is exposed through NSAccessibility, browser accessibility controls, and UIAccessibilityElement. Browser state stays in IndexedDB and the installable PWA works offline after its first successful load. Native state and captured audio stay under `~/Library/Application Support/Score`.
+The current build can import MusicXML/XML/MXL, standard MIDI, and portable `.score` documents; export MusicXML/MXL, MIDI, `.score`, or the complete score as a paginated A4 PDF; preserve timed lyrics and optional vocal-guide cues separately from instrument notes; render and page through a properly braced piano grand staff; insert, select, move, delete, undo, annotate, loop, count in, adjust tempo, play, record microphone audio plus synchronized MIDI, replay a take, and assess live MIDI or detected microphone pitch. The shared semantic control tree is exposed through NSAccessibility, browser accessibility controls, and UIAccessibilityElement. Browser state stays in IndexedDB and the installable PWA works offline after its first successful load. Native state and captured audio stay under `~/Library/Application Support/Score`.
 
 ## Toolchain
 
@@ -30,9 +30,10 @@ open zig-out/Score.app
 `zig build -Doptimize=ReleaseSafe` builds the native executable and statically links the same system descriptors used in development. `zig build dev` launches a Debug build and watches reloadable systems: a valid dylib is installed at a frame boundary while the Flecs world remains alive; a failed build leaves the previous system running.
 
 The development host uses its own atomic `autosave-dev.score` journal. That
-journal survives watcher-driven process relaunches but is isolated from the
-release app's `autosave.score`, so an older open app window cannot overwrite the
-score being exercised through hot reload.
+journal survives watcher-driven process relaunches and is isolated from the
+release app's `autosave.score`. Only the Debug process that owns the single
+development-control socket may write the journal; stale/duplicate development
+windows are read-only for recovery and cannot overwrite the score under test.
 
 In a Debug session, `zig-out/bin/score-devctl sampler state` reports sampler
 regions, preload count, queue/overload faults, and the acoustic detail values
@@ -67,9 +68,20 @@ logical-point range before capture.
 
 Paged layout uses the actual score-stage height everywhere. With the guided
 piano visible, a constrained window shows one complete voice-plus-piano system;
-hiding the piano or using a taller window allows two systems when their full
-clefs, meters, lyrics, and grand staves fit. Page counts, playback following,
-turn controls, hit testing, and annotations all use that same responsive map.
+hiding the piano or using a taller window adds up to six vertically justified
+systems when their full clefs, meters, lyrics, grand staves, and pedal lanes
+fit. Page counts, playback following, turn controls, note editing, hit testing,
+and score-space annotations all use that same responsive map. Native Metal QA
+includes four piano systems and three independent voice-plus-piano systems at
+1400x1100, plus the constrained one-system layout.
+
+Paged zoom is semantic reflow on one paper sheet: zooming out first adds the
+next complete score system to the same page, then adds further systems at lower
+density steps. It never reveals a second page below or converts paged mode into
+a spread. Continuous mode remains a page-free vertically scrollable surface;
+spread mode deliberately remains two-up. The native Export panel's PDF choice
+renders every authored page through the same GPU engraving path into an A4 PDF,
+independent of the currently visible page and zoom.
 
 ## WebGPU/Wasm PWA
 
@@ -103,9 +115,9 @@ zig build ios-simulator
 - Loop: isolate/toggle the measure containing the cursor; Click: toggle the metronome
 - Page Up / Page Down, Left / Right in Read mode, or scroll: advance the score
 - `M` or the view button: cycle paged, continuous-system, and two-page spread views
-- `[` / `]` or the GPU minus/plus controls: zoom the score between 65% and 105%;
+- `[` / `]` or the GPU minus/plus controls: zoom the score between 45% and 105%;
   zoom also reflows complete authored measures so zooming out actually reveals
-  more music instead of shrinking the same sparse page
+  more measures and complete systems on the same paper sheet
 - `F` or Focus: dedicate the window to the score and transport; the piano,
   library, tool rail, and coach return when focus mode is exited
 - Read: select a note; Edit: insert a note

@@ -1,6 +1,8 @@
 const std = @import("std");
 const score = @import("score");
-const Sampler = @import("sfizz_sampler").Sampler;
+const sampler_api = @import("sfizz_sampler");
+const Sampler = sampler_api.Sampler;
+const PianoDetailProfile = sampler_api.PianoDetailProfile;
 
 const sample_rate: u32 = 48_000;
 const channels: usize = 2;
@@ -287,7 +289,7 @@ fn samplerUsage() error{InvalidArguments} {
         \\usage:
         \\  score-sampler-workbench verify [REPORT.json] [EVIDENCE.wav] [PIANO.sfz]
         \\  score-sampler-workbench render [OUTPUT.wav] [PIANO.sfz]
-        \\  score-sampler-workbench render-score SCORE.mxl OUTPUT.wav [PIANO.sfz] [--start-beat N] [--end-beat N] [--tail-seconds N] [--quarter-bpm N]
+        \\  score-sampler-workbench render-score SCORE.mxl OUTPUT.wav [PIANO.sfz] [--start-beat N] [--end-beat N] [--tail-seconds N] [--quarter-bpm N] [--detail RELEASE:HAMMER:PEDAL_NOISE:RESONANCE]
         \\
     , .{});
     return error.InvalidArguments;
@@ -345,6 +347,21 @@ fn scorePedalController(pedal: u8) ?u8 {
     };
 }
 
+fn parseDetailProfile(value: []const u8) !PianoDetailProfile {
+    var fields = std.mem.splitScalar(u8, value, ':');
+    const sampled_release = try std.fmt.parseInt(u8, fields.next() orelse return error.InvalidDetailProfile, 10);
+    const hammer_noise = try std.fmt.parseInt(u8, fields.next() orelse return error.InvalidDetailProfile, 10);
+    const pedal_noise = try std.fmt.parseInt(u8, fields.next() orelse return error.InvalidDetailProfile, 10);
+    const pedal_resonance = try std.fmt.parseInt(u8, fields.next() orelse return error.InvalidDetailProfile, 10);
+    if (fields.next() != null or sampled_release > 127 or hammer_noise > 127 or pedal_noise > 127 or pedal_resonance > 127) return error.InvalidDetailProfile;
+    return .{
+        .sampled_release = sampled_release,
+        .hammer_noise = hammer_noise,
+        .pedal_noise = pedal_noise,
+        .pedal_resonance = pedal_resonance,
+    };
+}
+
 fn runRenderScore(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
     const score_path = arguments.next() orelse return error.InvalidArguments;
     const output_path = arguments.next() orelse return error.InvalidArguments;
@@ -353,6 +370,7 @@ fn runRenderScore(init: std.process.Init, arguments: *std.process.Args.Iterator)
     var end_beat: f32 = 42;
     var tail_seconds: f32 = 2.5;
     var quarter_bpm_override: ?f32 = null;
+    var detail_profile = PianoDetailProfile.studio;
     var sfz_seen = false;
     while (arguments.next()) |argument| {
         if (std.mem.eql(u8, argument, "--start-beat")) {
@@ -363,6 +381,8 @@ fn runRenderScore(init: std.process.Init, arguments: *std.process.Args.Iterator)
             tail_seconds = try std.fmt.parseFloat(f32, arguments.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, argument, "--quarter-bpm")) {
             quarter_bpm_override = try std.fmt.parseFloat(f32, arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--detail")) {
+            detail_profile = try parseDetailProfile(arguments.next() orelse return error.MissingValue);
         } else if (!sfz_seen and !std.mem.startsWith(u8, argument, "--")) {
             sfz_path = argument;
             sfz_seen = true;
@@ -408,8 +428,20 @@ fn runRenderScore(init: std.process.Init, arguments: *std.process.Args.Iterator)
     for (report.pedals[0..report.pedal_count]) |pedal| {
         if (pedal.start_beat < start_beat or pedal.start_beat >= end_beat) continue;
         const controller = scorePedalController(pedal.pedal) orelse continue;
+        const pedal_frame = scoreFrameAtBeat(report, start_seconds, pedal.start_beat);
+        if (pedal.action == score.model.pedal_action_change and pedal.value != 0) {
+            // MusicXML change-pedal is an up/down repedal. Give sfizz one
+            // millisecond of rendered controller-up state so damped voices
+            // are actually released before the pedal is depressed again.
+            try events.append(init.gpa, .{
+                .frame = pedal_frame,
+                .kind = .control_change,
+                .pitch_or_controller = controller,
+                .value = 0,
+            });
+        }
         try events.append(init.gpa, .{
-            .frame = scoreFrameAtBeat(report, start_seconds, pedal.start_beat),
+            .frame = pedal_frame + if (pedal.action == score.model.pedal_action_change and pedal.value != 0) sample_rate / 1000 else 0,
             .kind = .control_change,
             .pitch_or_controller = controller,
             .value = pedal.value,
@@ -420,7 +452,7 @@ fn runRenderScore(init: std.process.Init, arguments: *std.process.Args.Iterator)
     const library_paths = [_][]const u8{"zig-out/lib/libsfizz.dylib"};
     const sampler = try Sampler.create(init.gpa, &library_paths, sfz_path);
     defer sampler.destroy();
-    sampler.applyPianoDetailProfile(.studio);
+    sampler.applyPianoDetailProfile(detail_profile);
     sampler.controlChange(0, 64, 0);
     sampler.controlChange(0, 66, 0);
     sampler.controlChange(0, 67, 0);
@@ -455,8 +487,8 @@ fn runRenderScore(init: std.process.Init, arguments: *std.process.Args.Iterator)
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = encoded });
     const stats = score.audio_quality.analyze(output);
     std.log.info(
-        "rendered score {s} -> {s}: beats={d:.3}..{d:.3} seconds={d:.3} notes={d} pedals={d} peak={d:.2}dBFS overloads={d}",
-        .{ score_path, output_path, start_beat, end_beat, range_seconds, scheduled_notes, report.pedal_count, stats.peakDbfs(), sampler.overloadedSampleCount() },
+        "rendered score {s} -> {s}: beats={d:.3}..{d:.3} seconds={d:.3} notes={d} pedals={d} detail={d}:{d}:{d}:{d} peak={d:.2}dBFS overloads={d}",
+        .{ score_path, output_path, start_beat, end_beat, range_seconds, scheduled_notes, report.pedal_count, detail_profile.sampled_release, detail_profile.hammer_noise, detail_profile.pedal_noise, detail_profile.pedal_resonance, stats.peakDbfs(), sampler.overloadedSampleCount() },
     );
 }
 

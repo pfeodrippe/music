@@ -44,6 +44,19 @@ const CsvPitch = struct {
     source_index: u8 = 0,
 };
 
+const MeasurePitchAudit = struct {
+    notes: usize = 0,
+    exact_any: usize = 0,
+    pitch_class_any: usize = 0,
+    exact_corroborated: usize = 0,
+    pitch_class_corroborated: usize = 0,
+};
+
+const PitchSourceMatch = struct {
+    exact_mask: u8 = 0,
+    pitch_class_mask: u8 = 0,
+};
+
 const RecordingAnchor = struct {
     measure_number: u32,
     start_seconds: f32,
@@ -105,17 +118,52 @@ const SpanIssue = struct {
     high: u8 = 0,
 };
 
+const DuplicateIssue = struct {
+    beat: f32 = 0,
+    measure: u32 = 0,
+    staff: u8 = 0,
+    voice: u8 = 0,
+    pitch: u8 = 0,
+    count: u8 = 0,
+};
+
+const RetuneEdit = struct {
+    beat: f32,
+    staff: u8,
+    from_pitch: u8,
+    to_pitch: u8,
+};
+
+const PedalizeResult = struct {
+    events: std.ArrayList(score.model.PedalEvent) = .empty,
+    starts: usize = 0,
+    changes: usize = 0,
+    stops: usize = 0,
+    midpoint_changes: usize = 0,
+};
+
 const PlayabilitySummary = struct {
     instrumental_notes: usize = 0,
     onset_groups: usize = 0,
     wide_spans: usize = 0,
     extreme_spans: usize = 0,
     dense_chords: usize = 0,
+    duplicate_notes: usize = 0,
+    duplicate_onsets: usize = 0,
     outside_piano_range: usize = 0,
     invalid_durations: usize = 0,
     dynamic_notes: usize = 0,
+    velocity_layers: usize = 0,
+    minimum_velocity: u8 = 127,
+    maximum_velocity: u8 = 0,
     articulated_notes: usize = 0,
     fingered_notes: usize = 0,
+    pedal_starts: usize = 0,
+    pedal_changes: usize = 0,
+    pedal_stops: usize = 0,
+    pedal_restarts_while_active: usize = 0,
+    long_pedal_gaps: usize = 0,
+    max_pedal_refresh_gap_beats: f32 = 0,
     max_span: u8 = 0,
     max_simultaneous: u8 = 0,
     fastest_gap_beats: f32 = std.math.inf(f32),
@@ -123,6 +171,8 @@ const PlayabilitySummary = struct {
     max_pitch: [2]u8 = .{ 0, 0 },
     span_issues: [16]SpanIssue = [_]SpanIssue{.{}} ** 16,
     span_issue_count: usize = 0,
+    duplicate_issues: [32]DuplicateIssue = [_]DuplicateIssue{.{}} ** 32,
+    duplicate_issue_count: usize = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -145,8 +195,20 @@ pub fn main(init: std.process.Init) !void {
         printPlayability(input_path, report);
         return;
     }
+    if (std.mem.eql(u8, command, "dedupe")) {
+        try runDedupe(init, &arguments);
+        return;
+    }
     if (std.mem.eql(u8, command, "revoice")) {
         try runRevoice(init, &arguments);
+        return;
+    }
+    if (std.mem.eql(u8, command, "retune")) {
+        try runRetune(init, &arguments);
+        return;
+    }
+    if (std.mem.eql(u8, command, "pedalize")) {
+        try runPedalize(init, &arguments);
         return;
     }
     if (std.mem.eql(u8, command, "opening-performance")) {
@@ -200,6 +262,8 @@ pub fn main(init: std.process.Init) !void {
         var quarter_bpm: f32 = 147;
         var tolerance_seconds: f32 = 0.08;
         var anchor_path: ?[]const u8 = null;
+        var output_path: ?[]const u8 = null;
+        var detail_measure: ?u32 = null;
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--csv")) {
                 if (csv_count == csv_paths.len) return error.TooManyCsvInputs;
@@ -215,13 +279,19 @@ pub fn main(init: std.process.Init) !void {
                 tolerance_seconds = try parseNonNegativeFloat(arguments.next() orelse return error.MissingValue);
             } else if (std.mem.eql(u8, argument, "--anchors")) {
                 anchor_path = arguments.next() orelse return error.MissingValue;
+            } else if (std.mem.eql(u8, argument, "--output")) {
+                output_path = arguments.next() orelse return error.MissingValue;
+            } else if (std.mem.eql(u8, argument, "--detail-measure")) {
+                detail_measure = try std.fmt.parseUnsigned(u32, arguments.next() orelse return error.MissingValue, 10);
             } else {
                 return error.UnknownArgument;
             }
         }
         if (csv_count == 0 or end_beat <= start_beat) return error.InvalidArguments;
-        const report = try readReport(init, score_path);
-        try compareCsvEvidence(init, score_path, &report, csv_paths[0..csv_count], .{ .start = start_beat, .end = end_beat }, quarter_bpm, tolerance_seconds, anchor_path);
+        const report = try init.gpa.create(score.musicxml.ImportReport);
+        defer init.gpa.destroy(report);
+        try readReportInto(init, score_path, report);
+        try compareCsvEvidence(init, score_path, report, csv_paths[0..csv_count], .{ .start = start_beat, .end = end_beat }, quarter_bpm, tolerance_seconds, anchor_path, output_path, detail_measure);
         return;
     }
     if (std.mem.eql(u8, command, "audio-evidence")) {
@@ -338,16 +408,19 @@ fn usage() error{InvalidArguments} {
         \\usage:
         \\  score-workbench inspect SCORE.musicxml|SCORE.mxl
         \\  score-workbench playability SCORE.musicxml|SCORE.mxl
+        \\  score-workbench dedupe INPUT.mxl OUTPUT.mxl
         \\  score-workbench revoice INPUT.mxl OUTPUT.mxl --beat N [--beat N ...] --pitch MIDI --from-staff N --to-staff N
+        \\  score-workbench retune INPUT.mxl OUTPUT.mxl --replace BEAT:STAFF:FROM_MIDI:TO_MIDI [--replace ...]
+        \\  score-workbench pedalize INPUT.mxl OUTPUT.mxl [--value 72] [--harmonic-midpoint] [--every-measure] [--preserve-existing] [--max-refresh-beats N | --harmony-refresh-min-beats N | --refresh-measure N ...] [--normalize-restarts]
         \\  score-workbench opening-performance INPUT.mxl OUTPUT.mxl [--repeat-start-measure 4] [--repeat-end-measure 13] [--pedal-value 54]
         \\  score-workbench splice-opening TARGET.mxl FRAGMENT.musicxml|mxl OUTPUT.mxl --target-end-beat N [--repeat-count N]
         \\  score-workbench pattern-fragment TEMPLATE.mxl PATTERN.txt OUTPUT.mxl [--pedal-value 54]
         \\  score-workbench enrich-opening TARGET.mxl FRAGMENT.mxl OUTPUT.mxl [--end-beat 42] [--quarter-bpm 147] [--replace-fragment-bass]
-        \\  score-workbench evidence SCORE.mxl --csv EVENTS.csv [--csv EVENTS.csv ...] [--anchors REVIEW.json] [--start-beat 0] [--end-beat 42] [--quarter-bpm 147] [--tolerance 0.08]
+        \\  score-workbench evidence SCORE.mxl --csv EVENTS.csv [--csv EVENTS.csv ...] [--anchors REVIEW.json] [--start-beat 0] [--end-beat 42] [--quarter-bpm 147] [--tolerance 0.08] [--output REPORT.json] [--detail-measure N]
         \\  score-workbench audio-evidence INPUT.wav [--score SCORE.musicxml|SCORE.mxl] [--output REPORT.json] [--start-beat N] [--end-beat N]
         \\  score-workbench shape-performance INPUT.mxl AUDIO.wav OUTPUT.mxl --start-beat N --end-beat N [--audio-offset N] [--anchors ANCHORS.json]
         \\  score-workbench rebase-anchors SOURCE.mxl SOURCE-ANCHORS.json TARGET.mxl OUTPUT.json --source-cut-beat N --target-insert-end-beat N
-        \\  score-workbench compare-performance REFERENCE.wav CANDIDATE.wav [--output REPORT.json] [--frame-ms 40] [--onset-tolerance 0.08] [--score SCORE.mxl --anchors ANCHORS.json --phase-bins 12]
+        \\  score-workbench compare-performance REFERENCE.wav CANDIDATE.wav [--output REPORT.json] [--frame-ms 40] [--onset-tolerance 0.08] [--score SCORE.mxl --anchors ANCHORS.json --phase-bins 12] [--start-measure N --end-measure N]
         \\  score-workbench enrich-evidence TARGET.mxl OUTPUT.mxl --anchors REVIEW.json --csv EVENTS.csv [--csv EVENTS.csv ...] --start-beat N --end-beat N [--grid 0.5] [--onset-tolerance 0.12] [--min-sources 2]
         \\  score-workbench find-repeats SCORE.mxl [--pattern-start 0] [--pattern-end 42]
         \\  score-workbench enrich-repeats TARGET.mxl FRAGMENT.mxl OUTPUT.mxl --pattern START:END [--pattern START:END ...] [--quarter-bpm 147]
@@ -685,6 +758,413 @@ fn runRevoice(init: std.process.Init, arguments: *std.process.Args.Iterator) !vo
     std.mem.sort(score.model.Note, notes.items, {}, noteLessThan);
     try writeMxl(init, output_path, report, notes.items, report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
     std.debug.print("Wrote {s}: revoiced={d} pitch={d} staff={d}->{d}\n", .{ output_path, changed, pitch.?, from_staff.?, to_staff.? });
+}
+
+fn runRetune(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const input_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    var edits: [32]RetuneEdit = undefined;
+    var edit_count: usize = 0;
+    while (arguments.next()) |argument| {
+        if (!std.mem.eql(u8, argument, "--replace")) return error.UnknownArgument;
+        if (edit_count == edits.len) return error.TooManyRetuneArguments;
+        edits[edit_count] = try parseRetuneEdit(arguments.next() orelse return error.MissingValue);
+        edit_count += 1;
+    }
+    if (edit_count == 0) return error.InvalidArguments;
+
+    const report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(report);
+    try readReportInto(init, input_path, report);
+    var notes: std.ArrayList(score.model.Note) = .empty;
+    defer notes.deinit(init.gpa);
+    try notes.appendSlice(init.gpa, report.notes[0..report.note_count]);
+    const changed = retuneNotes(notes.items, edits[0..edit_count], report.key_fifths);
+    if (changed != edit_count) return error.RetuneMatchCount;
+    std.mem.sort(score.model.Note, notes.items, {}, noteLessThan);
+    try writeMxl(init, output_path, report, notes.items, report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
+    std.debug.print("Wrote {s}: retuned={d}; timing, dynamics, articulation, fingering, pedal and lyrics preserved\n", .{ output_path, changed });
+}
+
+fn runDedupe(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const input_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    if (arguments.next() != null) return error.UnknownArgument;
+
+    const report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(report);
+    try readReportInto(init, input_path, report);
+    var notes: std.ArrayList(score.model.Note) = .empty;
+    defer notes.deinit(init.gpa);
+    try notes.appendSlice(init.gpa, report.notes[0..report.note_count]);
+    const removed = deduplicateNotes(notes.items);
+    if (removed == 0) return error.NoDuplicateNotes;
+    notes.items.len -= removed;
+    std.mem.sort(score.model.Note, notes.items, {}, noteLessThan);
+    try writeMxl(init, output_path, report, notes.items, report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
+    std.debug.print("Wrote {s}: removed={d} semantically identical same-voice note copies; all other score/performance data preserved\n", .{ output_path, removed });
+}
+
+fn duplicateEquivalent(left: score.model.Note, right: score.model.Note) bool {
+    return @abs(left.start_beat - right.start_beat) < 0.0001 and
+        @abs(left.duration_beats - right.duration_beats) < 0.0001 and
+        left.pitch == right.pitch and
+        left.velocity == right.velocity and
+        left.staff == right.staff and
+        left.voice == right.voice and
+        left.written_step == right.written_step and
+        left.written_alter == right.written_alter and
+        left.written_octave == right.written_octave and
+        left.dots == right.dots and
+        left.fingering == right.fingering and
+        left.flags == right.flags;
+}
+
+fn deduplicateNotes(notes: []score.model.Note) usize {
+    var output_count: usize = 0;
+    for (notes) |note| {
+        var duplicate = false;
+        const instrumental = note.staff <= 1 and (note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) == 0;
+        if (instrumental) {
+            for (notes[0..output_count]) |prior| {
+                if (prior.staff <= 1 and (prior.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) == 0 and duplicateEquivalent(prior, note)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+        }
+        if (duplicate) continue;
+        notes[output_count] = note;
+        output_count += 1;
+    }
+    return notes.len - output_count;
+}
+
+fn parseRetuneEdit(text_value: []const u8) !RetuneEdit {
+    var fields = std.mem.splitScalar(u8, text_value, ':');
+    const beat = try parseNonNegativeFloat(fields.next() orelse return error.InvalidArguments);
+    const staff = try std.fmt.parseUnsigned(u8, fields.next() orelse return error.InvalidArguments, 10);
+    const from_pitch = try std.fmt.parseUnsigned(u8, fields.next() orelse return error.InvalidArguments, 10);
+    const to_pitch = try std.fmt.parseUnsigned(u8, fields.next() orelse return error.InvalidArguments, 10);
+    if (fields.next() != null or staff > 1 or from_pitch > 127 or to_pitch > 127 or from_pitch == to_pitch) return error.InvalidArguments;
+    return .{ .beat = beat, .staff = staff, .from_pitch = from_pitch, .to_pitch = to_pitch };
+}
+
+fn runPedalize(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const input_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    var value: u8 = 72;
+    var harmonic_midpoint = false;
+    var every_measure = false;
+    var preserve_existing = false;
+    var max_refresh_beats: ?f32 = null;
+    var harmony_refresh_min_beats: ?f32 = null;
+    var refresh_measures: [64]u32 = undefined;
+    var refresh_measure_count: usize = 0;
+    var normalize_restarts = false;
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--value")) {
+            value = try std.fmt.parseUnsigned(u8, arguments.next() orelse return error.MissingValue, 10);
+            if (value == 0 or value > 127) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, argument, "--harmonic-midpoint")) {
+            harmonic_midpoint = true;
+        } else if (std.mem.eql(u8, argument, "--every-measure")) {
+            every_measure = true;
+        } else if (std.mem.eql(u8, argument, "--preserve-existing")) {
+            preserve_existing = true;
+        } else if (std.mem.eql(u8, argument, "--max-refresh-beats")) {
+            max_refresh_beats = try parsePositiveFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--harmony-refresh-min-beats")) {
+            harmony_refresh_min_beats = try parsePositiveFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--refresh-measure")) {
+            if (refresh_measure_count == refresh_measures.len) return error.TooManyRefreshMeasures;
+            refresh_measures[refresh_measure_count] = try std.fmt.parseUnsigned(u32, arguments.next() orelse return error.MissingValue, 10);
+            if (refresh_measures[refresh_measure_count] == 0) return error.InvalidArguments;
+            refresh_measure_count += 1;
+        } else if (std.mem.eql(u8, argument, "--normalize-restarts")) {
+            normalize_restarts = true;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+
+    const report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(report);
+    try readReportInto(init, input_path, report);
+    if (preserve_existing and (harmonic_midpoint or every_measure)) return error.InvalidArguments;
+    if (!preserve_existing and (max_refresh_beats != null or harmony_refresh_min_beats != null or refresh_measure_count != 0 or normalize_restarts)) return error.InvalidArguments;
+    if (@as(usize, @intFromBool(max_refresh_beats != null)) + @as(usize, @intFromBool(harmony_refresh_min_beats != null)) + @as(usize, @intFromBool(refresh_measure_count != 0)) > 1) return error.InvalidArguments;
+    var result = if (preserve_existing)
+        try finalizeExistingPedals(init.gpa, report, max_refresh_beats, harmony_refresh_min_beats, refresh_measures[0..refresh_measure_count], normalize_restarts)
+    else
+        try pedalizeScore(init.gpa, report, value, harmonic_midpoint, every_measure);
+    defer result.events.deinit(init.gpa);
+    try writeMxl(init, output_path, report, report.notes[0..report.note_count], report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], result.events.items, report.measures[0..report.measure_count], null, null);
+
+    const output_report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(output_report);
+    try readReportInto(init, output_path, output_report);
+    if (output_report.pedal_count != result.events.items.len) return error.PedalRoundTripMismatch;
+    std.debug.print(
+        "Wrote {s}: score-aware CC64={d}, starts={d}, changes={d} (midpoint={d}), stops={d}, roundtrip={d}\n",
+        .{ output_path, value, result.starts, result.changes, result.midpoint_changes, result.stops, output_report.pedal_count },
+    );
+}
+
+fn finalizeExistingPedals(
+    allocator: std.mem.Allocator,
+    report: *const score.musicxml.ImportReport,
+    max_refresh_beats: ?f32,
+    harmony_refresh_min_beats: ?f32,
+    refresh_measures: []const u32,
+    normalize_restarts: bool,
+) !PedalizeResult {
+    var result: PedalizeResult = .{};
+    errdefer result.events.deinit(allocator);
+    var sustain_active = false;
+    var last_event_beat: f32 = -10;
+    var active_value: u8 = 0;
+    for (report.pedals[0..report.pedal_count]) |event| {
+        if (event.pedal != score.model.pedal_sustain) {
+            try result.events.append(allocator, event);
+            continue;
+        }
+        if (sustain_active and max_refresh_beats != null) {
+            try appendBoundedPedalRefreshes(allocator, report, &result, &last_event_beat, event.start_beat, max_refresh_beats.?, active_value);
+        }
+        if (sustain_active and harmony_refresh_min_beats != null) {
+            try appendHarmonyPedalRefreshes(allocator, report, &result, &last_event_beat, event.start_beat, harmony_refresh_min_beats.?, active_value);
+        }
+        if (sustain_active and refresh_measures.len != 0) {
+            try appendMeasurePedalRefreshes(allocator, report, &result, &last_event_beat, event.start_beat, refresh_measures, active_value);
+        }
+        var output_event = event;
+        if (normalize_restarts and sustain_active and event.action == score.model.pedal_action_start and event.value != 0) output_event.action = score.model.pedal_action_change;
+        try result.events.append(allocator, output_event);
+        sustain_active = output_event.action != score.model.pedal_action_stop and output_event.value != 0;
+        active_value = if (sustain_active) output_event.value else 0;
+        last_event_beat = @max(last_event_beat, output_event.start_beat);
+        switch (output_event.action) {
+            score.model.pedal_action_start => result.starts += 1,
+            score.model.pedal_action_change => result.changes += 1,
+            score.model.pedal_action_stop => result.stops += 1,
+            else => {},
+        }
+    }
+    if (!sustain_active or report.measure_count == 0) return result;
+    const end_beat = scoreEnd(report);
+    if (max_refresh_beats != null) try appendBoundedPedalRefreshes(allocator, report, &result, &last_event_beat, end_beat, max_refresh_beats.?, active_value);
+    if (harmony_refresh_min_beats != null) try appendHarmonyPedalRefreshes(allocator, report, &result, &last_event_beat, end_beat, harmony_refresh_min_beats.?, active_value);
+    if (refresh_measures.len != 0) try appendMeasurePedalRefreshes(allocator, report, &result, &last_event_beat, end_beat, refresh_measures, active_value);
+    const stop_beat = @max(last_event_beat + 0.01, end_beat - 0.01);
+    try result.events.append(allocator, .{
+        .start_beat = stop_beat,
+        .pedal = score.model.pedal_sustain,
+        .value = 0,
+        .action = score.model.pedal_action_stop,
+        .flags = score.model.pedal_flag_line | score.model.pedal_flag_sign,
+    });
+    result.stops += 1;
+    return result;
+}
+
+fn containsMeasure(values: []const u32, number: u32) bool {
+    for (values) |value| if (value == number) return true;
+    return false;
+}
+
+fn appendMeasurePedalRefreshes(
+    allocator: std.mem.Allocator,
+    report: *const score.musicxml.ImportReport,
+    result: *PedalizeResult,
+    last_refresh_beat: *f32,
+    limit_beat: f32,
+    refresh_measures: []const u32,
+    value: u8,
+) !void {
+    for (report.measures[0..report.measure_count]) |measure| {
+        if (!containsMeasure(refresh_measures, measure.number)) continue;
+        if (measure.start_beat <= last_refresh_beat.* + 0.0001 or measure.start_beat >= limit_beat - 0.0001) continue;
+        const measure_end = @min(limit_beat, measure.start_beat + @max(0.001, measure.duration_beats));
+        const attack = firstInstrumentAttack(report, measure.start_beat, measure_end) orelse continue;
+        if (attack <= last_refresh_beat.* + 0.0001) continue;
+        try result.events.append(allocator, .{
+            .start_beat = attack,
+            .pedal = score.model.pedal_sustain,
+            .value = value,
+            .action = score.model.pedal_action_change,
+            .flags = score.model.pedal_flag_line | score.model.pedal_flag_sign,
+        });
+        result.changes += 1;
+        last_refresh_beat.* = attack;
+    }
+}
+
+fn harmonyEquivalent(left: score.model.Harmony, right: score.model.Harmony) bool {
+    return left.root_step == right.root_step and
+        left.root_alter == right.root_alter and
+        left.bass_step == right.bass_step and
+        left.bass_alter == right.bass_alter and
+        left.inversion == right.inversion and
+        std.mem.eql(u8, left.kindSlice(), right.kindSlice());
+}
+
+fn latestHarmonyIndexAt(report: *const score.musicxml.ImportReport, beat: f32) ?usize {
+    var result: ?usize = null;
+    for (report.harmonies[0..report.harmony_count], 0..) |harmony, index| {
+        if (harmony.start_beat > beat + 0.0001) break;
+        result = index;
+    }
+    return result;
+}
+
+fn appendHarmonyPedalRefreshes(
+    allocator: std.mem.Allocator,
+    report: *const score.musicxml.ImportReport,
+    result: *PedalizeResult,
+    last_refresh_beat: *f32,
+    limit_beat: f32,
+    min_refresh_beats: f32,
+    value: u8,
+) !void {
+    var previous_index = latestHarmonyIndexAt(report, last_refresh_beat.*);
+    var index: usize = if (previous_index) |value_index| value_index + 1 else 0;
+    while (index < report.harmony_count) : (index += 1) {
+        const harmony = report.harmonies[index];
+        if (harmony.start_beat >= limit_beat - 0.0001) break;
+        const changed = if (previous_index) |value_index| !harmonyEquivalent(report.harmonies[value_index], harmony) else true;
+        previous_index = index;
+        if (!changed or harmony.start_beat - last_refresh_beat.* < min_refresh_beats - 0.0001) continue;
+        const next_harmony_beat = if (index + 1 < report.harmony_count) report.harmonies[index + 1].start_beat else limit_beat;
+        const attack = firstInstrumentAttack(report, harmony.start_beat, @min(limit_beat, next_harmony_beat)) orelse continue;
+        if (attack <= last_refresh_beat.* + 0.0001) continue;
+        try result.events.append(allocator, .{
+            .start_beat = attack,
+            .pedal = score.model.pedal_sustain,
+            .value = value,
+            .action = score.model.pedal_action_change,
+            .flags = score.model.pedal_flag_line | score.model.pedal_flag_sign,
+        });
+        result.changes += 1;
+        last_refresh_beat.* = attack;
+    }
+}
+
+fn appendBoundedPedalRefreshes(
+    allocator: std.mem.Allocator,
+    report: *const score.musicxml.ImportReport,
+    result: *PedalizeResult,
+    last_refresh_beat: *f32,
+    limit_beat: f32,
+    max_refresh_beats: f32,
+    value: u8,
+) !void {
+    while (last_refresh_beat.* + max_refresh_beats < limit_beat - 0.0001) {
+        const search_start = last_refresh_beat.* + max_refresh_beats;
+        const attack = firstInstrumentAttack(report, search_start, limit_beat) orelse break;
+        if (attack <= last_refresh_beat.* + 0.0001) break;
+        try result.events.append(allocator, .{
+            .start_beat = attack,
+            .pedal = score.model.pedal_sustain,
+            .value = value,
+            .action = score.model.pedal_action_change,
+            .flags = score.model.pedal_flag_line | score.model.pedal_flag_sign,
+        });
+        result.changes += 1;
+        last_refresh_beat.* = attack;
+    }
+}
+
+fn pedalizeScore(allocator: std.mem.Allocator, report: *const score.musicxml.ImportReport, value: u8, harmonic_midpoint: bool, every_measure: bool) !PedalizeResult {
+    var result: PedalizeResult = .{};
+    errdefer result.events.deinit(allocator);
+    const flags = score.model.pedal_flag_line | score.model.pedal_flag_sign;
+    var active = false;
+    var last_event_beat: f32 = -10;
+    var active_root: ?u8 = null;
+
+    for (report.measures[0..report.measure_count]) |measure| {
+        const measure_start = measure.start_beat;
+        const measure_end = measure_start + @max(0.001, measure.duration_beats);
+        const first_attack = firstInstrumentAttack(report, measure_start, measure_end);
+        if (first_attack == null) {
+            if (active) {
+                try result.events.append(allocator, .{ .start_beat = measure_start, .pedal = score.model.pedal_sustain, .value = 0, .action = score.model.pedal_action_stop, .flags = flags });
+                result.stops += 1;
+                last_event_beat = measure_start;
+                active = false;
+                active_root = null;
+            }
+            continue;
+        }
+
+        const attack_beat = first_attack.?;
+        const measure_root = rangeRootPitchClass(report, measure_start, measure_end);
+        if (!active or every_measure or measure_root != active_root) {
+            try result.events.append(allocator, .{
+                .start_beat = attack_beat,
+                .pedal = score.model.pedal_sustain,
+                .value = value,
+                .action = if (active) score.model.pedal_action_change else score.model.pedal_action_start,
+                .flags = flags,
+            });
+            if (active) result.changes += 1 else result.starts += 1;
+            active = true;
+            last_event_beat = attack_beat;
+        }
+        active_root = measure_root;
+
+        if (!harmonic_midpoint or measure.duration_beats < 3.5) continue;
+        const midpoint = measure_start + measure.duration_beats * 0.5;
+        const first_root = rangeRootPitchClass(report, measure_start, midpoint);
+        const second_root = rangeRootPitchClass(report, midpoint, measure_end);
+        const second_attack = firstInstrumentAttack(report, midpoint, measure_end);
+        if (first_root == null or second_root == null or second_attack == null or first_root.? == second_root.?) continue;
+        if (second_attack.? - last_event_beat < 0.5) continue;
+        try result.events.append(allocator, .{
+            .start_beat = second_attack.?,
+            .pedal = score.model.pedal_sustain,
+            .value = value,
+            .action = score.model.pedal_action_change,
+            .flags = flags,
+        });
+        result.changes += 1;
+        result.midpoint_changes += 1;
+        last_event_beat = second_attack.?;
+        active_root = second_root;
+    }
+
+    if (active and report.measure_count != 0) {
+        const last = report.measures[report.measure_count - 1];
+        const end_beat = last.start_beat + @max(0.001, last.duration_beats);
+        // Keep the lift far enough inside the final half-open measure that
+        // MusicXML tick quantization cannot round it onto the excluded edge.
+        const stop_beat = @max(last_event_beat + 0.01, end_beat - 0.01);
+        try result.events.append(allocator, .{ .start_beat = stop_beat, .pedal = score.model.pedal_sustain, .value = 0, .action = score.model.pedal_action_stop, .flags = flags });
+        result.stops += 1;
+    }
+    return result;
+}
+
+fn firstInstrumentAttack(report: *const score.musicxml.ImportReport, start_beat: f32, end_beat: f32) ?f32 {
+    var result = std.math.inf(f32);
+    for (report.notes[0..report.note_count]) |note| {
+        if ((note.flags & (score.model.note_flag_rest | score.model.note_flag_vocal_guide)) != 0) continue;
+        if (note.start_beat < start_beat - 0.0001 or note.start_beat >= end_beat - 0.0001) continue;
+        result = @min(result, note.start_beat);
+    }
+    return if (std.math.isFinite(result)) result else null;
+}
+
+fn rangeRootPitchClass(report: *const score.musicxml.ImportReport, start_beat: f32, end_beat: f32) ?u8 {
+    const attack = firstInstrumentAttack(report, start_beat, end_beat) orelse return null;
+    var lowest: u8 = 127;
+    for (report.notes[0..report.note_count]) |note| {
+        if ((note.flags & (score.model.note_flag_rest | score.model.note_flag_vocal_guide)) != 0) continue;
+        if (@abs(note.start_beat - attack) > 0.0501) continue;
+        lowest = @min(lowest, note.pitch);
+    }
+    return if (lowest == 127) null else lowest % 12;
 }
 
 fn runOpeningPerformance(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
@@ -1162,6 +1642,8 @@ fn runComparePerformance(init: std.process.Init, arguments: *std.process.Args.It
     var score_path: ?[]const u8 = null;
     var anchor_path: ?[]const u8 = null;
     var phase_bins: usize = 12;
+    var start_measure: ?u32 = null;
+    var end_measure: ?u32 = null;
     while (arguments.next()) |argument| {
         if (std.mem.eql(u8, argument, "--output")) {
             output_path = arguments.next() orelse return error.MissingValue;
@@ -1175,12 +1657,18 @@ fn runComparePerformance(init: std.process.Init, arguments: *std.process.Args.It
             anchor_path = arguments.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, argument, "--phase-bins")) {
             phase_bins = try std.fmt.parseUnsigned(usize, arguments.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, argument, "--start-measure")) {
+            start_measure = try std.fmt.parseUnsigned(u32, arguments.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, argument, "--end-measure")) {
+            end_measure = try std.fmt.parseUnsigned(u32, arguments.next() orelse return error.MissingValue, 10);
         } else {
             return error.UnknownArgument;
         }
     }
     if (frame_seconds < 0.01 or frame_seconds > 0.25 or onset_tolerance > 0.5 or phase_bins < 2 or phase_bins > 64) return error.InvalidAudioComparisonOptions;
     if ((score_path == null) != (anchor_path == null)) return error.ScoreAndAnchorsRequiredTogether;
+    if ((start_measure == null) != (end_measure == null)) return error.MeasureRangeRequiredTogether;
+    if (start_measure != null and (score_path == null or start_measure.? == 0 or end_measure.? < start_measure.?)) return error.InvalidMeasureRange;
 
     const reference_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, reference_path, init.gpa, .limited(2 * 1024 * 1024 * 1024));
     defer init.gpa.free(reference_bytes);
@@ -1214,6 +1702,8 @@ fn runComparePerformance(init: std.process.Init, arguments: *std.process.Args.It
             candidate_analysis.onsets,
             phase_bins,
             onset_tolerance,
+            start_measure,
+            end_measure,
         );
     } else try comparePerformance(
         init.gpa,
@@ -1341,6 +1831,8 @@ fn compareAnchoredPerformance(
     candidate_onsets: []const f32,
     phase_bins: usize,
     onset_tolerance: f32,
+    start_measure: ?u32,
+    end_measure: ?u32,
 ) !PerformanceComparison {
     const maximum_frames = report.measure_count * phase_bins;
     const reference_envelope = try allocator.alloc(f32, maximum_frames);
@@ -1362,6 +1854,7 @@ fn compareAnchoredPerformance(
     var first_reference_start = std.math.inf(f32);
     var last_reference_end: f32 = 0;
     for (report.measures[0..report.measure_count]) |measure| {
+        if (start_measure) |first| if (measure.number < first or measure.number > end_measure.?) continue;
         const anchor = findRecordingAnchor(anchors, measure.number) orelse continue;
         const candidate_start = reportSecondsAtBeat(report, measure.start_beat);
         const candidate_end = reportSecondsAtBeat(report, measure.start_beat + measure.duration_beats);
@@ -1402,7 +1895,12 @@ fn compareAnchoredPerformance(
     for (sustain_mask[0..frame_count], attack_mask[0..frame_count], reference_values, candidate_values) |*sustain, attack, reference_value, candidate_value| {
         sustain.* = !attack and (reference_value > 0.02 or candidate_value > 0.02);
     }
-    const onset_result = try matchOnsets(allocator, reference_onsets, warped_candidate_onsets.items, last_reference_end, onset_tolerance);
+    var window_reference_onsets: std.ArrayList(f32) = .empty;
+    defer window_reference_onsets.deinit(allocator);
+    for (reference_onsets) |onset| {
+        if (onset >= first_reference_start and onset < last_reference_end) try window_reference_onsets.append(allocator, onset);
+    }
+    const onset_result = try matchOnsets(allocator, window_reference_onsets.items, warped_candidate_onsets.items, last_reference_end, onset_tolerance);
     return .{
         .alignment_kind = "measure-phase-anchors",
         .measure_count = included_measures,
@@ -1635,6 +2133,8 @@ fn compareCsvEvidence(
     quarter_bpm: f32,
     tolerance_seconds: f32,
     anchor_path: ?[]const u8,
+    output_path: ?[]const u8,
+    detail_measure: ?u32,
 ) !void {
     var anchors: std.ArrayList(RecordingAnchor) = .empty;
     defer anchors.deinit(init.gpa);
@@ -1643,7 +2143,7 @@ fn compareCsvEvidence(
     defer evidence.deinit(init.gpa);
     const start_seconds = range.start * 60.0 / quarter_bpm;
     const end_seconds = range.end * 60.0 / quarter_bpm;
-    for (csv_paths) |path| {
+    for (csv_paths, 0..) |path, source_index| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(max_file_bytes));
         defer init.gpa.free(bytes);
         var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -1655,13 +2155,18 @@ fn compareCsvEvidence(
             const event_end = std.fmt.parseFloat(f32, fields.next() orelse continue) catch continue;
             const pitch = std.fmt.parseUnsigned(u8, fields.next() orelse continue, 10) catch continue;
             if (anchors.items.len == 0 and (event_end + tolerance_seconds < start_seconds or event_start - tolerance_seconds > end_seconds)) continue;
-            try evidence.append(init.gpa, .{ .start_seconds = event_start, .end_seconds = event_end, .pitch = pitch });
+            try evidence.append(init.gpa, .{ .start_seconds = event_start, .end_seconds = event_end, .pitch = pitch, .source_index = @intCast(source_index) });
         }
     }
 
     var compared: usize = 0;
     var exact_matches: usize = 0;
     var pitch_class_matches: usize = 0;
+    var exact_corroborated: usize = 0;
+    var pitch_class_corroborated: usize = 0;
+    const measures = try init.gpa.alloc(MeasurePitchAudit, report.measure_count);
+    defer init.gpa.free(measures);
+    @memset(measures, .{});
     for (report.notes[0..report.note_count]) |note| {
         if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0) continue;
         if (note.start_beat < range.start or note.start_beat >= range.end) continue;
@@ -1670,22 +2175,132 @@ fn compareCsvEvidence(
             note.start_beat * 60.0 / quarter_bpm
         else
             anchoredNoteTime(report, anchors.items, note.start_beat) orelse continue;
-        var exact = false;
-        var pitch_class = false;
-        for (evidence.items) |event| {
-            if (event.start_seconds - tolerance_seconds > time or event.end_seconds + tolerance_seconds < time) continue;
-            if (event.pitch % 12 == note.pitch % 12) pitch_class = true;
-            if (event.pitch == note.pitch) exact = true;
-        }
+        const match = pitchSourceMatch(evidence.items, time, note.pitch, tolerance_seconds);
+        const exact = match.exact_mask != 0;
+        const pitch_class = match.pitch_class_mask != 0;
+        const exact_two_sources = @popCount(match.exact_mask) >= 2;
+        const pitch_class_two_sources = @popCount(match.pitch_class_mask) >= 2;
         exact_matches += @intFromBool(exact);
         pitch_class_matches += @intFromBool(pitch_class);
+        exact_corroborated += @intFromBool(exact_two_sources);
+        pitch_class_corroborated += @intFromBool(pitch_class_two_sources);
+        if (score.model.measureIndexAt(report.measures[0..report.measure_count], note.start_beat)) |measure_index| {
+            const measure = &measures[measure_index];
+            measure.notes += 1;
+            measure.exact_any += @intFromBool(exact);
+            measure.pitch_class_any += @intFromBool(pitch_class);
+            measure.exact_corroborated += @intFromBool(exact_two_sources);
+            measure.pitch_class_corroborated += @intFromBool(pitch_class_two_sources);
+        }
     }
     const exact_ratio = if (compared == 0) 0 else @as(f32, @floatFromInt(exact_matches)) / @as(f32, @floatFromInt(compared));
     const pitch_class_ratio = if (compared == 0) 0 else @as(f32, @floatFromInt(pitch_class_matches)) / @as(f32, @floatFromInt(compared));
     std.debug.print(
-        "{s}: CSV evidence sources={d} events={d} anchors={d} beats={d:.3}..{d:.3} seconds={d:.3}..{d:.3} tempo-quarter={d:.3} notes={d} exact={d} ({d:.4}) pitch-class={d} ({d:.4}) tolerance={d:.3}s\n",
-        .{ score_path, csv_paths.len, evidence.items.len, anchors.items.len, range.start, range.end, start_seconds, end_seconds, quarter_bpm, compared, exact_matches, exact_ratio, pitch_class_matches, pitch_class_ratio, tolerance_seconds },
+        "{s}: CSV evidence sources={d} events={d} anchors={d} beats={d:.3}..{d:.3} seconds={d:.3}..{d:.3} tempo-quarter={d:.3} notes={d} exact={d} ({d:.4}) pitch-class={d} ({d:.4}) corroborated-exact={d} corroborated-pitch-class={d} tolerance={d:.3}s\n",
+        .{ score_path, csv_paths.len, evidence.items.len, anchors.items.len, range.start, range.end, start_seconds, end_seconds, quarter_bpm, compared, exact_matches, exact_ratio, pitch_class_matches, pitch_class_ratio, exact_corroborated, pitch_class_corroborated, tolerance_seconds },
     );
+    if (detail_measure) |measure_number| printMeasurePitchEvidence(report, anchors.items, evidence.items, measure_number, tolerance_seconds);
+    if (output_path) |path| {
+        var allocating: std.Io.Writer.Allocating = .init(init.gpa);
+        defer allocating.deinit();
+        const writer = &allocating.writer;
+        try writer.print(
+            "{{\n  \"schema\": 1,\n  \"analysis_kind\": \"multi-source-score-note-evidence-not-certification\",\n  \"source_count\": {d},\n  \"evidence_events\": {d},\n  \"anchor_count\": {d},\n  \"tolerance_seconds\": {d:.4},\n  \"aggregate\": {{\"notes\":{d},\"exact_any\":{d},\"pitch_class_any\":{d},\"exact_corroborated\":{d},\"pitch_class_corroborated\":{d},\"exact_ratio\":{d:.6},\"pitch_class_ratio\":{d:.6},\"exact_corroborated_ratio\":{d:.6},\"pitch_class_corroborated_ratio\":{d:.6}}},\n  \"measures\": [\n",
+            .{
+                csv_paths.len,
+                evidence.items.len,
+                anchors.items.len,
+                tolerance_seconds,
+                compared,
+                exact_matches,
+                pitch_class_matches,
+                exact_corroborated,
+                pitch_class_corroborated,
+                exact_ratio,
+                pitch_class_ratio,
+                ratio(exact_corroborated, compared),
+                ratio(pitch_class_corroborated, compared),
+            },
+        );
+        for (report.measures[0..report.measure_count], measures, 0..) |measure, audit, index| {
+            if (index != 0) try writer.writeAll(",\n");
+            try writer.print(
+                "    {{\"measure\":{d},\"start_beat\":{d:.4},\"end_beat\":{d:.4},\"notes\":{d},\"exact_any\":{d},\"pitch_class_any\":{d},\"exact_corroborated\":{d},\"pitch_class_corroborated\":{d},\"exact_ratio\":{d:.6},\"pitch_class_ratio\":{d:.6},\"exact_corroborated_ratio\":{d:.6},\"pitch_class_corroborated_ratio\":{d:.6}}}",
+                .{ measure.number, measure.start_beat, measure.start_beat + measure.duration_beats, audit.notes, audit.exact_any, audit.pitch_class_any, audit.exact_corroborated, audit.pitch_class_corroborated, ratio(audit.exact_any, audit.notes), ratio(audit.pitch_class_any, audit.notes), ratio(audit.exact_corroborated, audit.notes), ratio(audit.pitch_class_corroborated, audit.notes) },
+            );
+        }
+        try writer.writeAll("\n  ]\n}\n");
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = allocating.written() });
+        std.debug.print("Wrote per-measure pitch audit to {s}\n", .{path});
+    }
+}
+
+fn printMeasurePitchEvidence(report: *const score.musicxml.ImportReport, anchors: []const RecordingAnchor, evidence: []const CsvPitch, measure_number: u32, tolerance_seconds: f32) void {
+    const measure_index = for (report.measures[0..report.measure_count], 0..) |measure, index| {
+        if (measure.number == measure_number) break index;
+    } else {
+        std.debug.print("measure {d}: missing\n", .{measure_number});
+        return;
+    };
+    const measure = report.measures[measure_index];
+    var source_count: u8 = 0;
+    for (evidence) |event| source_count = @max(source_count, event.source_index + 1);
+    std.debug.print("measure {d}: beats {d:.3}..{d:.3}\n", .{ measure.number, measure.start_beat, measure.start_beat + measure.duration_beats });
+    for (report.notes[0..report.note_count]) |note| {
+        if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0 or note.start_beat < measure.start_beat or note.start_beat >= measure.start_beat + measure.duration_beats) continue;
+        const time = anchoredNoteTime(report, anchors, note.start_beat) orelse continue;
+        const current = pitchSourceMatch(evidence, time, note.pitch, tolerance_seconds);
+        std.debug.print("  beat={d:.3} time={d:.3}s staff={d} pitch={d} exact-sources={d} pc-sources={d} corroborated-candidates=", .{
+            note.start_beat,
+            time,
+            note.staff,
+            note.pitch,
+            @popCount(current.exact_mask),
+            @popCount(current.pitch_class_mask),
+        });
+        var first = true;
+        for (21..109) |pitch_index| {
+            const pitch: u8 = @intCast(pitch_index);
+            const candidate = pitchSourceMatch(evidence, time, pitch, tolerance_seconds);
+            const sources = @popCount(candidate.exact_mask);
+            if (sources < 2) continue;
+            if (!first) std.debug.print(",", .{});
+            std.debug.print("{d}({d})", .{ pitch, sources });
+            first = false;
+        }
+        if (first) std.debug.print("none", .{});
+        std.debug.print(" source-pitches=", .{});
+        for (0..source_count) |source_index| {
+            if (source_index != 0) std.debug.print(";", .{});
+            std.debug.print("s{d}[", .{source_index});
+            var source_first = true;
+            const source_bit: u8 = @as(u8, 1) << @intCast(source_index);
+            for (21..109) |pitch_index| {
+                const pitch: u8 = @intCast(pitch_index);
+                if ((pitchSourceMatch(evidence, time, pitch, tolerance_seconds).exact_mask & source_bit) == 0) continue;
+                if (!source_first) std.debug.print(",", .{});
+                std.debug.print("{d}", .{pitch});
+                source_first = false;
+            }
+            std.debug.print("]", .{});
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+fn pitchSourceMatch(evidence: []const CsvPitch, time: f32, pitch: u8, tolerance_seconds: f32) PitchSourceMatch {
+    var result: PitchSourceMatch = .{};
+    for (evidence) |event| {
+        if (event.start_seconds - tolerance_seconds > time or event.end_seconds + tolerance_seconds < time) continue;
+        const source_bit: u8 = @as(u8, 1) << @intCast(event.source_index);
+        if (event.pitch % 12 == pitch % 12) result.pitch_class_mask |= source_bit;
+        if (event.pitch == pitch) result.exact_mask |= source_bit;
+    }
+    return result;
+}
+
+fn ratio(numerator: usize, denominator: usize) f32 {
+    return if (denominator == 0) 0 else @as(f32, @floatFromInt(numerator)) / @as(f32, @floatFromInt(denominator));
 }
 
 fn readRecordingAnchors(init: std.process.Init, path: []const u8, output: *std.ArrayList(RecordingAnchor)) !void {
@@ -2223,6 +2838,7 @@ fn playabilitySummary(report: *const score.musicxml.ImportReport) PlayabilitySum
     var result: PlayabilitySummary = .{};
     var last_onset = [_]f32{0} ** 2;
     var have_last_onset = [_]bool{false} ** 2;
+    var velocity_seen = [_]bool{false} ** 128;
 
     for (report.notes[0..report.note_count]) |note| {
         if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0 or note.staff > 1) continue;
@@ -2232,6 +2848,9 @@ fn playabilitySummary(report: *const score.musicxml.ImportReport) PlayabilitySum
         result.min_pitch[note.staff] = @min(result.min_pitch[note.staff], note.pitch);
         result.max_pitch[note.staff] = @max(result.max_pitch[note.staff], note.pitch);
         if (score.model.dynamic(note.flags) != 0) result.dynamic_notes += 1;
+        velocity_seen[note.velocity] = true;
+        result.minimum_velocity = @min(result.minimum_velocity, note.velocity);
+        result.maximum_velocity = @max(result.maximum_velocity, note.velocity);
         if ((note.flags & (score.model.note_flag_staccato | score.model.note_flag_accent | score.model.note_flag_tenuto | score.model.note_flag_marcato | score.model.note_flag_fermata | score.model.note_flag_slur_start | score.model.note_flag_slur_stop)) != 0) result.articulated_notes += 1;
         if (note.fingering != 0) result.fingered_notes += 1;
     }
@@ -2241,6 +2860,39 @@ fn playabilitySummary(report: *const score.musicxml.ImportReport) PlayabilitySum
         const onset = report.notes[index].start_beat;
         var end = index + 1;
         while (end < report.note_count and @abs(report.notes[end].start_beat - onset) < 0.0001) : (end += 1) {}
+
+        for (report.notes[index..end], 0..) |note, local_index| {
+            if (note.staff > 1 or (note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0) continue;
+            var matching_prior: usize = 0;
+            for (report.notes[index .. index + local_index]) |prior| {
+                if (prior.staff > 1 or (prior.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0) continue;
+                if (prior.staff == note.staff and prior.voice == note.voice and prior.pitch == note.pitch) matching_prior += 1;
+            }
+            if (matching_prior == 0) continue;
+            result.duplicate_notes += 1;
+            if (matching_prior == 1) {
+                result.duplicate_onsets += 1;
+                if (result.duplicate_issue_count < result.duplicate_issues.len) {
+                    const measure = if (score.model.measureIndexAt(report.measures[0..report.measure_count], onset)) |measure_index| report.measures[measure_index].number else 0;
+                    result.duplicate_issues[result.duplicate_issue_count] = .{
+                        .beat = onset,
+                        .measure = measure,
+                        .staff = note.staff,
+                        .voice = note.voice,
+                        .pitch = note.pitch,
+                        .count = 2,
+                    };
+                    result.duplicate_issue_count += 1;
+                }
+            } else {
+                for (result.duplicate_issues[0..result.duplicate_issue_count]) |*issue| {
+                    if (@abs(issue.beat - onset) < 0.0001 and issue.staff == note.staff and issue.voice == note.voice and issue.pitch == note.pitch) {
+                        issue.count +|= 1;
+                        break;
+                    }
+                }
+            }
+        }
 
         for (0..2) |staff| {
             var pitches = [_]bool{false} ** 128;
@@ -2277,14 +2929,52 @@ fn playabilitySummary(report: *const score.musicxml.ImportReport) PlayabilitySum
         }
         index = end;
     }
+    for (velocity_seen) |seen| result.velocity_layers += @intFromBool(seen);
+
+    var pedal_active = false;
+    var last_refresh_beat: f32 = 0;
+    for (report.pedals[0..report.pedal_count]) |event| {
+        if (event.pedal != score.model.pedal_sustain) continue;
+        switch (event.action) {
+            score.model.pedal_action_start => {
+                if (pedal_active) {
+                    result.pedal_restarts_while_active += 1;
+                    recordPedalGap(&result, event.start_beat - last_refresh_beat);
+                }
+                result.pedal_starts += 1;
+                pedal_active = event.value != 0;
+                last_refresh_beat = event.start_beat;
+            },
+            score.model.pedal_action_change => {
+                if (pedal_active) recordPedalGap(&result, event.start_beat - last_refresh_beat);
+                result.pedal_changes += 1;
+                pedal_active = event.value != 0;
+                last_refresh_beat = event.start_beat;
+            },
+            score.model.pedal_action_stop => {
+                if (pedal_active) recordPedalGap(&result, event.start_beat - last_refresh_beat);
+                result.pedal_stops += 1;
+                pedal_active = false;
+                last_refresh_beat = event.start_beat;
+            },
+            else => {},
+        }
+    }
+    if (pedal_active) recordPedalGap(&result, scoreEnd(report) - last_refresh_beat);
     return result;
+}
+
+fn recordPedalGap(result: *PlayabilitySummary, gap_beats: f32) void {
+    if (gap_beats <= 0 or !std.math.isFinite(gap_beats)) return;
+    result.max_pedal_refresh_gap_beats = @max(result.max_pedal_refresh_gap_beats, gap_beats);
+    if (gap_beats > 16.0001) result.long_pedal_gaps += 1;
 }
 
 fn printPlayability(path: []const u8, report: *const score.musicxml.ImportReport) void {
     const result = playabilitySummary(report);
     const quarter_bpm = score.model.quarterTempoFromPulse(report.tempo_bpm, report.tempo_beat_unit);
     const fastest_ms = if (std.math.isFinite(result.fastest_gap_beats)) result.fastest_gap_beats * 60_000.0 / quarter_bpm else 0;
-    const technical_pass = result.outside_piano_range == 0 and result.invalid_durations == 0 and result.wide_spans == 0 and result.dense_chords == 0;
+    const technical_pass = result.outside_piano_range == 0 and result.invalid_durations == 0 and result.wide_spans == 0 and result.dense_chords == 0 and result.duplicate_notes == 0;
     std.debug.print(
         "{s}: technical_playability={s} publication_readiness=REVIEW_REQUIRED instrumental_notes={d} onset_groups={d} qpm={d:.2}\n",
         .{ path, if (technical_pass) "PASS" else "REVIEW", result.instrumental_notes, result.onset_groups, quarter_bpm },
@@ -2294,18 +2984,25 @@ fn printPlayability(path: []const u8, report: *const score.musicxml.ImportReport
         .{ result.min_pitch[0], result.max_pitch[0], result.min_pitch[1], result.max_pitch[1], result.max_span, result.max_simultaneous, result.fastest_gap_beats, fastest_ms },
     );
     std.debug.print(
-        "  review flags: spans>octave={d} spans>major10th={d} chords>5={d} outside_88_keys={d} invalid_duration={d}\n",
-        .{ result.wide_spans, result.extreme_spans, result.dense_chords, result.outside_piano_range, result.invalid_durations },
+        "  review flags: spans>octave={d} spans>major10th={d} chords>5={d} same_voice_duplicate_notes={d} duplicate_onsets={d} outside_88_keys={d} invalid_duration={d}\n",
+        .{ result.wide_spans, result.extreme_spans, result.dense_chords, result.duplicate_notes, result.duplicate_onsets, result.outside_piano_range, result.invalid_durations },
     );
     std.debug.print(
-        "  authored interpretation: dynamic_notes={d}/{d} articulated_notes={d}/{d} fingered_notes={d}/{d} pedal_events={d}\n",
-        .{ result.dynamic_notes, result.instrumental_notes, result.articulated_notes, result.instrumental_notes, result.fingered_notes, result.instrumental_notes, report.pedal_count },
+        "  authored interpretation: visible_dynamic_notes={d}/{d} performed_velocity={d}..{d} layers={d} articulated_notes={d}/{d} fingered_notes={d}/{d}\n",
+        .{ result.dynamic_notes, result.instrumental_notes, result.minimum_velocity, result.maximum_velocity, result.velocity_layers, result.articulated_notes, result.instrumental_notes, result.fingered_notes, result.instrumental_notes },
+    );
+    std.debug.print(
+        "  pedal interpretation: events={d} starts={d} changes={d} stops={d} active_restarts={d} max_refresh_gap={d:.3} beats gaps>16={d}\n",
+        .{ report.pedal_count, result.pedal_starts, result.pedal_changes, result.pedal_stops, result.pedal_restarts_while_active, result.max_pedal_refresh_gap_beats, result.long_pedal_gaps },
     );
     for (result.span_issues[0..result.span_issue_count]) |issue| {
         std.debug.print("  span review: measure={d} beat={d:.3} hand={s} pitches={d}..{d} span={d}\n", .{ issue.measure, issue.beat, if (issue.staff == 0) "right" else "left", issue.low, issue.high, issue.high - issue.low });
     }
+    for (result.duplicate_issues[0..result.duplicate_issue_count]) |issue| {
+        std.debug.print("  duplicate review: measure={d} beat={d:.3} hand={s} voice={d} pitch={d} copies={d}\n", .{ issue.measure, issue.beat, if (issue.staff == 0) "right" else "left", issue.voice, issue.pitch, issue.count });
+    }
     if (!technical_pass) std.debug.print("  Technical REVIEW means redistribution or notation repair is required before pianist sign-off.\n", .{});
-    if (report.pedal_count == 0 or result.dynamic_notes == 0) std.debug.print("  Publication remains REVIEW_REQUIRED: recording-faithful dynamics/pedal directions are incomplete.\n", .{});
+    if (report.pedal_count == 0 or result.velocity_layers <= 1 or result.long_pedal_gaps != 0 or result.pedal_restarts_while_active != 0) std.debug.print("  Publication remains REVIEW_REQUIRED: recording-faithful velocity/pedal interpretation is incomplete.\n", .{});
 }
 
 fn revoiceNotes(notes: []score.model.Note, beats: []const f32, pitch: u8, from_staff: u8, to_staff: u8) usize {
@@ -2315,6 +3012,21 @@ fn revoiceNotes(notes: []score.model.Note, beats: []const f32, pitch: u8, from_s
         for (beats) |beat| {
             if (@abs(note.start_beat - beat) > 0.0001) continue;
             note.staff = to_staff;
+            changed += 1;
+            break;
+        }
+    }
+    return changed;
+}
+
+fn retuneNotes(notes: []score.model.Note, edits: []const RetuneEdit, key_fifths: i8) usize {
+    var changed: usize = 0;
+    for (edits) |edit| {
+        for (notes) |*note| {
+            if (@abs(note.start_beat - edit.beat) > 0.0001 or note.staff != edit.staff or note.pitch != edit.from_pitch) continue;
+            if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) != 0) continue;
+            note.pitch = edit.to_pitch;
+            applyPitchSpelling(note, key_fifths);
             changed += 1;
             break;
         }
@@ -2397,6 +3109,19 @@ test "performance comparison separates envelope shape and onset timing" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.02), matches.mean_error, 0.0001);
 }
 
+test "pitch audit distinguishes single-source and corroborated evidence" {
+    const events = [_]CsvPitch{
+        .{ .start_seconds = 1.0, .end_seconds = 1.2, .pitch = 61, .source_index = 0 },
+        .{ .start_seconds = 1.05, .end_seconds = 1.3, .pitch = 61, .source_index = 1 },
+        .{ .start_seconds = 1.0, .end_seconds = 1.2, .pitch = 73, .source_index = 2 },
+        .{ .start_seconds = 2.0, .end_seconds = 2.2, .pitch = 61, .source_index = 2 },
+    };
+    const match = pitchSourceMatch(&events, 1.1, 61, 0.01);
+    try std.testing.expectEqual(@as(u8, 0b0000_0011), match.exact_mask);
+    try std.testing.expectEqual(@as(u8, 0b0000_0111), match.pitch_class_mask);
+    try std.testing.expectEqual(@as(f32, 0.5), ratio(2, 4));
+}
+
 test "recording anchors interpolate inside the matching score measure" {
     var report: score.musicxml.ImportReport = .{};
     report.measure_count = 2;
@@ -2441,12 +3166,49 @@ test "anchored performance comparison removes measure-duration drift" {
         &.{ 0.5, 1.5 },
         4,
         0.01,
+        null,
+        null,
     );
     try std.testing.expectEqualStrings("measure-phase-anchors", comparison.alignment_kind);
     try std.testing.expectEqual(@as(usize, 1), comparison.measure_count);
     try std.testing.expectApproxEqAbs(@as(f32, 1), comparison.envelope_correlation, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0), comparison.normalized_envelope_mae, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1), comparison.onset_precision, 0.0001);
+}
+
+test "anchored performance comparison limits envelopes and onsets to selected measures" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 2;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.measures[1] = .{ .number = 2, .start_beat = 4, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.tempo_count = 1;
+    report.tempos[0] = .{ .start_beat = 0, .bpm = 120 };
+    const anchors = [_]RecordingAnchor{
+        .{ .measure_number = 1, .start_seconds = 0, .end_seconds = 2 },
+        .{ .measure_number = 2, .start_seconds = 2, .end_seconds = 4 },
+    };
+    var samples: [4000]f32 = undefined;
+    for (&samples, 0..) |*sample, index| sample.* = @as(f32, @floatFromInt(index % 100)) / 100.0;
+    const comparison = try compareAnchoredPerformance(
+        std.testing.allocator,
+        &report,
+        &anchors,
+        &samples,
+        1000,
+        &.{ 0.5, 2.5 },
+        &samples,
+        1000,
+        &.{ 0.5, 2.5 },
+        4,
+        0.01,
+        2,
+        2,
+    );
+    try std.testing.expectEqual(@as(usize, 1), comparison.measure_count);
+    try std.testing.expectEqual(@as(usize, 1), comparison.reference_onsets);
+    try std.testing.expectEqual(@as(usize, 1), comparison.candidate_onsets);
+    try std.testing.expectEqual(@as(usize, 1), comparison.matched_candidate_onsets);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), comparison.duration_seconds, 0.0001);
 }
 
 test "playability audit distinguishes wide and extreme one-hand spans" {
@@ -2466,6 +3228,64 @@ test "playability audit distinguishes wide and extreme one-hand spans" {
     try std.testing.expectEqual(@as(usize, 2), result.span_issue_count);
 }
 
+test "playability audit rejects duplicate pitches only within the same voice" {
+    var report: score.musicxml.ImportReport = .{};
+    report.note_count = 5;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 8, .duration_beats = 0.5, .pitch = 70, .velocity = 80, .staff = 0, .voice = 1 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 8, .duration_beats = 0.5, .pitch = 70, .velocity = 80, .staff = 0, .voice = 1 };
+    report.notes[2] = .{ .stable_id = 3, .start_beat = 8, .duration_beats = 1, .pitch = 70, .velocity = 80, .staff = 0, .voice = 2 };
+    report.notes[3] = .{ .stable_id = 4, .start_beat = 8, .duration_beats = 0.5, .pitch = 73, .velocity = 80, .staff = 0, .voice = 1 };
+    report.notes[4] = .{ .stable_id = 5, .start_beat = 8, .duration_beats = 0.5, .pitch = 70, .velocity = 80, .staff = 0, .voice = 1 };
+    const result = playabilitySummary(&report);
+    try std.testing.expectEqual(@as(usize, 2), result.duplicate_notes);
+    try std.testing.expectEqual(@as(usize, 1), result.duplicate_onsets);
+    try std.testing.expectEqual(@as(usize, 1), result.duplicate_issue_count);
+    try std.testing.expectEqual(@as(u8, 3), result.duplicate_issues[0].count);
+    try std.testing.expectEqual(@as(u8, 1), result.duplicate_issues[0].voice);
+    try std.testing.expectEqual(@as(u8, 70), result.duplicate_issues[0].pitch);
+}
+
+test "dedupe removes only semantically identical note copies" {
+    var notes = [_]score.model.Note{
+        .{ .stable_id = 1, .start_beat = 264, .duration_beats = 0.5, .pitch = 70, .velocity = 94, .staff = 0, .voice = 1, .written_step = 'B', .written_alter = -1, .written_octave = 4 },
+        .{ .stable_id = 2, .start_beat = 264, .duration_beats = 0.5, .pitch = 70, .velocity = 94, .staff = 0, .voice = 1, .written_step = 'B', .written_alter = -1, .written_octave = 4 },
+        .{ .stable_id = 3, .start_beat = 264, .duration_beats = 0.5, .pitch = 70, .velocity = 94, .staff = 0, .voice = 2, .written_step = 'B', .written_alter = -1, .written_octave = 4 },
+        .{ .stable_id = 4, .start_beat = 264, .duration_beats = 1, .pitch = 70, .velocity = 94, .staff = 0, .voice = 1, .written_step = 'B', .written_alter = -1, .written_octave = 4 },
+        .{ .stable_id = 5, .start_beat = 264, .duration_beats = 0.5, .pitch = 70, .velocity = 94, .staff = 8, .voice = 1, .written_step = 'B', .written_alter = -1, .written_octave = 4, .flags = score.model.note_flag_vocal_guide },
+        .{ .stable_id = 6, .start_beat = 264, .duration_beats = 0.5, .pitch = 70, .velocity = 94, .staff = 8, .voice = 1, .written_step = 'B', .written_alter = -1, .written_octave = 4, .flags = score.model.note_flag_vocal_guide },
+    };
+    const removed = deduplicateNotes(&notes);
+    try std.testing.expectEqual(@as(usize, 1), removed);
+    try std.testing.expectEqual(@as(u64, 1), notes[0].stable_id);
+    try std.testing.expectEqual(@as(u64, 3), notes[1].stable_id);
+    try std.testing.expectEqual(@as(u64, 4), notes[2].stable_id);
+    try std.testing.expectEqual(@as(u64, 5), notes[3].stable_id);
+    try std.testing.expectEqual(@as(u64, 6), notes[4].stable_id);
+}
+
+test "playability audit exposes performed velocity and implausibly long pedal holds" {
+    var report: score.musicxml.ImportReport = .{};
+    report.note_count = 3;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 52, .staff = 0, .voice = 0 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 1, .duration_beats = 1, .pitch = 62, .velocity = 80, .staff = 0, .voice = 0 };
+    report.notes[2] = .{ .stable_id = 3, .start_beat = 2, .duration_beats = 1, .pitch = 64, .velocity = 94, .staff = 0, .voice = 0 };
+    report.measure_count = 1;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 40, .beats = 4, .beat_unit = 4 };
+    report.pedal_count = 3;
+    report.pedals[0] = .{ .start_beat = 0, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[1] = .{ .start_beat = 20, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[2] = .{ .start_beat = 40, .pedal = score.model.pedal_sustain, .value = 0, .action = score.model.pedal_action_stop };
+    const result = playabilitySummary(&report);
+    try std.testing.expectEqual(@as(u8, 52), result.minimum_velocity);
+    try std.testing.expectEqual(@as(u8, 94), result.maximum_velocity);
+    try std.testing.expectEqual(@as(usize, 3), result.velocity_layers);
+    try std.testing.expectEqual(@as(usize, 2), result.pedal_starts);
+    try std.testing.expectEqual(@as(usize, 1), result.pedal_stops);
+    try std.testing.expectEqual(@as(usize, 1), result.pedal_restarts_while_active);
+    try std.testing.expectEqual(@as(usize, 2), result.long_pedal_gaps);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), result.max_pedal_refresh_gap_beats, 0.0001);
+}
+
 test "revoice moves only exact instrumental onset matches" {
     var notes = [_]score.model.Note{
         .{ .stable_id = 1, .start_beat = 8, .duration_beats = 0.5, .pitch = 58, .velocity = 80, .staff = 1, .voice = 1 },
@@ -2477,6 +3297,149 @@ test "revoice moves only exact instrumental onset matches" {
     try std.testing.expectEqual(@as(u8, 0), notes[0].staff);
     try std.testing.expectEqual(@as(u8, 0), notes[1].staff);
     try std.testing.expectEqual(@as(u8, 1), notes[2].staff);
+}
+
+test "retune changes only exact instrumental onset matches and respells for key" {
+    var notes = [_]score.model.Note{
+        .{ .stable_id = 1, .start_beat = 438, .duration_beats = 0.5, .pitch = 48, .velocity = 91, .staff = 1, .voice = 1, .written_step = 'C', .written_octave = 3 },
+        .{ .stable_id = 2, .start_beat = 438, .duration_beats = 0.5, .pitch = 68, .velocity = 70, .staff = 0, .voice = 0, .flags = score.model.note_flag_vocal_guide },
+    };
+    const changed = retuneNotes(&notes, &.{.{ .beat = 438, .staff = 1, .from_pitch = 48, .to_pitch = 44 }}, -5);
+    try std.testing.expectEqual(@as(usize, 1), changed);
+    try std.testing.expectEqual(@as(u8, 44), notes[0].pitch);
+    try std.testing.expectEqual(@as(u8, 'A'), notes[0].written_step);
+    try std.testing.expectEqual(@as(i8, -1), notes[0].written_alter);
+    try std.testing.expectEqual(@as(i8, 2), notes[0].written_octave);
+    try std.testing.expectEqual(@as(u8, 68), notes[1].pitch);
+}
+
+test "score-aware pedalization repedals harmonic midpoint and lifts for empty measures" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 3;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.measures[1] = .{ .number = 2, .start_beat = 4, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.measures[2] = .{ .number = 3, .start_beat = 8, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.note_count = 4;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 2, .duration_beats = 1, .pitch = 43, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[2] = .{ .stable_id = 3, .start_beat = 5, .duration_beats = 1, .pitch = 72, .velocity = 80, .staff = 8, .voice = 0, .flags = score.model.note_flag_vocal_guide };
+    report.notes[3] = .{ .stable_id = 4, .start_beat = 9, .duration_beats = 1, .pitch = 50, .velocity = 80, .staff = 1, .voice = 0 };
+    var result = try pedalizeScore(std.testing.allocator, &report, 72, true, false);
+    defer result.events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), result.events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), result.starts);
+    try std.testing.expectEqual(@as(usize, 1), result.changes);
+    try std.testing.expectEqual(@as(usize, 1), result.midpoint_changes);
+    try std.testing.expectEqual(@as(usize, 2), result.stops);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), result.events.items[1].start_beat, 0.0001);
+    try std.testing.expectEqual(score.model.pedal_action_change, result.events.items[1].action);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), result.events.items[2].start_beat, 0.0001);
+    try std.testing.expectEqual(score.model.pedal_action_stop, result.events.items[2].action);
+}
+
+test "score-aware pedalization holds through measures with the same bass root" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 2;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.measures[1] = .{ .number = 2, .start_beat = 4, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.note_count = 2;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 4, .duration_beats = 1, .pitch = 60, .velocity = 80, .staff = 1, .voice = 0 };
+    var result = try pedalizeScore(std.testing.allocator, &report, 72, false, false);
+    defer result.events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.starts);
+    try std.testing.expectEqual(@as(usize, 0), result.changes);
+    try std.testing.expectEqual(@as(usize, 1), result.stops);
+}
+
+test "pedal finalization preserves authored events and adds only terminal lift" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 2;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.measures[1] = .{ .number = 2, .start_beat = 4, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.pedal_count = 2;
+    report.pedals[0] = .{ .start_beat = 0, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[1] = .{ .start_beat = 4, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_change };
+    var result = try finalizeExistingPedals(std.testing.allocator, &report, null, null, &.{}, false);
+    defer result.events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), result.events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.starts);
+    try std.testing.expectEqual(@as(usize, 1), result.changes);
+    try std.testing.expectEqual(@as(usize, 1), result.stops);
+    try std.testing.expectEqual(score.model.pedal_action_stop, result.events.items[2].action);
+    try std.testing.expectApproxEqAbs(@as(f32, 7.99), result.events.items[2].start_beat, 0.0001);
+}
+
+test "pedal finalization bounds long holds at real attacks and normalizes active restart" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 1;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 40, .beats = 4, .beat_unit = 4 };
+    report.note_count = 5;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 9, .duration_beats = 1, .pitch = 50, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[2] = .{ .stable_id = 3, .start_beat = 18, .duration_beats = 1, .pitch = 52, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[3] = .{ .stable_id = 4, .start_beat = 27, .duration_beats = 1, .pitch = 53, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[4] = .{ .stable_id = 5, .start_beat = 36, .duration_beats = 1, .pitch = 55, .velocity = 80, .staff = 1, .voice = 0 };
+    report.pedal_count = 3;
+    report.pedals[0] = .{ .start_beat = 0, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[1] = .{ .start_beat = 18, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[2] = .{ .start_beat = 39.99, .pedal = score.model.pedal_sustain, .value = 0, .action = score.model.pedal_action_stop };
+    var result = try finalizeExistingPedals(std.testing.allocator, &report, 8, null, &.{}, true);
+    defer result.events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), result.events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.starts);
+    try std.testing.expectEqual(@as(usize, 4), result.changes);
+    try std.testing.expectEqual(@as(usize, 1), result.stops);
+    try std.testing.expectApproxEqAbs(@as(f32, 9), result.events.items[1].start_beat, 0.0001);
+    try std.testing.expectEqual(score.model.pedal_action_change, result.events.items[2].action);
+    try std.testing.expectApproxEqAbs(@as(f32, 27), result.events.items[3].start_beat, 0.0001);
+}
+
+test "pedal finalization refreshes only on authored harmony changes and real attacks" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 1;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 16, .beats = 4, .beat_unit = 4 };
+    report.note_count = 3;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 8, .duration_beats = 1, .pitch = 53, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[2] = .{ .stable_id = 3, .start_beat = 12, .duration_beats = 1, .pitch = 55, .velocity = 80, .staff = 1, .voice = 0 };
+    report.harmony_count = 4;
+    report.harmonies[0] = .{ .start_beat = 0, .root_step = 'C' };
+    report.harmonies[1] = .{ .start_beat = 4, .root_step = 'C' };
+    report.harmonies[2] = .{ .start_beat = 8, .root_step = 'F' };
+    report.harmonies[3] = .{ .start_beat = 12, .root_step = 'G' };
+    report.pedal_count = 2;
+    report.pedals[0] = .{ .start_beat = 0, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[1] = .{ .start_beat = 15.99, .pedal = score.model.pedal_sustain, .value = 0, .action = score.model.pedal_action_stop };
+    var result = try finalizeExistingPedals(std.testing.allocator, &report, null, 4, &.{}, false);
+    defer result.events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), result.events.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.starts);
+    try std.testing.expectEqual(@as(usize, 2), result.changes);
+    try std.testing.expectEqual(@as(usize, 1), result.stops);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), result.events.items[1].start_beat, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), result.events.items[2].start_beat, 0.0001);
+}
+
+test "pedal finalization refreshes selected phrase measures only at piano attacks" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 4;
+    for (0..4) |index| report.measures[index] = .{ .number = @intCast(index + 1), .start_beat = @floatFromInt(index * 4), .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.note_count = 4;
+    report.notes[0] = .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[1] = .{ .stable_id = 2, .start_beat = 5, .duration_beats = 1, .pitch = 50, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[2] = .{ .stable_id = 3, .start_beat = 9, .duration_beats = 1, .pitch = 52, .velocity = 80, .staff = 1, .voice = 0 };
+    report.notes[3] = .{ .stable_id = 4, .start_beat = 13, .duration_beats = 1, .pitch = 53, .velocity = 80, .staff = 1, .voice = 0 };
+    report.pedal_count = 2;
+    report.pedals[0] = .{ .start_beat = 0, .pedal = score.model.pedal_sustain, .value = 72, .action = score.model.pedal_action_start };
+    report.pedals[1] = .{ .start_beat = 15.99, .pedal = score.model.pedal_sustain, .value = 0, .action = score.model.pedal_action_stop };
+    var result = try finalizeExistingPedals(std.testing.allocator, &report, null, null, &.{ 2, 4 }, false);
+    defer result.events.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), result.events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), result.changes);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), result.events.items[1].start_beat, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 13), result.events.items[2].start_beat, 0.0001);
 }
 
 test "score timing integrates authored quarter tempo changes independently from displayed pulse" {
