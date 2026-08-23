@@ -112,6 +112,7 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
     var beats: u32 = report.beats_per_measure;
     var beat_unit: u32 = report.beat_unit;
     var current_dynamic: u8 = 0;
+    var current_velocity: u8 = dynamicVelocity(0);
     while (findOpenTag(source, measure_cursor, "measure")) |measure_open| {
         const open_end = std.mem.indexOfPos(u8, source, measure_open, ">") orelse return error.InvalidMusicXml;
         const measure_end = std.mem.indexOfPos(u8, source, open_end, "</measure>") orelse return error.InvalidMusicXml;
@@ -119,7 +120,7 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
         const body = source[open_end + 1 .. measure_end];
         if (tagContent(body, "beats")) |value| beats = @max(1, try parseUnsigned(value));
         if (tagContent(body, "beat-type")) |value| beat_unit = @max(1, try parseUnsigned(value));
-        const extent = try parseMeasure(body, report, measure_start, part_index, vocal_guide, stable_id, &current_dynamic);
+        const extent = try parseMeasure(body, report, measure_start, part_index, vocal_guide, stable_id, &current_dynamic, &current_velocity);
         // A regular MusicXML measure occupies its declared metrical duration.
         // Advancing by recognized note extent makes one missing OMR rest shift
         // every later bar and desynchronize parts. Explicit implicit measures
@@ -146,7 +147,7 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
     }
 }
 
-fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, part_index: u32, vocal_guide: bool, stable_id: *u64, current_dynamic: *u8) Error!f32 {
+fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, part_index: u32, vocal_guide: bool, stable_id: *u64, current_dynamic: *u8, current_velocity: *u8) Error!f32 {
     var divisions = report.divisions;
     if (tagContent(source, "divisions")) |value| {
         divisions = @max(1, try parseUnsigned(value));
@@ -180,10 +181,13 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
         if (next_direction != null and next == next_direction.?) {
             const end = std.mem.indexOfPos(u8, source, next, "</direction>") orelse return error.InvalidMusicXml;
             const block = source[next..end];
+            const performed_velocity = soundVelocity(block);
             if (dynamicFromDirection(block)) |dynamic_code| {
                 current_dynamic.* = dynamic_code;
                 pending_dynamic = dynamic_code;
+                if (performed_velocity == null) current_velocity.* = dynamicVelocity(dynamic_code);
             }
+            if (performed_velocity) |velocity| current_velocity.* = velocity;
             if (findOpenTag(block, 0, "pedal") != null) {
                 const offset_units = if (tagContent(block, "offset")) |value| try parseSigned(value) else 0;
                 const offset_beats = @as(f32, @floatFromInt(offset_units)) / @as(f32, @floatFromInt(divisions));
@@ -299,7 +303,7 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                     .start_beat = measure_start + start_beat,
                     .duration_beats = if (grace) 0.125 else @max(duration, 0.0625),
                     .pitch = @intCast(midi_wide),
-                    .velocity = dynamicVelocity(current_dynamic.*),
+                    .velocity = current_velocity.*,
                     .staff = stored_staff,
                     .voice = stored_voice,
                     .written_step = std.ascii.toUpper(step_text[0]),
@@ -378,6 +382,15 @@ fn dynamicVelocity(dynamic_code: u8) u8 {
         model.dynamic_fff, model.dynamic_sfz => 120,
         else => 88,
     };
+}
+
+fn soundVelocity(source: []const u8) ?u8 {
+    const sound_start = findOpenTag(source, 0, "sound") orelse return null;
+    const sound_end = std.mem.indexOfPos(u8, source, sound_start, ">") orelse return null;
+    const text = attributeValue(source[sound_start .. sound_end + 1], "dynamics") orelse return null;
+    const percent = std.fmt.parseFloat(f32, text) catch return null;
+    if (!std.math.isFinite(percent) or percent < 0) return null;
+    return @intFromFloat(@round(std.math.clamp(percent * 90.0 / 100.0, 1, 127)));
 }
 
 fn openTagContent(source: []const u8, comptime tag: []const u8) ?[]const u8 {
@@ -771,6 +784,27 @@ test "imports printed eighth pulse separately from quarter-note playback tempo" 
     try std.testing.expectEqual(@as(u8, 8), report.tempo_beat_unit);
     try std.testing.expectEqual(@as(usize, 1), report.tempo_count);
     try std.testing.expectApproxEqAbs(@as(f32, 73.5), report.tempos[0].bpm, 0.001);
+}
+
+test "imports continuous MusicXML performance dynamics without flattening velocities" {
+    const xml =
+        \\<?xml version="1.0"?><score-partwise version="4.0">
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<direction print-object="no"><direction-type><other-direction>performance</other-direction></direction-type><sound dynamics="50"/></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff></note>
+        \\<direction placement="below"><direction-type><dynamics><f/></dynamics></direction-type><sound dynamics="66.667"/></direction>
+        \\<note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff></note>
+        \\<direction print-object="no"><direction-type><other-direction>performance</other-direction></direction-type><sound dynamics="120"/></direction>
+        \\<note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff></note>
+        \\</measure></part></score-partwise>
+    ;
+    const imported = try parse(xml);
+    try std.testing.expectEqual(@as(usize, 3), imported.note_count);
+    try std.testing.expectEqual(@as(u8, 45), imported.notes[0].velocity);
+    try std.testing.expectEqual(@as(u8, 60), imported.notes[1].velocity);
+    try std.testing.expectEqual(@as(u8, 108), imported.notes[2].velocity);
+    try std.testing.expectEqual(model.dynamic_f, model.dynamic(imported.notes[1].flags));
 }
 
 test "falls back to MusicXML page credits for title and composer" {

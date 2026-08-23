@@ -26,6 +26,46 @@ iOS remain later portability targets and must not distract from native quality.
   and zero overloads. Exact-pitch agreement improves 26.4% -> 39.1% and
   pitch-class agreement improves 66.7% -> 75.5%; this is meaningful progress,
   not certification.
+- [x] Restore the expressive opening after a hot-host rebuild exposed two
+  separate regressions: the host had recovered an older 193-measure autosave
+  with zero pedal events, and MusicXML export/re-import collapsed continuous
+  performed velocities into coarse dynamic markings. The unpromoted v10
+  candidate now carries standard `<sound dynamics>` values through the Zig
+  importer/exporter (37 distinct MIDI levels, 52..93 over the opening), keeps
+  all 14 CC64 pedal events at a recording-gated 72/127 depth, and renders 192
+  attacks / 32.653 seconds through the 1,704-region grand at -17.66 dBFS with
+  zero overloads. Debug `load` now writes the atomic autosave immediately,
+  closing the rebuild race.
+- [x] Add `compare-performance` to the consolidated Zig workbench and gate the
+  expressive candidate against the retained audio, not against subjective
+  loudness alone. Relative to the former flat-velocity v8 render, v10 improves
+  normalized envelope correlation 0.311 -> 0.546, attack correlation 0.294 ->
+  0.535, sustain correlation 0.660 -> 0.665, onset precision 0.690 -> 0.702,
+  and normalized envelope error 0.309 -> 0.241. A 54/64/72/80/96 pedal sweep
+  selected the shallowest full-sustain winner (72); all alternatives remain
+  ignored review artifacts. The v10 candidate SHA-256 is
+  `772402f9eb3d5183949f5d074e27579c680968de6c89e29764960bbd9b4fdf68`.
+  A live autosave recovery followed by native MXL export re-imports with the
+  same 195 measures, 2,760 events, 37 instrumental velocity levels (52..93),
+  14 pedal events, and 56.693% MusicXML damper depth.
+- [x] Rebase the complete 193-measure recording ledger onto the v10/v11
+  195-measure timeline instead of stretching a rigid 147-QPM clock across the
+  recording. New measures 1..14 cover 0..32.653 seconds; canonical measure 13
+  resumes as target measure 15 at 33.250 seconds with a 0.597-second transition;
+  all remaining measures map one-to-one through target measure 195. The
+  anchor-aware Zig shaper then assigns continuous performance velocity to the
+  remaining 1,473 attacks without changing notes, rests, lyrics, voice guide,
+  harmony, fingering, articulation, or pedal data.
+- [x] Accept the unpromoted full-performance v11 candidate over v10 on the
+  anchored 195-measure render gate. Envelope correlation improves 0.243 ->
+  0.718, attack correlation 0.233 -> 0.697, sustain correlation 0.192 -> 0.666,
+  normalized envelope error falls 0.310 -> 0.179, and onset precision improves
+  0.669 -> 0.676. The 322.449-second / 1,665-note render peaks at -16.58 dBFS
+  with all 14 pedal events and zero overloads. Measures 1..14 remain byte-level
+  equivalent in exported notation/performance content; the first difference is
+  measure 15. Native autosave recovery/export preserves 195 measures, 2,760
+  events, 40 velocity levels (52..94), and 14 pedal events. Candidate SHA-256:
+  `9eb1f6b0b2e690cee4b428cf81163774a09d0fbb9027bed297045c178d2a1878`.
 - [ ] Complete the ear-and-pianist gate for the second opening candidate before
   promotion. Refine its attack contour, voicing, hand assignment, velocity,
   articulation, and pedal against the retained recording. Keep the canonical
@@ -90,9 +130,11 @@ iOS remain later portability targets and must not distract from native quality.
   opening. The remaining measures are not yet certified as a concert-quality
   reduction; preserve candidate/rejection evidence and require a musician pass.
 - [ ] Author recording-faithful dynamics, articulation, and sustain-pedal
-  transitions. The objective playability audit currently finds zero dynamic
-  markings and zero pedal events, so mechanical playability must not be
-  confused with publication readiness or professional interpretive completion.
+  transitions across the complete canonical score. The opening v10 candidate
+  now has audio-shaped continuous velocities and 14 pedal events, but the
+  canonical score and later sections still lack a complete musician-approved
+  interpretation; mechanical playability must not be confused with publication
+  readiness or professional interpretive completion.
 - [ ] Rerun every historical musical playback/recording QA item below that says
   eighth=147 or 73.5 QPM. Those timing claims are superseded and do **not** count
   as current completion evidence.

@@ -9,12 +9,17 @@ subcommands of the single Zig executable in `src/tools/score_workbench.zig`:
 
 ```sh
 zig build score-workbench -- inspect SCORE.mxl
-zig build score-workbench -- pattern-fragment TEMPLATE.mxl PATTERN.txt FRAGMENT.mxl
+zig build score-workbench -- pattern-fragment TEMPLATE.mxl PATTERN.txt FRAGMENT.mxl --pedal-value 72
 zig build score-workbench -- splice-opening TARGET.mxl FRAGMENT.mxl OUTPUT.mxl --target-end-beat N --repeat-count N
 zig build score-workbench -- opening-performance INPUT.mxl OUTPUT.mxl
 zig build score-workbench -- enrich-opening TARGET.mxl FRAGMENT.mxl OUTPUT.mxl
 zig build score-workbench -- evidence SCORE.mxl --csv EVENTS.csv
 zig build score-workbench -- audio-evidence INPUT.wav --score SCORE.mxl
+zig build score-workbench -- shape-performance INPUT.mxl AUDIO.wav OUTPUT.mxl --start-beat N --end-beat N
+zig build score-workbench -- compare-performance REFERENCE.wav CANDIDATE.wav --output REPORT.json
+zig build score-workbench -- rebase-anchors SOURCE.mxl SOURCE-ANCHORS.json TARGET.mxl OUTPUT.json --source-cut-beat N --target-insert-end-beat N
+zig build score-workbench -- shape-performance INPUT.mxl AUDIO.wav OUTPUT.mxl --start-beat N --end-beat N --anchors ANCHORS.json
+zig build score-workbench -- compare-performance REFERENCE.wav CANDIDATE.wav --score SCORE.mxl --anchors ANCHORS.json --output REPORT.json
 zig build score-workbench -- enrich-evidence TARGET.mxl OUTPUT.mxl --anchors REVIEW.json --csv EVENTS.csv --start-beat N --end-beat N
 zig build score-workbench -- playability SCORE.mxl
 zig build score-workbench -- revoice INPUT.mxl OUTPUT.mxl --beat N --pitch MIDI --from-staff N --to-staff N

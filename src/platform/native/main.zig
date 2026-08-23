@@ -896,6 +896,9 @@ fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzS
             loadScorePath(app, std.heap.c_allocator, path_buffer[0..path.len :0].ptr) catch |err| {
                 response_len = hostDevResponse(&response, "error load failed: {s}", .{@errorName(err)});
             };
+            if (response_len == 0) saveAutosave(app, std.heap.c_allocator) catch |err| {
+                response_len = hostDevResponse(&response, "error loaded but autosave failed: {s}", .{@errorName(err)});
+            };
             if (response_len == 0) response_len = hostDevResponse(&response, "ok loaded {s}", .{path});
         }
     } else if (std.mem.startsWith(u8, command, "export-take ")) {

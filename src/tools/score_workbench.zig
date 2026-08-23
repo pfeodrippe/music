@@ -77,6 +77,26 @@ const AudioAlignment = struct {
     end_beat: f32 = std.math.inf(f32),
 };
 
+const PerformanceComparison = struct {
+    alignment_kind: []const u8 = "absolute-time",
+    measure_count: usize = 0,
+    duration_seconds: f32 = 0,
+    frame_seconds: f32 = 0.04,
+    frame_count: usize = 0,
+    envelope_correlation: f32 = 0,
+    attack_correlation: f32 = 0,
+    sustain_correlation: f32 = 0,
+    normalized_envelope_mae: f32 = 0,
+    reference_dynamic_range_db: f32 = 0,
+    candidate_dynamic_range_db: f32 = 0,
+    reference_onsets: usize = 0,
+    candidate_onsets: usize = 0,
+    matched_candidate_onsets: usize = 0,
+    onset_precision: f32 = 0,
+    reference_coverage: f32 = 0,
+    mean_onset_error_seconds: f32 = 0,
+};
+
 const SpanIssue = struct {
     beat: f32 = 0,
     measure: u32 = 0,
@@ -208,6 +228,18 @@ pub fn main(init: std.process.Init) !void {
         try runAudioEvidence(init, &arguments);
         return;
     }
+    if (std.mem.eql(u8, command, "shape-performance")) {
+        try runShapePerformance(init, &arguments);
+        return;
+    }
+    if (std.mem.eql(u8, command, "rebase-anchors")) {
+        try runRebaseAnchors(init, &arguments);
+        return;
+    }
+    if (std.mem.eql(u8, command, "compare-performance")) {
+        try runComparePerformance(init, &arguments);
+        return;
+    }
     if (std.mem.eql(u8, command, "enrich-evidence")) {
         const target_path = arguments.next() orelse return usage();
         const output_path = arguments.next() orelse return usage();
@@ -309,10 +341,13 @@ fn usage() error{InvalidArguments} {
         \\  score-workbench revoice INPUT.mxl OUTPUT.mxl --beat N [--beat N ...] --pitch MIDI --from-staff N --to-staff N
         \\  score-workbench opening-performance INPUT.mxl OUTPUT.mxl [--repeat-start-measure 4] [--repeat-end-measure 13] [--pedal-value 54]
         \\  score-workbench splice-opening TARGET.mxl FRAGMENT.musicxml|mxl OUTPUT.mxl --target-end-beat N [--repeat-count N]
-        \\  score-workbench pattern-fragment TEMPLATE.mxl PATTERN.txt OUTPUT.mxl
+        \\  score-workbench pattern-fragment TEMPLATE.mxl PATTERN.txt OUTPUT.mxl [--pedal-value 54]
         \\  score-workbench enrich-opening TARGET.mxl FRAGMENT.mxl OUTPUT.mxl [--end-beat 42] [--quarter-bpm 147] [--replace-fragment-bass]
         \\  score-workbench evidence SCORE.mxl --csv EVENTS.csv [--csv EVENTS.csv ...] [--anchors REVIEW.json] [--start-beat 0] [--end-beat 42] [--quarter-bpm 147] [--tolerance 0.08]
         \\  score-workbench audio-evidence INPUT.wav [--score SCORE.musicxml|SCORE.mxl] [--output REPORT.json] [--start-beat N] [--end-beat N]
+        \\  score-workbench shape-performance INPUT.mxl AUDIO.wav OUTPUT.mxl --start-beat N --end-beat N [--audio-offset N] [--anchors ANCHORS.json]
+        \\  score-workbench rebase-anchors SOURCE.mxl SOURCE-ANCHORS.json TARGET.mxl OUTPUT.json --source-cut-beat N --target-insert-end-beat N
+        \\  score-workbench compare-performance REFERENCE.wav CANDIDATE.wav [--output REPORT.json] [--frame-ms 40] [--onset-tolerance 0.08] [--score SCORE.mxl --anchors ANCHORS.json --phase-bins 12]
         \\  score-workbench enrich-evidence TARGET.mxl OUTPUT.mxl --anchors REVIEW.json --csv EVENTS.csv [--csv EVENTS.csv ...] --start-beat N --end-beat N [--grid 0.5] [--onset-tolerance 0.12] [--min-sources 2]
         \\  score-workbench find-repeats SCORE.mxl [--pattern-start 0] [--pattern-end 42]
         \\  score-workbench enrich-repeats TARGET.mxl FRAGMENT.mxl OUTPUT.mxl --pattern START:END [--pattern START:END ...] [--quarter-bpm 147]
@@ -343,7 +378,15 @@ fn runPatternFragment(init: std.process.Init, arguments: *std.process.Args.Itera
     const template_path = arguments.next() orelse return usage();
     const pattern_path = arguments.next() orelse return usage();
     const output_path = arguments.next() orelse return usage();
-    if (arguments.next() != null) return error.UnknownArgument;
+    var pedal_value: u8 = 54;
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--pedal-value")) {
+            pedal_value = try std.fmt.parseUnsigned(u8, arguments.next() orelse return error.MissingValue, 10);
+            if (pedal_value == 0 or pedal_value > 127) return error.InvalidArguments;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
     const template = try init.gpa.create(score.musicxml.ImportReport);
     defer init.gpa.destroy(template);
     try readReportInto(init, template_path, template);
@@ -407,7 +450,7 @@ fn runPatternFragment(init: std.process.Init, arguments: *std.process.Args.Itera
         try pedals.append(init.gpa, .{
             .start_beat = cursor,
             .pedal = score.model.pedal_sustain,
-            .value = 54,
+            .value = pedal_value,
             .action = if (measure_number == 1) score.model.pedal_action_start else score.model.pedal_action_change,
             .flags = score.model.pedal_flag_line | score.model.pedal_flag_sign,
         });
@@ -922,6 +965,562 @@ fn runAudioEvidence(init: std.process.Init, arguments: *std.process.Args.Iterato
     } else {
         try std.Io.File.stdout().writeStreamingAll(init.io, json);
     }
+}
+
+fn runShapePerformance(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const input_path = arguments.next() orelse return usage();
+    const audio_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    var start_beat: f32 = 0;
+    var end_beat: f32 = std.math.inf(f32);
+    var audio_offset: f32 = 0;
+    var anchor_path: ?[]const u8 = null;
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--start-beat")) {
+            start_beat = try parseNonNegativeFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--end-beat")) {
+            end_beat = try parsePositiveFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--audio-offset")) {
+            audio_offset = try parseNonNegativeFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--anchors")) {
+            anchor_path = arguments.next() orelse return error.MissingValue;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    if (end_beat <= start_beat) return error.InvalidBeatRange;
+
+    const report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(report);
+    try readReportInto(init, input_path, report);
+    const audio_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, audio_path, init.gpa, .limited(2 * 1024 * 1024 * 1024));
+    defer init.gpa.free(audio_bytes);
+    var decoded = try score.wav.decode(init.gpa, audio_bytes);
+    defer decoded.deinit();
+    var anchors: std.ArrayList(RecordingAnchor) = .empty;
+    defer anchors.deinit(init.gpa);
+    if (anchor_path) |path| try readRecordingAnchors(init, path, &anchors);
+    const range_start_seconds = reportSecondsAtBeat(report, start_beat);
+    const range_end_seconds = reportSecondsAtBeat(report, end_beat);
+    const audio_duration = @as(f32, @floatFromInt(decoded.samples.len)) / @as(f32, @floatFromInt(decoded.sample_rate));
+    if (anchors.items.len == 0 and audio_offset + range_end_seconds - range_start_seconds > audio_duration + 0.1) return error.AudioEvidenceTooShort;
+
+    var note_indices: [score.musicxml.max_import_notes]usize = undefined;
+    var strengths: [score.musicxml.max_import_notes]f32 = undefined;
+    var shaped_count: usize = 0;
+    for (report.notes[0..report.note_count], 0..) |note, note_index| {
+        if (note.start_beat < start_beat or note.start_beat >= end_beat) continue;
+        if ((note.flags & (score.model.note_flag_rest | score.model.note_flag_vocal_guide)) != 0) continue;
+        var time = audio_offset + if (anchors.items.len == 0)
+            reportSecondsAtBeat(report, note.start_beat) - range_start_seconds
+        else
+            anchoredNoteTime(report, anchors.items, note.start_beat) orelse return error.MissingRecordingAnchor;
+        if (time < 0 or time > audio_duration + 0.1) return error.RecordingAnchorOutsideAudio;
+        time = std.math.clamp(time, 0, @max(0, audio_duration - 0.0001));
+        note_indices[shaped_count] = note_index;
+        strengths[shaped_count] = localPerformanceStrength(decoded.samples, decoded.sample_rate, time);
+        shaped_count += 1;
+    }
+    if (shaped_count == 0) return error.NoInstrumentNotesInRange;
+    var sorted_strengths: [score.musicxml.max_import_notes]f32 = undefined;
+    @memcpy(sorted_strengths[0..shaped_count], strengths[0..shaped_count]);
+    std.mem.sort(f32, sorted_strengths[0..shaped_count], {}, std.sort.asc(f32));
+    const low = sorted_strengths[@min(shaped_count - 1, shaped_count / 10)];
+    const high = sorted_strengths[@min(shaped_count - 1, shaped_count * 9 / 10)];
+    var minimum_velocity: u8 = 127;
+    var maximum_velocity: u8 = 0;
+    var velocity_sum: usize = 0;
+    for (note_indices[0..shaped_count], strengths[0..shaped_count]) |note_index, strength| {
+        const normalized = if (high > low + 0.0001) std.math.clamp((strength - low) / (high - low), 0, 1) else 0.5;
+        const note = &report.notes[note_index];
+        note.velocity = shapedVelocity(note.velocity, normalized, (note.staff & 1) == 1, note.flags);
+        minimum_velocity = @min(minimum_velocity, note.velocity);
+        maximum_velocity = @max(maximum_velocity, note.velocity);
+        velocity_sum += note.velocity;
+    }
+    try writeMxl(init, output_path, report, report.notes[0..report.note_count], report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
+    std.debug.print(
+        "Wrote {s}: audio-shaped {d} instrumental attacks over beats {d:.3}..{d:.3}; velocity={d}..{d} mean={d:.1}; reference={d:.3}s anchors={d}\n",
+        .{ output_path, shaped_count, start_beat, end_beat, minimum_velocity, maximum_velocity, @as(f32, @floatFromInt(velocity_sum)) / @as(f32, @floatFromInt(shaped_count)), audio_duration, anchors.items.len },
+    );
+}
+
+fn runRebaseAnchors(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const source_score_path = arguments.next() orelse return usage();
+    const source_anchor_path = arguments.next() orelse return usage();
+    const target_score_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    var source_cut_beat: ?f32 = null;
+    var target_insert_end_beat: ?f32 = null;
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--source-cut-beat")) {
+            source_cut_beat = try parseNonNegativeFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--target-insert-end-beat")) {
+            target_insert_end_beat = try parsePositiveFloat(arguments.next() orelse return error.MissingValue);
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    const source_cut = source_cut_beat orelse return error.MissingValue;
+    const target_insert_end = target_insert_end_beat orelse return error.MissingValue;
+    const source = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(source);
+    try readReportInto(init, source_score_path, source);
+    const target = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(target);
+    try readReportInto(init, target_score_path, target);
+    var source_anchors: std.ArrayList(RecordingAnchor) = .empty;
+    defer source_anchors.deinit(init.gpa);
+    try readRecordingAnchors(init, source_anchor_path, &source_anchors);
+
+    const source_resume_index = measureIndexAtOrAfter(source, source_cut) orelse return error.SourceResumeMeasureMissing;
+    const target_resume_index = measureIndexAtOrAfter(target, target_insert_end) orelse return error.TargetResumeMeasureMissing;
+    if (source.measure_count - source_resume_index != target.measure_count - target_resume_index) return error.RebasedMeasureCountMismatch;
+    const inserted_end_seconds = reportSecondsAtBeat(target, target_insert_end);
+    const source_resume_measure = source.measures[source_resume_index];
+    const source_resume_anchor = findRecordingAnchor(source_anchors.items, source_resume_measure.number) orelse return error.MissingRecordingAnchor;
+    const join_gap_seconds = source_resume_anchor.start_seconds - inserted_end_seconds;
+
+    var allocating: std.Io.Writer.Allocating = .init(init.gpa);
+    defer allocating.deinit();
+    const writer = &allocating.writer;
+    try writer.print(
+        "{{\n  \"schema\": 1,\n  \"analysis_kind\": \"rebased-recording-timing-anchors\",\n  \"source_resume_measure\": {d},\n  \"target_resume_measure\": {d},\n  \"inserted_measure_count\": {d},\n  \"join_gap_seconds\": {d:.6},\n  \"measures\": [\n",
+        .{ source_resume_measure.number, target.measures[target_resume_index].number, target_resume_index, join_gap_seconds },
+    );
+    for (target.measures[0..target.measure_count], 0..) |measure, target_index| {
+        var start_seconds: f32 = undefined;
+        var end_seconds: f32 = undefined;
+        if (target_index < target_resume_index) {
+            start_seconds = reportSecondsAtBeat(target, measure.start_beat);
+            end_seconds = reportSecondsAtBeat(target, measure.start_beat + measure.duration_beats);
+        } else {
+            const source_measure = source.measures[source_resume_index + (target_index - target_resume_index)];
+            const anchor = findRecordingAnchor(source_anchors.items, source_measure.number) orelse return error.MissingRecordingAnchor;
+            start_seconds = anchor.start_seconds;
+            end_seconds = anchor.end_seconds;
+        }
+        if (target_index != 0) try writer.writeAll(",\n");
+        try writer.print("    {{\"measure\":\"{d}\",\"recording_start_seconds\":{d:.6},\"recording_end_seconds\":{d:.6}}}", .{ measure.number, start_seconds, end_seconds });
+    }
+    try writer.writeAll("\n  ]\n}\n");
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output_path, .data = allocating.written() });
+    std.debug.print(
+        "Wrote {s}: target measures={d}, inserted={d}, source resume m{d} -> target m{d}, join gap={d:.3}s\n",
+        .{ output_path, target.measure_count, target_resume_index, source_resume_measure.number, target.measures[target_resume_index].number, join_gap_seconds },
+    );
+}
+
+fn measureIndexAtOrAfter(report: *const score.musicxml.ImportReport, beat: f32) ?usize {
+    for (report.measures[0..report.measure_count], 0..) |measure, index| {
+        if (measure.start_beat >= beat - 0.0001) return index;
+    }
+    return null;
+}
+
+fn findRecordingAnchor(anchors: []const RecordingAnchor, measure_number: u32) ?RecordingAnchor {
+    for (anchors) |anchor| if (anchor.measure_number == measure_number) return anchor;
+    return null;
+}
+
+fn localPerformanceStrength(samples: []const f32, sample_rate: u32, time_seconds: f32) f32 {
+    const center: usize = @min(samples.len, @as(usize, @intFromFloat(@max(0, time_seconds) * @as(f32, @floatFromInt(sample_rate)))));
+    const before_window: usize = @max(1, sample_rate * 60 / 1000);
+    const after_window: usize = @max(1, sample_rate * 100 / 1000);
+    const before_start = center -| before_window;
+    const after_end = @min(samples.len, center + after_window);
+    const before = windowRms(samples[before_start..center]);
+    const after = windowRms(samples[center..after_end]);
+    const loudness_db = 20.0 * @log10(@max(after, 0.000001));
+    const attack_bonus = std.math.clamp((after - before) * 80.0, 0, 8);
+    return loudness_db + attack_bonus;
+}
+
+fn windowRms(samples: []const f32) f32 {
+    if (samples.len == 0) return 0;
+    var energy: f64 = 0;
+    for (samples) |sample| energy += @as(f64, sample) * sample;
+    return @floatCast(@sqrt(energy / @as(f64, @floatFromInt(samples.len))));
+}
+
+fn shapedVelocity(authored_velocity: u8, normalized_strength: f32, bass_hand: bool, flags: u32) u8 {
+    const authored = if (authored_velocity == 0) 76.0 else @as(f32, @floatFromInt(authored_velocity));
+    const audio = 48.0 + 48.0 * std.math.clamp(normalized_strength, 0, 1);
+    const hand_offset: f32 = if (bass_hand) 3.0 else 0.0;
+    var result = 0.28 * authored + 0.72 * audio - hand_offset;
+    if ((flags & score.model.note_flag_accent) != 0) result += 4;
+    if ((flags & score.model.note_flag_marcato) != 0) result += 7;
+    return @intFromFloat(@round(std.math.clamp(result, 38, 108)));
+}
+
+fn runComparePerformance(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const reference_path = arguments.next() orelse return usage();
+    const candidate_path = arguments.next() orelse return usage();
+    var output_path: ?[]const u8 = null;
+    var frame_seconds: f32 = 0.04;
+    var onset_tolerance: f32 = 0.08;
+    var score_path: ?[]const u8 = null;
+    var anchor_path: ?[]const u8 = null;
+    var phase_bins: usize = 12;
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--output")) {
+            output_path = arguments.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, argument, "--frame-ms")) {
+            frame_seconds = try parsePositiveFloat(arguments.next() orelse return error.MissingValue) / 1000.0;
+        } else if (std.mem.eql(u8, argument, "--onset-tolerance")) {
+            onset_tolerance = try parseNonNegativeFloat(arguments.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, argument, "--score")) {
+            score_path = arguments.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, argument, "--anchors")) {
+            anchor_path = arguments.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, argument, "--phase-bins")) {
+            phase_bins = try std.fmt.parseUnsigned(usize, arguments.next() orelse return error.MissingValue, 10);
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+    if (frame_seconds < 0.01 or frame_seconds > 0.25 or onset_tolerance > 0.5 or phase_bins < 2 or phase_bins > 64) return error.InvalidAudioComparisonOptions;
+    if ((score_path == null) != (anchor_path == null)) return error.ScoreAndAnchorsRequiredTogether;
+
+    const reference_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, reference_path, init.gpa, .limited(2 * 1024 * 1024 * 1024));
+    defer init.gpa.free(reference_bytes);
+    const candidate_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, candidate_path, init.gpa, .limited(2 * 1024 * 1024 * 1024));
+    defer init.gpa.free(candidate_bytes);
+    var reference = try score.wav.decode(init.gpa, reference_bytes);
+    defer reference.deinit();
+    var candidate = try score.wav.decode(init.gpa, candidate_bytes);
+    defer candidate.deinit();
+    var reference_analysis = try score.transcribe.analyze(init.gpa, reference.samples, reference.sample_rate);
+    defer reference_analysis.deinit();
+    var candidate_analysis = try score.transcribe.analyze(init.gpa, candidate.samples, candidate.sample_rate);
+    defer candidate_analysis.deinit();
+
+    const comparison = if (score_path) |path| blk: {
+        const report = try init.gpa.create(score.musicxml.ImportReport);
+        defer init.gpa.destroy(report);
+        try readReportInto(init, path, report);
+        var anchors: std.ArrayList(RecordingAnchor) = .empty;
+        defer anchors.deinit(init.gpa);
+        try readRecordingAnchors(init, anchor_path.?, &anchors);
+        break :blk try compareAnchoredPerformance(
+            init.gpa,
+            report,
+            anchors.items,
+            reference.samples,
+            reference.sample_rate,
+            reference_analysis.onsets,
+            candidate.samples,
+            candidate.sample_rate,
+            candidate_analysis.onsets,
+            phase_bins,
+            onset_tolerance,
+        );
+    } else try comparePerformance(
+        init.gpa,
+        reference.samples,
+        reference.sample_rate,
+        reference_analysis.onsets,
+        candidate.samples,
+        candidate.sample_rate,
+        candidate_analysis.onsets,
+        frame_seconds,
+        onset_tolerance,
+    );
+    var allocating: std.Io.Writer.Allocating = .init(init.gpa);
+    defer allocating.deinit();
+    const writer = &allocating.writer;
+    try writer.print(
+        "{{\n  \"schema\": 1,\n  \"alignment_kind\": \"{s}\",\n  \"measure_count\": {d},\n  \"duration_seconds\": {d:.4},\n  \"frame_seconds\": {d:.4},\n  \"frame_count\": {d},\n  \"envelope\": {{\"correlation\":{d:.6},\"attack_correlation\":{d:.6},\"sustain_correlation\":{d:.6},\"normalized_mae\":{d:.6},\"reference_dynamic_range_db\":{d:.3},\"candidate_dynamic_range_db\":{d:.3}}},\n  \"onsets\": {{\"reference\":{d},\"candidate\":{d},\"matched_candidate\":{d},\"precision\":{d:.6},\"reference_coverage\":{d:.6},\"mean_error_seconds\":{d:.6}}}\n}}\n",
+        .{
+            comparison.alignment_kind,
+            comparison.measure_count,
+            comparison.duration_seconds,
+            comparison.frame_seconds,
+            comparison.frame_count,
+            comparison.envelope_correlation,
+            comparison.attack_correlation,
+            comparison.sustain_correlation,
+            comparison.normalized_envelope_mae,
+            comparison.reference_dynamic_range_db,
+            comparison.candidate_dynamic_range_db,
+            comparison.reference_onsets,
+            comparison.candidate_onsets,
+            comparison.matched_candidate_onsets,
+            comparison.onset_precision,
+            comparison.reference_coverage,
+            comparison.mean_onset_error_seconds,
+        },
+    );
+    const json = allocating.written();
+    if (output_path) |path| {
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = json });
+        std.debug.print("Wrote performance comparison to {s}\n", .{path});
+    } else {
+        try std.Io.File.stdout().writeStreamingAll(init.io, json);
+    }
+}
+
+fn comparePerformance(
+    allocator: std.mem.Allocator,
+    reference_samples: []const f32,
+    reference_rate: u32,
+    reference_onsets: []const f32,
+    candidate_samples: []const f32,
+    candidate_rate: u32,
+    candidate_onsets: []const f32,
+    frame_seconds: f32,
+    onset_tolerance: f32,
+) !PerformanceComparison {
+    const reference_duration = @as(f32, @floatFromInt(reference_samples.len)) / @as(f32, @floatFromInt(reference_rate));
+    const candidate_duration = @as(f32, @floatFromInt(candidate_samples.len)) / @as(f32, @floatFromInt(candidate_rate));
+    const duration = @min(reference_duration, candidate_duration);
+    const frame_count: usize = @intFromFloat(@floor(duration / frame_seconds));
+    if (frame_count < 4) return error.AudioEvidenceTooShort;
+    const reference_envelope = try allocator.alloc(f32, frame_count);
+    defer allocator.free(reference_envelope);
+    const candidate_envelope = try allocator.alloc(f32, frame_count);
+    defer allocator.free(candidate_envelope);
+    const scratch = try allocator.alloc(f32, frame_count);
+    defer allocator.free(scratch);
+    const attack_mask = try allocator.alloc(bool, frame_count);
+    defer allocator.free(attack_mask);
+    @memset(attack_mask, false);
+
+    for (0..frame_count) |frame| {
+        const start = @as(f32, @floatFromInt(frame)) * frame_seconds;
+        const end = start + frame_seconds;
+        reference_envelope[frame] = frameRmsDb(reference_samples, reference_rate, start, end);
+        candidate_envelope[frame] = frameRmsDb(candidate_samples, candidate_rate, start, end);
+    }
+    const reference_range = normalizeEnvelope(reference_envelope, scratch);
+    const candidate_range = normalizeEnvelope(candidate_envelope, scratch);
+    for (candidate_onsets) |onset| {
+        if (onset < 0 or onset >= duration) continue;
+        const start_time = @max(0, onset - 0.04);
+        const end_time = @min(duration, onset + 0.12);
+        const start_frame: usize = @min(frame_count, @as(usize, @intFromFloat(@floor(start_time / frame_seconds))));
+        const end_frame: usize = @min(frame_count, @as(usize, @intFromFloat(@ceil(end_time / frame_seconds))));
+        @memset(attack_mask[start_frame..end_frame], true);
+    }
+    const sustain_mask = try allocator.alloc(bool, frame_count);
+    defer allocator.free(sustain_mask);
+    for (sustain_mask, attack_mask, reference_envelope, candidate_envelope) |*sustain, attack, reference_value, candidate_value| {
+        sustain.* = !attack and (reference_value > 0.02 or candidate_value > 0.02);
+    }
+
+    const onset_result = try matchOnsets(allocator, reference_onsets, candidate_onsets, duration, onset_tolerance);
+    return .{
+        .alignment_kind = "absolute-time",
+        .duration_seconds = duration,
+        .frame_seconds = frame_seconds,
+        .frame_count = frame_count,
+        .envelope_correlation = envelopeCorrelation(reference_envelope, candidate_envelope, null),
+        .attack_correlation = envelopeCorrelation(reference_envelope, candidate_envelope, attack_mask),
+        .sustain_correlation = envelopeCorrelation(reference_envelope, candidate_envelope, sustain_mask),
+        .normalized_envelope_mae = envelopeMae(reference_envelope, candidate_envelope),
+        .reference_dynamic_range_db = reference_range,
+        .candidate_dynamic_range_db = candidate_range,
+        .reference_onsets = onset_result.reference_count,
+        .candidate_onsets = onset_result.candidate_count,
+        .matched_candidate_onsets = onset_result.matched,
+        .onset_precision = onset_result.precision,
+        .reference_coverage = onset_result.coverage,
+        .mean_onset_error_seconds = onset_result.mean_error,
+    };
+}
+
+fn compareAnchoredPerformance(
+    allocator: std.mem.Allocator,
+    report: *const score.musicxml.ImportReport,
+    anchors: []const RecordingAnchor,
+    reference_samples: []const f32,
+    reference_rate: u32,
+    reference_onsets: []const f32,
+    candidate_samples: []const f32,
+    candidate_rate: u32,
+    candidate_onsets: []const f32,
+    phase_bins: usize,
+    onset_tolerance: f32,
+) !PerformanceComparison {
+    const maximum_frames = report.measure_count * phase_bins;
+    const reference_envelope = try allocator.alloc(f32, maximum_frames);
+    defer allocator.free(reference_envelope);
+    const candidate_envelope = try allocator.alloc(f32, maximum_frames);
+    defer allocator.free(candidate_envelope);
+    const attack_mask = try allocator.alloc(bool, maximum_frames);
+    defer allocator.free(attack_mask);
+    const sustain_mask = try allocator.alloc(bool, maximum_frames);
+    defer allocator.free(sustain_mask);
+    const scratch = try allocator.alloc(f32, maximum_frames);
+    defer allocator.free(scratch);
+    var warped_candidate_onsets: std.ArrayList(f32) = .empty;
+    defer warped_candidate_onsets.deinit(allocator);
+    try warped_candidate_onsets.ensureTotalCapacity(allocator, candidate_onsets.len);
+
+    var frame_count: usize = 0;
+    var included_measures: usize = 0;
+    var first_reference_start = std.math.inf(f32);
+    var last_reference_end: f32 = 0;
+    for (report.measures[0..report.measure_count]) |measure| {
+        const anchor = findRecordingAnchor(anchors, measure.number) orelse continue;
+        const candidate_start = reportSecondsAtBeat(report, measure.start_beat);
+        const candidate_end = reportSecondsAtBeat(report, measure.start_beat + measure.duration_beats);
+        if (candidate_end <= candidate_start or anchor.end_seconds <= anchor.start_seconds) continue;
+        first_reference_start = @min(first_reference_start, anchor.start_seconds);
+        last_reference_end = @max(last_reference_end, anchor.end_seconds);
+        included_measures += 1;
+        for (0..phase_bins) |bin| {
+            const phase_start = @as(f32, @floatFromInt(bin)) / @as(f32, @floatFromInt(phase_bins));
+            const phase_end = @as(f32, @floatFromInt(bin + 1)) / @as(f32, @floatFromInt(phase_bins));
+            const reference_start = anchor.start_seconds + phase_start * (anchor.end_seconds - anchor.start_seconds);
+            const reference_end = anchor.start_seconds + phase_end * (anchor.end_seconds - anchor.start_seconds);
+            const rendered_start = candidate_start + phase_start * (candidate_end - candidate_start);
+            const rendered_end = candidate_start + phase_end * (candidate_end - candidate_start);
+            reference_envelope[frame_count] = frameRmsDb(reference_samples, reference_rate, reference_start, reference_end);
+            candidate_envelope[frame_count] = frameRmsDb(candidate_samples, candidate_rate, rendered_start, rendered_end);
+            var has_attack = false;
+            for (candidate_onsets) |onset| {
+                if (onset >= rendered_start and onset < rendered_end) {
+                    has_attack = true;
+                    break;
+                }
+            }
+            attack_mask[frame_count] = has_attack;
+            frame_count += 1;
+        }
+        for (candidate_onsets) |onset| {
+            if (onset < candidate_start or onset >= candidate_end) continue;
+            const phase = std.math.clamp((onset - candidate_start) / (candidate_end - candidate_start), 0, 1);
+            try warped_candidate_onsets.append(allocator, anchor.start_seconds + phase * (anchor.end_seconds - anchor.start_seconds));
+        }
+    }
+    if (included_measures == 0 or frame_count < 4) return error.MissingRecordingAnchor;
+    const reference_values = reference_envelope[0..frame_count];
+    const candidate_values = candidate_envelope[0..frame_count];
+    const reference_range = normalizeEnvelope(reference_values, scratch[0..frame_count]);
+    const candidate_range = normalizeEnvelope(candidate_values, scratch[0..frame_count]);
+    for (sustain_mask[0..frame_count], attack_mask[0..frame_count], reference_values, candidate_values) |*sustain, attack, reference_value, candidate_value| {
+        sustain.* = !attack and (reference_value > 0.02 or candidate_value > 0.02);
+    }
+    const onset_result = try matchOnsets(allocator, reference_onsets, warped_candidate_onsets.items, last_reference_end, onset_tolerance);
+    return .{
+        .alignment_kind = "measure-phase-anchors",
+        .measure_count = included_measures,
+        .duration_seconds = last_reference_end - first_reference_start,
+        .frame_seconds = 0,
+        .frame_count = frame_count,
+        .envelope_correlation = envelopeCorrelation(reference_values, candidate_values, null),
+        .attack_correlation = envelopeCorrelation(reference_values, candidate_values, attack_mask[0..frame_count]),
+        .sustain_correlation = envelopeCorrelation(reference_values, candidate_values, sustain_mask[0..frame_count]),
+        .normalized_envelope_mae = envelopeMae(reference_values, candidate_values),
+        .reference_dynamic_range_db = reference_range,
+        .candidate_dynamic_range_db = candidate_range,
+        .reference_onsets = onset_result.reference_count,
+        .candidate_onsets = onset_result.candidate_count,
+        .matched_candidate_onsets = onset_result.matched,
+        .onset_precision = onset_result.precision,
+        .reference_coverage = onset_result.coverage,
+        .mean_onset_error_seconds = onset_result.mean_error,
+    };
+}
+
+fn frameRmsDb(samples: []const f32, sample_rate: u32, start_seconds: f32, end_seconds: f32) f32 {
+    const rate: f32 = @floatFromInt(sample_rate);
+    const start: usize = @min(samples.len, @as(usize, @intFromFloat(@max(0, start_seconds) * rate)));
+    const end: usize = @min(samples.len, @as(usize, @intFromFloat(@max(start_seconds, end_seconds) * rate)));
+    const rms = windowRms(samples[start..end]);
+    return std.math.clamp(20.0 * @log10(@max(rms, 0.0001)), -80, 0);
+}
+
+fn normalizeEnvelope(values: []f32, scratch: []f32) f32 {
+    @memcpy(scratch[0..values.len], values);
+    std.mem.sort(f32, scratch[0..values.len], {}, std.sort.asc(f32));
+    const low = scratch[@min(values.len - 1, values.len / 10)];
+    const high = scratch[@min(values.len - 1, values.len * 9 / 10)];
+    const width = @max(0.001, high - low);
+    for (values) |*value| value.* = std.math.clamp((value.* - low) / width, 0, 1);
+    return high - low;
+}
+
+fn envelopeCorrelation(left: []const f32, right: []const f32, mask: ?[]const bool) f32 {
+    var count: usize = 0;
+    var left_sum: f64 = 0;
+    var right_sum: f64 = 0;
+    for (left, right, 0..) |a, b, index| {
+        if (mask) |active| if (!active[index]) continue;
+        count += 1;
+        left_sum += a;
+        right_sum += b;
+    }
+    if (count < 2) return 0;
+    const left_mean = left_sum / @as(f64, @floatFromInt(count));
+    const right_mean = right_sum / @as(f64, @floatFromInt(count));
+    var left_energy: f64 = 0;
+    var right_energy: f64 = 0;
+    var cross_energy: f64 = 0;
+    for (left, right, 0..) |a, b, index| {
+        if (mask) |active| if (!active[index]) continue;
+        const centered_left = @as(f64, a) - left_mean;
+        const centered_right = @as(f64, b) - right_mean;
+        left_energy += centered_left * centered_left;
+        right_energy += centered_right * centered_right;
+        cross_energy += centered_left * centered_right;
+    }
+    if (left_energy <= 0 or right_energy <= 0) return 0;
+    return @floatCast(cross_energy / @sqrt(left_energy * right_energy));
+}
+
+fn envelopeMae(left: []const f32, right: []const f32) f32 {
+    var total: f64 = 0;
+    for (left, right) |a, b| total += @abs(@as(f64, a) - b);
+    return @floatCast(total / @as(f64, @floatFromInt(left.len)));
+}
+
+const OnsetMatch = struct {
+    reference_count: usize,
+    candidate_count: usize,
+    matched: usize,
+    precision: f32,
+    coverage: f32,
+    mean_error: f32,
+};
+
+fn matchOnsets(allocator: std.mem.Allocator, reference: []const f32, candidate: []const f32, duration: f32, tolerance: f32) !OnsetMatch {
+    const used = try allocator.alloc(bool, reference.len);
+    defer allocator.free(used);
+    @memset(used, false);
+    var reference_count: usize = 0;
+    for (reference) |onset| reference_count += @intFromBool(onset >= 0 and onset < duration);
+    var candidate_count: usize = 0;
+    var matched: usize = 0;
+    var error_sum: f32 = 0;
+    for (candidate) |candidate_onset| {
+        if (candidate_onset < 0 or candidate_onset >= duration) continue;
+        candidate_count += 1;
+        var nearest_index: ?usize = null;
+        var nearest_error = tolerance + 0.000001;
+        for (reference, 0..) |reference_onset, index| {
+            if (used[index] or reference_onset < 0 or reference_onset >= duration) continue;
+            const difference = @abs(reference_onset - candidate_onset);
+            if (difference <= tolerance and difference < nearest_error) {
+                nearest_index = index;
+                nearest_error = difference;
+            }
+        }
+        if (nearest_index) |index| {
+            used[index] = true;
+            matched += 1;
+            error_sum += nearest_error;
+        }
+    }
+    return .{
+        .reference_count = reference_count,
+        .candidate_count = candidate_count,
+        .matched = matched,
+        .precision = if (candidate_count == 0) 0 else @as(f32, @floatFromInt(matched)) / @as(f32, @floatFromInt(candidate_count)),
+        .coverage = if (reference_count == 0) 0 else @as(f32, @floatFromInt(matched)) / @as(f32, @floatFromInt(reference_count)),
+        .mean_error = if (matched == 0) 0 else error_sum / @as(f32, @floatFromInt(matched)),
+    };
 }
 
 fn alignAudioScore(analysis: *const score.transcribe.Analysis, report: *const score.musicxml.ImportReport, start_beat: f32, requested_end_beat: f32) AudioAlignment {
@@ -1585,11 +2184,21 @@ fn printReport(path: []const u8, report: *const score.musicxml.ImportReport) voi
     var pitched: usize = 0;
     var vocal: usize = 0;
     var rests: usize = 0;
+    var minimum_velocity: u8 = 127;
+    var maximum_velocity: u8 = 0;
+    var velocity_seen = [_]bool{false} ** 128;
+    var instrumental_pitched: usize = 0;
     var staff_counts = [_]usize{0} ** 256;
     var voice_seen = [_][256]bool{[_]bool{false} ** 256} ** 256;
     for (report.notes[0..report.note_count]) |note| {
         if ((note.flags & score.model.note_flag_rest) != 0) rests += 1 else pitched += 1;
         if ((note.flags & score.model.note_flag_vocal_guide) != 0) vocal += 1;
+        if ((note.flags & (score.model.note_flag_rest | score.model.note_flag_vocal_guide)) == 0) {
+            minimum_velocity = @min(minimum_velocity, note.velocity);
+            maximum_velocity = @max(maximum_velocity, note.velocity);
+            velocity_seen[note.velocity] = true;
+            instrumental_pitched += 1;
+        }
         staff_counts[note.staff] += 1;
         voice_seen[note.staff][note.voice] = true;
     }
@@ -1597,6 +2206,11 @@ fn printReport(path: []const u8, report: *const score.musicxml.ImportReport) voi
         "{s}: title=\"{s}\" creator=\"{s}\" measures={d} events={d} pitched={d} rests={d} vocal={d} harmonies={d} pedals={d} tempo={d:.3} pulse-unit={d} quarter={d:.3} end={d:.3}\n",
         .{ path, report.titleSlice(), report.creatorSlice(), report.measure_count, report.note_count, pitched, rests, vocal, report.harmony_count, report.pedal_count, report.tempo_bpm, report.tempo_beat_unit, score.model.quarterTempoFromPulse(report.tempo_bpm, report.tempo_beat_unit), scoreEnd(report) },
     );
+    if (instrumental_pitched != 0) {
+        var velocity_layers: usize = 0;
+        for (velocity_seen) |seen| velocity_layers += @intFromBool(seen);
+        std.debug.print("  performance: instrumental={d} velocity={d}..{d} distinct={d}\n", .{ instrumental_pitched, minimum_velocity, maximum_velocity, velocity_layers });
+    }
     for (staff_counts, 0..) |count, staff| {
         if (count == 0) continue;
         var voices: usize = 0;
@@ -1756,6 +2370,83 @@ test "optional pitch lists preserve intentionally empty accompaniment bars" {
     try std.testing.expectEqual(@as(usize, 2), try parseOptionalPitchList("37,49", &pitches));
     try std.testing.expectEqual(@as(u8, 37), pitches[0]);
     try std.testing.expectEqual(@as(u8, 49), pitches[1]);
+}
+
+test "audio-shaped velocities preserve authored contour while following source strength" {
+    const quiet = shapedVelocity(70, 0.1, false, 0);
+    const loud = shapedVelocity(70, 0.9, false, 0);
+    const bass = shapedVelocity(70, 0.9, true, 0);
+    const accented = shapedVelocity(70, 0.9, false, score.model.note_flag_accent);
+    try std.testing.expect(loud > quiet);
+    try std.testing.expect(bass < loud);
+    try std.testing.expect(accented > loud);
+    try std.testing.expectEqual(@as(f32, 0.5), windowRms(&.{ 0.5, -0.5, 0.5, -0.5 }));
+}
+
+test "performance comparison separates envelope shape and onset timing" {
+    const rising = [_]f32{ 0.0, 0.25, 0.5, 0.75, 1.0 };
+    const same_shape = [_]f32{ 0.0, 0.25, 0.5, 0.75, 1.0 };
+    const falling = [_]f32{ 1.0, 0.75, 0.5, 0.25, 0.0 };
+    try std.testing.expectApproxEqAbs(@as(f32, 1), envelopeCorrelation(&rising, &same_shape, null), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), envelopeCorrelation(&rising, &falling, null), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), envelopeMae(&rising, &same_shape), 0.0001);
+
+    const matches = try matchOnsets(std.testing.allocator, &.{ 0.1, 0.5, 0.9 }, &.{ 0.12, 0.48, 0.7 }, 1.0, 0.05);
+    try std.testing.expectEqual(@as(usize, 2), matches.matched);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), matches.precision, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.02), matches.mean_error, 0.0001);
+}
+
+test "recording anchors interpolate inside the matching score measure" {
+    var report: score.musicxml.ImportReport = .{};
+    report.measure_count = 2;
+    report.measures[0] = .{ .number = 10, .start_beat = 0, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    report.measures[1] = .{ .number = 11, .start_beat = 4, .duration_beats = 6, .beats = 6, .beat_unit = 4 };
+    const anchors = [_]RecordingAnchor{
+        .{ .measure_number = 10, .start_seconds = 2, .end_seconds = 6 },
+        .{ .measure_number = 11, .start_seconds = 6.5, .end_seconds = 12.5 },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), measureIndexAtOrAfter(&report, 4));
+    try std.testing.expectApproxEqAbs(@as(f32, 3), anchoredNoteTime(&report, &anchors, 1).?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 9.5), anchoredNoteTime(&report, &anchors, 7).?, 0.0001);
+    try std.testing.expectEqual(@as(u32, 11), findRecordingAnchor(&anchors, 11).?.measure_number);
+}
+
+test "anchored performance comparison removes measure-duration drift" {
+    var report: score.musicxml.ImportReport = .{};
+    report.tempo_bpm = 120;
+    report.tempo_beat_unit = 4;
+    report.measure_count = 1;
+    report.measures[0] = .{ .number = 1, .start_beat = 0, .duration_beats = 4, .beats = 4, .beat_unit = 4 };
+    const anchors = [_]RecordingAnchor{.{ .measure_number = 1, .start_seconds = 0, .end_seconds = 2 }};
+    var samples: [2000]f32 = undefined;
+    for (&samples, 0..) |*sample, index| {
+        const quarter = @min(3, index / 500);
+        sample.* = switch (quarter) {
+            0 => 0.1,
+            1 => 0.2,
+            2 => 0.4,
+            else => 0.8,
+        };
+    }
+    const comparison = try compareAnchoredPerformance(
+        std.testing.allocator,
+        &report,
+        &anchors,
+        &samples,
+        1000,
+        &.{ 0.5, 1.5 },
+        &samples,
+        1000,
+        &.{ 0.5, 1.5 },
+        4,
+        0.01,
+    );
+    try std.testing.expectEqualStrings("measure-phase-anchors", comparison.alignment_kind);
+    try std.testing.expectEqual(@as(usize, 1), comparison.measure_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), comparison.envelope_correlation, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), comparison.normalized_envelope_mae, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), comparison.onset_precision, 0.0001);
 }
 
 test "playability audit distinguishes wide and extreme one-hand spans" {

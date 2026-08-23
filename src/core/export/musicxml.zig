@@ -347,11 +347,23 @@ fn writeTrack(builder: *Builder, segments: []const Segment, staff: usize, voice:
         if (group_start > cursor) try builder.print("      <forward><duration>{d}</duration></forward>\n", .{group_start - cursor});
         var group_end = index + 1;
         while (group_end < segments.len and segments[group_end].start_tick == group_start) : (group_end += 1) {}
+        var performed_velocity: ?u8 = null;
+        var visible_dynamic: u8 = 0;
         for (segments[index..group_end]) |segment| {
-            const dynamic_code = if (segment.original_start) model.dynamic(segment.note.flags) else 0;
-            if (dynamicName(dynamic_code)) |name| {
-                try builder.print("      <direction placement=\"below\"><direction-type><dynamics><{s}/></dynamics></direction-type></direction>\n", .{name});
-                break;
+            if (!segment.original_start or (segment.note.flags & model.note_flag_rest) != 0) continue;
+            performed_velocity = if (performed_velocity) |current| @max(current, segment.note.velocity) else segment.note.velocity;
+            if (visible_dynamic == 0) visible_dynamic = model.dynamic(segment.note.flags);
+        }
+        if (performed_velocity) |velocity| {
+            const percent = @as(f32, @floatFromInt(velocity)) * 100.0 / 90.0;
+            if (dynamicName(visible_dynamic)) |name| {
+                try builder.print("      <direction placement=\"below\"><direction-type><dynamics><{s}/></dynamics></direction-type><sound dynamics=\"{d:.3}\"/></direction>\n", .{ name, percent });
+            } else {
+                // MusicXML carries performed velocity on <sound dynamics> as
+                // a percentage of the standard MIDI velocity 90. The hidden
+                // direction preserves nuanced sampler playback without
+                // cluttering the engraved page with a mark at every attack.
+                try builder.print("      <direction print-object=\"no\"><direction-type><other-direction print-object=\"no\">performance</other-direction></direction-type><sound dynamics=\"{d:.3}\"/></direction>\n", .{percent});
             }
         }
         for (segments[index..group_end], 0..) |segment, chord_index| try writeNote(builder, segment, staff, voice, chord_index != 0);
@@ -567,6 +579,7 @@ test "exports preserved flat spelling engraving and semantic spanners" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "<beam number=\"1\">begin</beam>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<tie type=\"start\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<dynamics><mf/></dynamics>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<sound dynamics=\"100.000\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<actual-notes>3</actual-notes><normal-notes>2</normal-notes>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<slur type=\"start\" placement=\"above\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<staccato/><accent/>") != null);
@@ -576,6 +589,8 @@ test "exports preserved flat spelling engraving and semantic spanners" {
     try std.testing.expectEqual(@as(i8, -1), imported.notes[0].written_alter);
     try std.testing.expectEqual(@as(u8, 1), imported.notes[0].dots);
     try std.testing.expectEqual(model.dynamic_mf, model.dynamic(imported.notes[0].flags));
+    try std.testing.expectEqual(@as(u8, 90), imported.notes[0].velocity);
+    try std.testing.expectEqual(@as(u8, 90), imported.notes[1].velocity);
     try std.testing.expectEqual(@as(u8, 4), imported.notes[0].fingering);
     try std.testing.expectEqual(@as(u8, 3), model.tupletActual(imported.notes[0].flags));
     try std.testing.expect((imported.notes[0].flags & model.note_flag_slur_start) != 0);

@@ -34,6 +34,9 @@ This document started as the architecture plan and now also records the working 
 - A signed macOS `.app` using Dawn/Metal, CoreAudio/AudioUnit, CoreMIDI, AudioQueue microphone capture, native import/export panels, app-support autosave, and WAV take replay.
 - Debug/native recovery uses a separate atomic `autosave-dev.score` journal:
   it survives a hot-reload host relaunch without racing older release windows.
+  Debug-control imports synchronously replace that atomic journal before the
+  command succeeds, so a subsequent host rebuild cannot restore the score that
+  preceded the import.
   Cold-restart QA recovers the current private 193-measure score at exactly
   2,739 events and an explicit quarter-note pulse of 147 BPM.
 - The current ignored private MXL contains a two-staff piano reduction plus a
@@ -64,6 +67,34 @@ This document started as the architecture plan and now also records the working 
   overloads, and passes the mechanical playability audit. It remains
   `REVIEW_REQUIRED`; these detector metrics do not replace a musician ear and
   piano pass, and the canonical private MXL is unchanged.
+- MusicXML performance dynamics retain exact per-onset velocity rather than
+  being flattened to `p`/`mf`/`f`: export writes standard `<sound dynamics>`
+  percentages and import gives those values precedence over the visible
+  dynamic glyph. The current v10 opening candidate derives a restrained 52..93
+  MIDI contour (37 distinct levels) from the retained source-audio envelope,
+  preserves all 14 pedal events at 72/127, and renders its 192 attacks at
+  -17.66 dBFS with zero sampler overloads. The Zig workbench's performance
+  comparator independently measures normalized envelope, attack and sustain
+  correlations plus onset matching. Against the former flat-velocity render,
+  v10 improves those correlations from 0.311/0.294/0.660 to
+  0.546/0.535/0.665, onset precision from 0.690 to 0.702, and normalized
+  envelope error from 0.309 to 0.241. This repairs playback expression; it
+  does not turn the still-unpromoted candidate into a certified transcription.
+  A native autosave-recovery/export round trip preserves all 195 measures,
+  2,760 events, 37 instrumental velocity levels, 14 pedal events, and the
+  56.693% MusicXML damper value.
+- Full-score expression no longer assumes that 790 score beats map rigidly onto
+  the 332.7-second retained recording. The Zig workbench rebases the original
+  193-measure timing ledger onto the two inserted opening measures, yielding
+  195 anchors: new measures 1..14 end at 32.653 seconds and original measure 13
+  resumes as measure 15 at 33.250 seconds. Anchor-aware shaping changes only
+  performed velocity for the remaining 1,473 attacks. On complete matched
+  renders, v11 improves envelope/attack/sustain correlations from
+  0.243/0.233/0.192 to 0.718/0.697/0.666 and reduces normalized envelope error
+  from 0.310 to 0.179. The 1,665-note render has zero overloads; native
+  autosave/export recovery preserves all 40 velocity levels (52..94) and 14
+  pedal events. Notes and the separate vocal guide remain subject to the
+  measure-by-measure professional transcription gate.
 - Debug audio evidence keeps its fixed-capacity score report on the heap, so a
   full-length WAV and MXL can be compared without overflowing the macOS Debug
   stack. Debug seek also leaves stale loop ranges and reports loop bounds;
