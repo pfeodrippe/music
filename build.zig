@@ -55,17 +55,25 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(dev_controller);
     }
 
-    const audio_analyzer = b.addExecutable(.{
-        .name = "score-audio-analyze",
+    // One score workbench with subcommands replaces a growing collection of
+    // narrow, song-specific scripts. Keep exchange-format transformations in
+    // Zig so the exact same semantic core is exercised by tooling and app.
+    const score_workbench = b.addExecutable(.{
+        .name = "score-workbench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tools/analyze_audio.zig"),
+            .root_source_file = b.path("src/tools/score_workbench.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "score", .module = score }},
         }),
     });
-    b.installArtifact(audio_analyzer);
-    const audio_analyzer_run = b.addRunArtifact(audio_analyzer);
+    b.installArtifact(score_workbench);
+    const score_workbench_run = b.addRunArtifact(score_workbench);
+    if (b.args) |args| score_workbench_run.addArgs(args);
+    const score_workbench_step = b.step("score-workbench", "Inspect and transform scores with the shared Zig semantic core");
+    score_workbench_step.dependOn(&score_workbench_run.step);
+    const audio_analyzer_run = b.addRunArtifact(score_workbench);
+    audio_analyzer_run.addArg("audio-evidence");
     if (b.args) |args| audio_analyzer_run.addArgs(args);
     const audio_analyzer_step = b.step("audio-analyze", "Analyze a local WAV and optionally compare it with MusicXML/MXL");
     audio_analyzer_step.dependOn(&audio_analyzer_run.step);
@@ -76,10 +84,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "score", .module = score }},
     });
-    const sampler_renderer = b.addExecutable(.{
-        .name = "score-sampler-render",
+    const sampler_workbench = b.addExecutable(.{
+        .name = "score-sampler-workbench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tools/render_sampler.zig"),
+            .root_source_file = b.path("src/tools/sampler_workbench.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -88,30 +96,17 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    sampler_renderer.step.dependOn(&sfizz_cmd.step);
-    b.installArtifact(sampler_renderer);
-    const sampler_renderer_run = b.addRunArtifact(sampler_renderer);
+    sampler_workbench.step.dependOn(&sfizz_cmd.step);
+    b.installArtifact(sampler_workbench);
+    const sampler_renderer_run = b.addRunArtifact(sampler_workbench);
     sampler_renderer_run.step.dependOn(&sfizz_cmd.step);
+    sampler_renderer_run.addArg("render");
     if (b.args) |args| sampler_renderer_run.addArgs(args);
     const sampler_renderer_step = b.step("sampler-render", "Render an offline SFZ grand-piano verification WAV");
     sampler_renderer_step.dependOn(&sampler_renderer_run.step);
-
-    const sampler_verifier = b.addExecutable(.{
-        .name = "score-sampler-verify",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tools/verify_sampler.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "score", .module = score },
-                .{ .name = "sfizz_sampler", .module = sampler_module },
-            },
-        }),
-    });
-    sampler_verifier.step.dependOn(&sfizz_cmd.step);
-    b.installArtifact(sampler_verifier);
-    const sampler_verifier_run = b.addRunArtifact(sampler_verifier);
+    const sampler_verifier_run = b.addRunArtifact(sampler_workbench);
     sampler_verifier_run.step.dependOn(&sfizz_cmd.step);
+    sampler_verifier_run.addArg("verify");
     if (b.args) |args| sampler_verifier_run.addArgs(args);
     const sampler_verifier_step = b.step("sampler-verify", "Run offline grand-piano dynamics, pedal, overload, and queue gates");
     sampler_verifier_step.dependOn(&sampler_verifier_run.step);
@@ -194,8 +189,18 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = score });
     const run_tests = b.addRunArtifact(tests);
+    const workbench_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/score_workbench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "score", .module = score }},
+        }),
+    });
+    const run_workbench_tests = b.addRunArtifact(workbench_tests);
     const test_step = b.step("test", "Run portable engine tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_workbench_tests.step);
 
     const web_step = b.step("web", "Build the Wasm/WebGPU export with Emscripten");
     const web_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-web.sh" });

@@ -3,7 +3,11 @@ zig-out/
 build/
 zig-pkg/
 .DS_Store
+__pycache__/
+*.py[cod]
 tests/fixtures/licensed/*
 !tests/fixtures/licensed/.gitkeep
 captures/
 local-content/
+output/
+tmp/

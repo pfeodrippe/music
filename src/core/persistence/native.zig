@@ -5,7 +5,7 @@ const musicxml = @import("../import/musicxml.zig");
 const recording = @import("../recording.zig");
 
 pub const magic = "SCOREAPP";
-pub const current_version: u32 = 12;
+pub const current_version: u32 = 15;
 const header_size = 20;
 
 pub const Snapshot = struct {
@@ -21,6 +21,9 @@ pub const Snapshot = struct {
     pedal_count: usize = 0,
     measures: [musicxml.max_import_measures]model.Measure = undefined,
     measure_count: usize = 0,
+    tempos: [model.max_tempo_events]model.TempoEvent = undefined,
+    tempo_count: usize = 0,
+    tempo_base_bpm: f32 = 72,
     annotations: annotation.Store = .{},
     take: recording.Take = .{},
 };
@@ -37,6 +40,7 @@ pub const Error = error{
     TooManyHarmonies,
     TooManyPedals,
     TooManyMeasures,
+    TooManyTempos,
     TooManyStrokes,
     TooManyPoints,
     TooManyMidiEvents,
@@ -95,7 +99,7 @@ pub fn encode(snapshot: *const Snapshot, output: []u8) Error!usize {
     notation[0] = snapshot.meta.beats_per_measure;
     notation[1] = snapshot.meta.beat_unit;
     notation[2] = @bitCast(snapshot.meta.key_fifths);
-    notation[3] = 0;
+    notation[3] = @max(@as(u8, 1), snapshot.meta.tempo_beat_unit);
     try writer.u32(snapshot.transport.metronome_enabled);
     try writer.u32(@intCast(snapshot.lyric_count));
     for (snapshot.lyrics[0..snapshot.lyric_count]) |lyric| {
@@ -136,6 +140,12 @@ pub fn encode(snapshot: *const Snapshot, output: []u8) Error!usize {
         fields[1] = measure.beat_unit;
         fields[2] = measure.implicit;
         fields[3] = measure.reserved;
+    }
+    try writer.f32(snapshot.tempo_base_bpm);
+    try writer.u32(@intCast(snapshot.tempo_count));
+    for (snapshot.tempos[0..snapshot.tempo_count]) |tempo| {
+        try writer.f32(tempo.start_beat);
+        try writer.f32(tempo.bpm);
     }
 
     const payload = output[header_size..writer.offset];
@@ -216,6 +226,7 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
         snapshot.meta.beats_per_measure = notation[0];
         snapshot.meta.beat_unit = notation[1];
         snapshot.meta.key_fifths = @bitCast(notation[2]);
+        snapshot.meta.tempo_beat_unit = if (version >= 14 and notation[3] != 0) notation[3] else 4;
     }
     if (version >= 5) snapshot.transport.metronome_enabled = try reader.u32();
     if (version >= 6) {
@@ -269,6 +280,18 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
             measure.reserved = fields[3];
         }
     }
+    if (version >= 13) {
+        snapshot.tempo_base_bpm = try reader.f32();
+        snapshot.tempo_count = try reader.u32();
+        if (snapshot.tempo_count > snapshot.tempos.len) return error.TooManyTempos;
+        for (snapshot.tempos[0..snapshot.tempo_count]) |*tempo| {
+            tempo.* = .{ .start_beat = try reader.f32(), .bpm = try reader.f32() };
+        }
+    } else {
+        snapshot.tempo_base_bpm = snapshot.transport.tempo_bpm;
+        snapshot.tempo_count = 1;
+        snapshot.tempos[0] = .{ .start_beat = 0, .bpm = snapshot.transport.tempo_bpm };
+    }
     snapshot.annotations.next_id = 1;
     for (snapshot.annotations.strokes[0..snapshot.annotations.stroke_count]) |stroke| snapshot.annotations.next_id = @max(snapshot.annotations.next_id, stroke.stable_id + 1);
     if (reader.offset != payload.len) return error.InvalidData;
@@ -317,8 +340,13 @@ const Writer = struct {
         spelling[1] = @bitCast(value.written_alter);
         spelling[2] = @bitCast(value.written_octave);
         spelling[3] = value.dots;
-        try self.u32(value.selected);
+        try self.u32(@intCast(value.selected));
         try self.u32(value.flags);
+        const technique = try self.reserve(4);
+        technique[0] = value.fingering;
+        technique[1] = 0;
+        technique[2] = 0;
+        technique[3] = 0;
     }
 };
 
@@ -357,6 +385,7 @@ const Reader = struct {
         const spelling = if (version >= 9) try self.take(4) else null;
         const selected = try self.u32();
         const flags = if (version >= 7) try self.u32() else 0;
+        const technique = if (version >= 15) try self.take(4) else null;
         return .{
             .stable_id = stable_id,
             .start_beat = start,
@@ -369,8 +398,9 @@ const Reader = struct {
             .written_alter = if (spelling) |value| @bitCast(value[1]) else 0,
             .written_octave = if (spelling) |value| @bitCast(value[2]) else -1,
             .dots = if (spelling) |value| value[3] else 0,
-            .selected = selected,
+            .selected = if (selected != 0) 1 else 0,
             .flags = flags,
+            .fingering = if (technique) |value| if (value[0] >= 1 and value[0] <= 5) value[0] else 0 else 0,
         };
     }
 };
@@ -390,9 +420,10 @@ test "native document round trips notes, transport and anchored ink" {
     defer std.testing.allocator.destroy(snapshot);
     snapshot.* = .{};
     snapshot.meta.setTitle("Round Trip");
+    snapshot.meta.tempo_beat_unit = 8;
     snapshot.transport.tempo_bpm = 84;
     snapshot.transport.metronome_enabled = 0;
-    snapshot.notes[0] = .{ .stable_id = 9, .start_beat = 1.5, .duration_beats = 0.75, .pitch = 63, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'E', .written_alter = -1, .written_octave = 4, .dots = 1, .flags = model.note_flag_beam_begin | model.note_flag_tie_start };
+    snapshot.notes[0] = .{ .stable_id = 9, .start_beat = 1.5, .duration_beats = 0.75, .pitch = 63, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'E', .written_alter = -1, .written_octave = 4, .dots = 1, .flags = model.note_flag_beam_begin | model.note_flag_tie_start, .fingering = 4 };
     snapshot.note_count = 1;
     snapshot.lyrics[0] = .{ .start_beat = 1.5 };
     snapshot.lyrics[0].setText("sing this");
@@ -406,7 +437,11 @@ test "native document round trips notes, transport and anchored ink" {
     snapshot.measures[0] = .{ .start_beat = 0, .duration_beats = 1, .number = 0, .beats = 4, .beat_unit = 4, .implicit = 1 };
     snapshot.measures[1] = .{ .start_beat = 1, .duration_beats = 2, .number = 1, .beats = 2, .beat_unit = 4 };
     snapshot.measure_count = 2;
-    snapshot.annotations.begin(.{ .u = 0.2, .v = 0.3, .pressure = 0.8, .time_ms = 10 }, 1);
+    snapshot.tempo_base_bpm = 120;
+    snapshot.tempos[0] = .{ .start_beat = 0, .bpm = 120 };
+    snapshot.tempos[1] = .{ .start_beat = 2, .bpm = 108 };
+    snapshot.tempo_count = 2;
+    snapshot.annotations.beginScore(.{ .u = 12.5, .v = 0.3, .pressure = 0.8, .time_ms = 10 }, 1);
     snapshot.annotations.end();
     var bytes: [4096]u8 = undefined;
     const len = try encode(snapshot, &bytes);
@@ -414,11 +449,13 @@ test "native document round trips notes, transport and anchored ink" {
     defer std.testing.allocator.destroy(decoded);
     try decode(bytes[0..len], decoded);
     try std.testing.expectEqualStrings("Round Trip", decoded.meta.titleSlice());
+    try std.testing.expectEqual(@as(u8, 8), decoded.meta.tempo_beat_unit);
     try std.testing.expectEqual(@as(u8, 63), decoded.notes[0].pitch);
     try std.testing.expectEqual(@as(u8, 'E'), decoded.notes[0].written_step);
     try std.testing.expectEqual(@as(i8, -1), decoded.notes[0].written_alter);
     try std.testing.expectEqual(@as(i8, 4), decoded.notes[0].written_octave);
     try std.testing.expectEqual(@as(u8, 1), decoded.notes[0].dots);
+    try std.testing.expectEqual(@as(u8, 4), decoded.notes[0].fingering);
     try std.testing.expect((decoded.notes[0].flags & model.note_flag_tie_start) != 0);
     try std.testing.expectEqualStrings("sing this", decoded.lyrics[0].textSlice());
     try std.testing.expectEqual(@as(usize, 1), decoded.harmony_count);
@@ -431,8 +468,13 @@ test "native document round trips notes, transport and anchored ink" {
     try std.testing.expectEqual(@as(u32, 0), decoded.measures[0].number);
     try std.testing.expectEqual(@as(u8, 1), decoded.measures[0].implicit);
     try std.testing.expectEqual(@as(u8, 2), decoded.measures[1].beats);
+    try std.testing.expectEqual(@as(usize, 2), decoded.tempo_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), decoded.tempo_base_bpm, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 108), decoded.tempos[1].bpm, 0.001);
     try std.testing.expectEqual(@as(usize, 1), decoded.annotations.point_count);
-    try std.testing.expectEqual(@as(u32, 1), decoded.annotations.strokes[0].page_index);
+    try std.testing.expect(annotation.isScoreSpace(decoded.annotations.strokes[0]));
+    try std.testing.expectEqual(@as(u32, 1), annotation.pageIndex(decoded.annotations.strokes[0]));
+    try std.testing.expectApproxEqAbs(@as(f32, 12.5), decoded.annotations.points[0].u, 0.001);
     try std.testing.expectEqual(@as(u32, 0), decoded.transport.metronome_enabled);
 }
 
@@ -453,6 +495,38 @@ test "native document persists synchronized MIDI take metadata" {
     try std.testing.expectEqual(@as(u8, 67), decoded.take.midi[0].data1);
     try std.testing.expectEqual(@as(u8, 2), decoded.take.midi[0].channel);
     try std.testing.expectApproxEqAbs(@as(f32, 93.5), decoded.take.tempo_bpm, 0.001);
+}
+
+test "version 14 native documents migrate with automatic fingering" {
+    const snapshot = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(snapshot);
+    snapshot.* = .{};
+    snapshot.notes[0] = .{ .stable_id = 3, .start_beat = 2, .duration_beats = 1, .pitch = 65, .velocity = 80, .staff = 0, .voice = 0, .fingering = 5 };
+    snapshot.note_count = 1;
+    var bytes: [4096]u8 = undefined;
+    const encoded_len = try encode(snapshot, &bytes);
+
+    var note_start: usize = header_size;
+    for (0..2) |_| {
+        const text_len: usize = readInt(u32, bytes[note_start .. note_start + 4]);
+        note_start += 4 + text_len;
+    }
+    note_start += 8 + 16 + 16;
+    try std.testing.expectEqual(@as(u32, 1), readInt(u32, bytes[note_start .. note_start + 4]));
+    note_start += 4;
+    const technique_start = note_start + 32;
+    std.mem.copyForwards(u8, bytes[technique_start .. encoded_len - 4], bytes[technique_start + 4 .. encoded_len]);
+    const legacy_len = encoded_len - 4;
+    writeInt(u32, bytes[8..12], 14);
+    writeInt(u32, bytes[12..16], @intCast(legacy_len - header_size));
+    writeInt(u32, bytes[16..20], std.hash.crc.Crc32.hash(bytes[header_size..legacy_len]));
+
+    const decoded = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(decoded);
+    try decode(bytes[0..legacy_len], decoded);
+    try std.testing.expectEqual(@as(usize, 1), decoded.note_count);
+    try std.testing.expectEqual(@as(u8, 65), decoded.notes[0].pitch);
+    try std.testing.expectEqual(@as(u8, 0), decoded.notes[0].fingering);
 }
 
 test "checksum rejects torn journals" {

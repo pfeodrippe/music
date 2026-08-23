@@ -43,7 +43,29 @@ fn advance(context: *hot.SystemContext) callconv(.c) void {
     for (0..context.entity_count) |index| {
         const transport = &transports[index];
         if (transport.playing == 0) continue;
-        transport.cursor_beat += context.delta_seconds * transport.tempo_bpm / 60.0;
+        var remaining_seconds = @max(0, context.delta_seconds);
+        // Consume the host frame in authored-tempo slices. This is exact at a
+        // tempo boundary even when a large debug frame crosses several events.
+        while (remaining_seconds > 0.000001) {
+            const effective_bpm = model.effectiveTempoAt(&bounds[index], transport, transport.cursor_beat);
+            var next_beat = bounds[index].end_beat;
+            const tempo_count = @min(@as(usize, bounds[index].tempo_count), bounds[index].tempos.len);
+            for (bounds[index].tempos[0..tempo_count]) |event| {
+                if (event.start_beat > transport.cursor_beat + 0.0001) {
+                    next_beat = @min(next_beat, event.start_beat);
+                    break;
+                }
+            }
+            const beats_available = @max(0, next_beat - transport.cursor_beat);
+            const seconds_available = beats_available * 60.0 / effective_bpm;
+            if (seconds_available <= 0.000001 or remaining_seconds < seconds_available) {
+                transport.cursor_beat += remaining_seconds * effective_bpm / 60.0;
+                remaining_seconds = 0;
+            } else {
+                transport.cursor_beat = next_beat;
+                remaining_seconds -= seconds_available;
+            }
+        }
         if (transport.loop_enabled != 0 and transport.cursor_beat >= transport.loop_end) {
             transport.cursor_beat = transport.loop_start + @mod(transport.cursor_beat - transport.loop_start, transport.loop_end - transport.loop_start);
         } else if (transport.loop_enabled == 0 and transport.cursor_beat >= bounds[index].end_beat) {

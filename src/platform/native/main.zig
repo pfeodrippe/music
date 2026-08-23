@@ -4,7 +4,8 @@ const zglfw = @import("zglfw");
 const zgpu = @import("zgpu");
 const wgpu = zgpu.wgpu;
 const build_options = @import("build_options");
-const SfizzSampler = @import("sfizz_sampler.zig").Sampler;
+const sfizz_sampler = @import("sfizz_sampler.zig");
+const SfizzSampler = sfizz_sampler.Sampler;
 const dev_control = @import("dev_control.zig");
 
 const native_c = @cImport({
@@ -501,7 +502,8 @@ const Renderer = struct {
     }
 
     /// Debug-only visual QA path. The same WebGPU/Metal pipeline is rendered
-    /// into a copyable BGRA texture, read back, and written as a top-down BMP.
+    /// into a copyable BGRA texture, read back, and written as a top-down BMP;
+    /// the Debug command rejects extensions that would mislabel this encoding.
     /// This is a capture of the real GPU result, never a software renderer.
     fn captureBmp(self: *Renderer, app: *const score.App, logical_size: [2]i32, scale: [2]f32, time: f32, path: [*:0]const u8) !void {
         if (!build_options.hot_reload) return error.DebugCaptureUnavailable;
@@ -705,10 +707,7 @@ pub fn main(init: std.process.Init) !void {
     // The reference Salamander/Accurate-Salamander profiles document these
     // controls as sampled release, hammer noise, pedal mechanics, and damper
     // resonance. Other SFZ instruments safely ignore unbound controllers.
-    sampler.controlChange(0, 20, 64);
-    sampler.controlChange(0, 21, 64);
-    sampler.controlChange(0, 22, 64);
-    sampler.controlChange(0, 23, 64);
+    sampler.applyPianoDetailProfile(.studio);
     const audio_output = native_c.score_audio_output_start(audioRender, sampler);
     defer native_c.score_audio_output_stop(audio_output);
     const midi_service = native_c.score_midi_create();
@@ -764,7 +763,7 @@ pub fn main(init: std.process.Init) !void {
         const scale = window.getContentScale();
         reloader.poll(app, now);
         shader_reloader.poll(app, &renderer, now);
-        if (dev_server) |*server| pumpDevControl(server, app, sampler, instrument_path, &reloader, &shader_reloader, &renderer, logical_size, scale, @floatCast(now));
+        if (dev_server) |*server| pumpDevControl(server, app, sampler, instrument_path, &reloader, &shader_reloader, &renderer, window, logical_size, scale, @floatCast(now));
         switch (app.takeHostRequest()) {
             .open_score => {
                 const selected = native_c.score_open_score_panel();
@@ -831,7 +830,7 @@ fn readableFile(path: [*:0]const u8) bool {
     return true;
 }
 
-fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzSampler, instrument_path: []const u8, reloader: *DevReloader, shader_reloader: *DevShaderReloader, renderer: *Renderer, logical_size: [2]i32, scale: [2]f32, time: f32) void {
+fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzSampler, instrument_path: []const u8, reloader: *DevReloader, shader_reloader: *DevShaderReloader, renderer: *Renderer, window: *zglfw.Window, logical_size: [2]i32, scale: [2]f32, time: f32) void {
     var command_buffer: [dev_control.max_command_bytes]u8 = undefined;
     const client = server.poll(&command_buffer) orelse return;
     const command = std.mem.trim(u8, command_buffer[0..client.command_len], " \t\r\n");
@@ -850,14 +849,39 @@ fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzS
             hostDevResponse(&response, "ok shader_generation={d} last_good=1 error=none", .{renderer.shader_generation})
         else
             hostDevResponse(&response, "ok shader_generation={d} last_good=1 error={s}", .{ renderer.shader_generation, message });
+    } else if (std.mem.startsWith(u8, command, "window ")) {
+        if (parseWindowSize(std.mem.trim(u8, command[7..], " \t\r\n"))) |size| {
+            window.setSize(size[0], size[1]);
+            response_len = hostDevResponse(&response, "ok window={d}x{d}", .{ size[0], size[1] });
+        } else {
+            response_len = hostDevResponse(&response, "error usage: window WIDTH HEIGHT (720..3840 x 540..2160)", .{});
+        }
     } else if (std.mem.eql(u8, command, "sampler state")) {
-        response_len = hostDevResponse(&response, "ok regions={d} preloaded={d} dropped={d} overloaded={d} instrument={s}", .{
+        const detail = sampler.pianoDetailProfile();
+        response_len = hostDevResponse(&response, "ok regions={d} preloaded={d} dropped={d} overloaded={d} release={d} hammer={d} pedal_noise={d} resonance={d} instrument={s}", .{
             sampler.region_count,
             sampler.preloaded_sample_count,
             sampler.droppedEventCount(),
             sampler.overloadedSampleCount(),
+            detail.sampled_release,
+            detail.hammer_noise,
+            detail.pedal_noise,
+            detail.pedal_resonance,
             instrument_path,
         });
+    } else if (std.mem.startsWith(u8, command, "sampler detail ")) {
+        const argument = std.mem.trim(u8, command[15..], " \t\r\n");
+        if (parseSamplerDetail(argument)) |profile| {
+            sampler.applyPianoDetailProfile(profile);
+            response_len = hostDevResponse(&response, "ok sampler detail queued release={d} hammer={d} pedal_noise={d} resonance={d}", .{
+                profile.sampled_release,
+                profile.hammer_noise,
+                profile.pedal_noise,
+                profile.pedal_resonance,
+            });
+        } else {
+            response_len = hostDevResponse(&response, "error usage: sampler detail studio|dry|RELEASE HAMMER PEDAL_NOISE RESONANCE (0..127)", .{});
+        }
     } else if (std.mem.startsWith(u8, command, "midi ")) {
         response_len = app.runDevCommand(command, &response);
         if (std.mem.startsWith(u8, response[0..response_len], "ok ")) dispatchDevMidi(sampler, command[5..]);
@@ -903,7 +927,9 @@ fn pumpDevControl(server: *dev_control.Server, app: *score.App, sampler: *SfizzS
     } else if (build_options.hot_reload and std.mem.startsWith(u8, command, "capture ")) {
         const path = std.mem.trim(u8, command[8..], " \t\r\n");
         var path_buffer: [std.fs.max_path_bytes:0]u8 = [_:0]u8{0} ** std.fs.max_path_bytes;
-        if (path.len >= path_buffer.len) {
+        if (!std.mem.endsWith(u8, path, ".bmp")) {
+            response_len = hostDevResponse(&response, "error native GPU capture must use a .bmp path", .{});
+        } else if (path.len >= path_buffer.len) {
             response_len = hostDevResponse(&response, "error capture path is too long", .{});
         } else {
             @memcpy(path_buffer[0..path.len], path);
@@ -933,6 +959,31 @@ fn dispatchDevMidi(sampler: *SfizzSampler, argument: []const u8) void {
     } else if (message == 0xb0) {
         sampler.controlChange(channel, data1, data2);
     }
+}
+
+fn parseSamplerDetail(argument: []const u8) ?sfizz_sampler.PianoDetailProfile {
+    if (std.mem.eql(u8, argument, "studio")) return .studio;
+    if (std.mem.eql(u8, argument, "dry")) return .dry;
+    var fields = std.mem.tokenizeAny(u8, argument, " \t");
+    const sampled_release = std.fmt.parseInt(u8, fields.next() orelse return null, 10) catch return null;
+    const hammer_noise = std.fmt.parseInt(u8, fields.next() orelse return null, 10) catch return null;
+    const pedal_noise = std.fmt.parseInt(u8, fields.next() orelse return null, 10) catch return null;
+    const pedal_resonance = std.fmt.parseInt(u8, fields.next() orelse return null, 10) catch return null;
+    if (fields.next() != null or sampled_release > 127 or hammer_noise > 127 or pedal_noise > 127 or pedal_resonance > 127) return null;
+    return .{
+        .sampled_release = sampled_release,
+        .hammer_noise = hammer_noise,
+        .pedal_noise = pedal_noise,
+        .pedal_resonance = pedal_resonance,
+    };
+}
+
+fn parseWindowSize(argument: []const u8) ?[2]i32 {
+    var fields = std.mem.tokenizeAny(u8, argument, " \t");
+    const width = std.fmt.parseInt(i32, fields.next() orelse return null, 10) catch return null;
+    const height = std.fmt.parseInt(i32, fields.next() orelse return null, 10) catch return null;
+    if (fields.next() != null or width < 720 or width > 3840 or height < 540 or height > 2160) return null;
+    return .{ width, height };
 }
 
 fn hostDevResponse(output: []u8, comptime format: []const u8, arguments: anytype) usize {
@@ -1081,7 +1132,7 @@ fn readWholeFile(allocator: std.mem.Allocator, path: [*:0]const u8) ![]u8 {
 
 fn loadAutosave(app: *score.App, allocator: std.mem.Allocator) void {
     var path_buffer: [4096]u8 = undefined;
-    const path = appDataPath(&path_buffer, "autosave.score") catch return;
+    const path = appDataPath(&path_buffer, autosaveBasename()) catch return;
     const bytes = readWholeFile(allocator, path.ptr) catch return;
     defer allocator.free(bytes);
     app.deserialize(bytes) catch |err| {
@@ -1097,11 +1148,11 @@ fn saveAutosave(app: *const score.App, allocator: std.mem.Allocator) !void {
     defer allocator.free(bytes);
     const len = try app.serialize(bytes);
     var temporary_name_buffer: [64]u8 = undefined;
-    const temporary_name = try std.fmt.bufPrint(&temporary_name_buffer, "autosave.score.{d}.tmp", .{native_c.getpid()});
+    const temporary_name = try std.fmt.bufPrint(&temporary_name_buffer, "{s}.{d}.tmp", .{ autosaveBasename(), native_c.getpid() });
     var temporary_buffer: [4096]u8 = undefined;
     var destination_buffer: [4096]u8 = undefined;
     const temporary = try appDataPath(&temporary_buffer, temporary_name);
-    const destination = try appDataPath(&destination_buffer, "autosave.score");
+    const destination = try appDataPath(&destination_buffer, autosaveBasename());
     errdefer _ = native_c.unlink(temporary.ptr);
     const file = native_c.fopen(temporary.ptr, "wb") orelse return error.OpenFailed;
     if (native_c.fwrite(bytes.ptr, 1, len, file) != len) {
@@ -1115,6 +1166,13 @@ fn saveAutosave(app: *const score.App, allocator: std.mem.Allocator) !void {
     _ = native_c.fsync(native_c.fileno(file));
     if (native_c.fclose(file) != 0) return error.CloseFailed;
     if (native_c.rename(temporary.ptr, destination.ptr) != 0) return error.RenameFailed;
+}
+
+fn autosaveBasename() []const u8 {
+    // Development builds may coexist with older release/native windows while the
+    // hot-reload watcher restarts this process. Keep their recovery journals
+    // independent so those windows cannot overwrite the score under test.
+    return if (build_options.hot_reload) "autosave-dev.score" else "autosave.score";
 }
 
 fn appDataPath(buffer: *[4096]u8, basename: []const u8) ![:0]u8 {

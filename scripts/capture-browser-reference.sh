@@ -10,12 +10,16 @@ Capture authorized browser/app playback through BlackHole and analyze it.
 Options:
   --duration SECONDS    Capture length (default: 60)
   --settle SECONDS      Allow apps to follow the device change (default: 3)
-  --device NAME         Loopback device (default: BlackHole 16ch)
+  --device NAME         Loopback input device (default: BlackHole 16ch)
+  --output-device NAME  macOS output route (default: same as --device)
   --score PATH          Compare against a MusicXML or MXL score
   --report PATH         Analysis JSON path (default: OUTPUT.analysis.json)
   --no-analyze          Capture only
 
 Start playback immediately after this command reports "CAPTURE READY".
+If Chrome does not follow a default-output change while paused, keep the track
+playing before launch and restart it (without pausing) at "CAPTURE READY"; the
+resulting short routing pre-roll must be trimmed/aligned before acceptance.
 The previous macOS output device is restored on success, failure, or interruption.
 Only capture material you are authorized to analyze; keep private references ignored.
 EOF
@@ -36,6 +40,7 @@ shift
 duration=60
 settle=3
 capture_device='BlackHole 16ch'
+output_device=
 score_path=
 report_path=
 analyze=1
@@ -50,6 +55,11 @@ while [ "$#" -gt 0 ]; do
         --device)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             capture_device=$2
+            shift 2
+            ;;
+        --output-device)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            output_device=$2
             shift 2
             ;;
         --settle)
@@ -83,6 +93,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ -z "$output_device" ]; then
+    output_device=$capture_device
+fi
+
 case "$duration" in
     ''|*[!0-9.]*)
         printf 'duration must be a positive number: %s\n' "$duration" >&2
@@ -103,6 +117,10 @@ fi
 
 command -v ffmpeg >/dev/null 2>&1 || {
     printf 'ffmpeg is required for loopback capture\n' >&2
+    exit 3
+}
+command -v ffprobe >/dev/null 2>&1 || {
+    printf 'ffprobe is required to validate loopback capture duration\n' >&2
     exit 3
 }
 command -v clang >/dev/null 2>&1 || {
@@ -154,21 +172,55 @@ fi
 
 printf 'Original output: %s\n' "$original_output"
 printf 'Loopback input: %s (AVFoundation audio %s)\n' "$capture_device" "$capture_index"
-"$device_tool" set "$capture_device"
+printf 'Capture output route: %s\n' "$output_device"
+"$device_tool" set "$output_device" || {
+    printf 'CoreAudio output not found or could not be selected: %s\n' "$output_device" >&2
+    exit 4
+}
 printf 'Waiting %s seconds for audio applications to follow the output change...\n' "$settle"
 sleep "$settle"
 printf 'CAPTURE READY — start authorized playback now (%s seconds)\n' "$duration"
 
+# AVFoundation may not emit BlackHole packets for the first few seconds after
+# macOS changes the output route. Capture a bounded routing allowance, then
+# trim the accepted program material back to the exact requested duration.
+capture_wall_duration=$(awk -v requested="$duration" 'BEGIN { printf "%.3f", requested + 4.0 }')
+
 ffmpeg -hide_banner -loglevel warning \
     -f avfoundation -i ":$capture_index" \
-    -t "$duration" \
-    -filter_complex '[0:a]pan=stereo|c0=c0|c1=c1[a]' \
+    -t "$capture_wall_duration" \
+    -filter_complex '[0:a]asetpts=PTS-STARTPTS,pan=stereo|c0=c0|c1=c1[a]' \
     -map '[a]' -ar 44100 -c:a pcm_s24le "$output_path"
 
 restore_output
 trap - EXIT HUP INT TERM
 printf 'Restored output: %s\n' "$original_output"
 printf 'Captured: %s\n' "$output_path"
+
+actual_duration=$(ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$output_path")
+if [ -z "$actual_duration" ] || \
+    awk -v actual="$actual_duration" -v requested="$duration" \
+        'BEGIN { exit !(actual + 1.0 < requested) }'; then
+    printf 'capture ended early: requested %s seconds, received %s seconds; exclude this take and retry\n' \
+        "$duration" "${actual_duration:-unknown}" >&2
+    exit 5
+fi
+
+if awk -v actual="$actual_duration" -v requested="$duration" \
+    'BEGIN { exit !(actual > requested + 0.01) }'; then
+    trimmed_path="$output_path.trimmed-$$.wav"
+    if ! ffmpeg -hide_banner -loglevel warning -i "$output_path" \
+        -t "$duration" -ar 44100 -c:a pcm_s24le "$trimmed_path"; then
+        rm -f "$trimmed_path"
+        printf 'could not trim routing allowance from capture\n' >&2
+        exit 5
+    fi
+    mv "$trimmed_path" "$output_path"
+    actual_duration=$(ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$output_path")
+fi
+printf 'Capture duration: %.3f seconds (requested %s)\n' "$actual_duration" "$duration"
 
 peak_db=$(ffmpeg -hide_banner -i "$output_path" -af volumedetect -f null - 2>&1 | awk '/max_volume:/ { print $(NF - 1); exit }')
 if [ -z "$peak_db" ] || awk -v peak="$peak_db" 'BEGIN { exit !(peak <= -80) }'; then

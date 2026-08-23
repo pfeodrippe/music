@@ -52,6 +52,7 @@ pub fn write(
     harmonies: []const model.Harmony,
     pedals: []const model.PedalEvent,
     measures: []const model.Measure,
+    playback: *const model.PlaybackBounds,
 ) Error!usize {
     var builder = Builder{ .output = output };
     try builder.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -60,7 +61,6 @@ pub fn write(
     try builder.append("</work-title></work>\n  <identification><creator type=\"composer\">");
     try builder.escaped(meta.creatorSlice());
     try builder.append("</creator><encoding><software>Score</software></encoding></identification>\n");
-    try builder.append("  <part-list><score-part id=\"P1\"><part-name>Piano</part-name><score-instrument id=\"P1-I1\"><instrument-name>Acoustic Grand Piano</instrument-name></score-instrument><midi-instrument id=\"P1-I1\"><midi-channel>1</midi-channel><midi-program>1</midi-program></midi-instrument></score-part></part-list>\n  <part id=\"P1\">\n");
 
     const fallback_beats = @max(@as(u8, 1), meta.beats_per_measure);
     const fallback_beat_unit = @max(@as(u8, 1), meta.beat_unit);
@@ -78,102 +78,157 @@ pub fn write(
         if (max_end > authored_end + 0.0001) measure_count += @as(usize, @intFromFloat(@ceil((max_end - authored_end) / fallback_measure_beats)));
     }
 
-    var segments: [max_export_notes]Segment = undefined;
-    for (0..measure_count) |measure_index| {
-        const imported_measure = measure_index < measures.len;
-        const measure = if (imported_measure) measures[measure_index] else blk: {
-            const authored_end = if (measures.len != 0)
-                measures[measures.len - 1].start_beat + @max(0.0001, measures[measures.len - 1].duration_beats)
-            else
-                0;
-            const extension_index = measure_index - measures.len;
-            const number: u32 = if (measures.len != 0)
-                measures[measures.len - 1].number + @as(u32, @intCast(extension_index + 1))
-            else
-                @intCast(measure_index + 1);
-            break :blk model.Measure{
-                .start_beat = authored_end + @as(f32, @floatFromInt(extension_index)) * fallback_measure_beats,
-                .duration_beats = fallback_measure_beats,
-                .number = number,
-                .beats = fallback_beats,
-                .beat_unit = fallback_beat_unit,
-            };
-        };
-        try builder.print("    <measure number=\"{d}\"", .{measure.number});
-        if (measure.implicit != 0) try builder.append(" implicit=\"yes\"");
-        try builder.append(">\n");
-        const beats = @max(@as(u8, 1), measure.beats);
-        const beat_unit = @max(@as(u8, 1), measure.beat_unit);
-        if (measure_index == 0) {
-            try builder.print("      <attributes><divisions>{d}</divisions><key><fifths>{d}</fifths></key><time><beats>{d}</beats><beat-type>{d}</beat-type></time><staves>2</staves><clef number=\"1\"><sign>G</sign><line>2</line></clef><clef number=\"2\"><sign>F</sign><line>4</line></clef></attributes>\n", .{ divisions, meta.key_fifths, beats, beat_unit });
-            try builder.print("      <direction placement=\"above\"><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>{d}</per-minute></metronome></direction-type><sound tempo=\"{d}\"/></direction>\n", .{ @as(u32, @intFromFloat(@round(@max(1, transport.tempo_bpm)))), @as(u32, @intFromFloat(@round(@max(1, transport.tempo_bpm)))) });
-        } else {
-            const previous = if (measure_index - 1 < measures.len) measures[measure_index - 1] else model.Measure{ .beats = fallback_beats, .beat_unit = fallback_beat_unit };
-            if (beats != @max(@as(u8, 1), previous.beats) or beat_unit != @max(@as(u8, 1), previous.beat_unit)) {
-                try builder.print("      <attributes><time><beats>{d}</beats><beat-type>{d}</beat-type></time></attributes>\n", .{ beats, beat_unit });
-            }
-        }
+    const has_vocal_guide = for (notes) |note| {
+        if ((note.flags & model.note_flag_vocal_guide) != 0) break true;
+    } else false;
+    try builder.append("  <part-list><score-part id=\"P1\"><part-name>Piano</part-name><score-instrument id=\"P1-I1\"><instrument-name>Acoustic Grand Piano</instrument-name></score-instrument><midi-instrument id=\"P1-I1\"><midi-channel>1</midi-channel><midi-program>1</midi-program></midi-instrument></score-part>");
+    if (has_vocal_guide) try builder.append("<score-part id=\"P2\"><part-name>Vocal guide (optional)</part-name><score-instrument id=\"P2-I1\"><instrument-name>Voice guide</instrument-name></score-instrument></score-part>");
+    try builder.append("</part-list>\n");
 
-        const measure_ticks: i64 = @max(1, beatToTick(@max(0.0001, measure.duration_beats)));
-        const measure_start = beatToTick(@max(0, measure.start_beat));
-        const measure_end = measure_start + measure_ticks;
-        for (harmonies) |harmony| {
-            const harmony_tick = beatToTick(@max(0, harmony.start_beat));
-            if (harmony_tick < measure_start or harmony_tick >= measure_end) continue;
-            try writeHarmony(&builder, harmony, harmony_tick - measure_start);
-        }
-        for (lyrics) |lyric| {
-            const lyric_tick = beatToTick(@max(0, lyric.start_beat));
-            if (lyric_tick < measure_start or lyric_tick >= measure_end) continue;
-            try builder.append("      <direction placement=\"above\"><direction-type><words>");
-            try builder.escaped(lyric.textSlice());
-            try builder.append("</words></direction-type>");
-            try builder.print("<offset>{d}</offset></direction>\n", .{lyric_tick - measure_start});
-        }
-        for (pedals) |pedal| {
-            const pedal_tick = beatToTick(@max(0, pedal.start_beat));
-            if (pedal_tick < measure_start or pedal_tick >= measure_end) continue;
-            try writePedal(&builder, pedal, pedal_tick - measure_start);
-        }
-        var emitted_track = false;
-        var emitted_any_note = false;
-        var exported_voice: usize = 0;
-        // Imported MusicXML parts occupy disjoint internal staff namespaces
-        // (part_index * 8 + source staff).  Keep each exact source staff/voice
-        // pair as its own track before projecting it onto the two-staff export.
-        // Grouping by projected odd/even staff first would merge, for example,
-        // a vocal-guide rest with simultaneous piano notes into one impossible
-        // overfilled voice.
-        for (0..2) |output_staff_index| {
-            for (0..256) |source_staff_index| {
-                const source_staff: u8 = @intCast(source_staff_index);
-                if (exportStaff(source_staff) != output_staff_index + 1) continue;
-                var voices = [_]bool{false} ** 256;
-                for (notes) |note| {
-                    if (note.staff != source_staff) continue;
-                    const note_start = beatToTick(@max(0, note.start_beat));
-                    const note_end = note_start + @max(1, beatToTick(@max(note.duration_beats, 1.0 / @as(f32, @floatFromInt(divisions)))));
-                    if (note_start < measure_end and note_end > measure_start) voices[note.voice] = true;
+    const part_count: usize = if (has_vocal_guide) 2 else 1;
+    for (0..part_count) |part_index| {
+        const vocal_part = has_vocal_guide and part_index == 1;
+        try builder.print("  <part id=\"P{d}\">\n", .{part_index + 1});
+        var segments: [max_export_notes]Segment = undefined;
+        for (0..measure_count) |measure_index| {
+            const imported_measure = measure_index < measures.len;
+            const measure = if (imported_measure) measures[measure_index] else blk: {
+                const authored_end = if (measures.len != 0)
+                    measures[measures.len - 1].start_beat + @max(0.0001, measures[measures.len - 1].duration_beats)
+                else
+                    0;
+                const extension_index = measure_index - measures.len;
+                const number: u32 = if (measures.len != 0)
+                    measures[measures.len - 1].number + @as(u32, @intCast(extension_index + 1))
+                else
+                    @intCast(measure_index + 1);
+                break :blk model.Measure{
+                    .start_beat = authored_end + @as(f32, @floatFromInt(extension_index)) * fallback_measure_beats,
+                    .duration_beats = fallback_measure_beats,
+                    .number = number,
+                    .beats = fallback_beats,
+                    .beat_unit = fallback_beat_unit,
+                };
+            };
+            try builder.print("    <measure number=\"{d}\"", .{measure.number});
+            if (measure.implicit != 0) try builder.append(" implicit=\"yes\"");
+            try builder.append(">\n");
+            const beats = @max(@as(u8, 1), measure.beats);
+            const beat_unit = @max(@as(u8, 1), measure.beat_unit);
+            if (measure_index == 0) {
+                if (vocal_part) {
+                    try builder.print("      <attributes><divisions>{d}</divisions><key><fifths>{d}</fifths></key><time><beats>{d}</beats><beat-type>{d}</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>\n", .{ divisions, meta.key_fifths, beats, beat_unit });
+                } else {
+                    try builder.print("      <attributes><divisions>{d}</divisions><key><fifths>{d}</fifths></key><time><beats>{d}</beats><beat-type>{d}</beat-type></time><staves>2</staves><clef number=\"1\"><sign>G</sign><line>2</line></clef><clef number=\"2\"><sign>F</sign><line>4</line></clef></attributes>\n", .{ divisions, meta.key_fifths, beats, beat_unit });
                 }
-                for (voices, 0..) |present, source_voice_index| {
-                    if (!present) continue;
-                    if (emitted_track) try builder.print("      <backup><duration>{d}</duration></backup>\n", .{measure_ticks});
-                    emitted_track = true;
-                    exported_voice += 1;
-                    const count = collectSegments(&segments, notes, source_staff, @intCast(source_voice_index), measure_start, measure_end);
-                    std.mem.sort(Segment, segments[0..count], {}, segmentLessThan);
-                    try writeTrack(&builder, segments[0..count], output_staff_index + 1, exported_voice, measure_ticks);
-                    emitted_any_note = emitted_any_note or count != 0;
+            } else {
+                const previous = if (measure_index - 1 < measures.len) measures[measure_index - 1] else model.Measure{ .beats = fallback_beats, .beat_unit = fallback_beat_unit };
+                if (beats != @max(@as(u8, 1), previous.beats) or beat_unit != @max(@as(u8, 1), previous.beat_unit)) {
+                    try builder.print("      <attributes><time><beats>{d}</beats><beat-type>{d}</beat-type></time></attributes>\n", .{ beats, beat_unit });
                 }
             }
+
+            const measure_ticks: i64 = @max(1, beatToTick(@max(0.0001, measure.duration_beats)));
+            const measure_start = beatToTick(@max(0, measure.start_beat));
+            const measure_end = measure_start + measure_ticks;
+            if (!vocal_part) {
+                const tempo_count = @min(@as(usize, playback.tempo_count), playback.tempos.len);
+                const editable_quarter = model.quarterTempoFromPulse(@max(1, transport.tempo_bpm), meta.tempo_beat_unit);
+                var emitted_tempo = false;
+                for (playback.tempos[0..tempo_count]) |tempo| {
+                    const tempo_tick = beatToTick(@max(0, tempo.start_beat));
+                    if (tempo_tick < measure_start or tempo_tick >= measure_end) continue;
+                    const scale = editable_quarter / @max(1, playback.tempo_base_bpm);
+                    try writeTempo(&builder, tempo.bpm * scale, meta.tempo_beat_unit, tempo_tick - measure_start);
+                    emitted_tempo = true;
+                }
+                if (measure_index == 0 and !emitted_tempo) try writeTempo(&builder, editable_quarter, meta.tempo_beat_unit, 0);
+                for (harmonies) |harmony| {
+                    const harmony_tick = beatToTick(@max(0, harmony.start_beat));
+                    if (harmony_tick < measure_start or harmony_tick >= measure_end) continue;
+                    try writeHarmony(&builder, harmony, harmony_tick - measure_start);
+                }
+                for (pedals) |pedal| {
+                    const pedal_tick = beatToTick(@max(0, pedal.start_beat));
+                    if (pedal_tick < measure_start or pedal_tick >= measure_end) continue;
+                    try writePedal(&builder, pedal, pedal_tick - measure_start);
+                }
+            }
+            if (vocal_part or !has_vocal_guide) {
+                for (lyrics) |lyric| {
+                    const lyric_tick = beatToTick(@max(0, lyric.start_beat));
+                    if (lyric_tick < measure_start or lyric_tick >= measure_end) continue;
+                    try builder.append(if (vocal_part) "      <direction placement=\"below\"><direction-type><words>" else "      <direction placement=\"above\"><direction-type><words>");
+                    try builder.escaped(lyric.textSlice());
+                    try builder.append("</words></direction-type>");
+                    try builder.print("<offset>{d}</offset></direction>\n", .{lyric_tick - measure_start});
+                }
+            }
+
+            var emitted_track = false;
+            var emitted_any_note = false;
+            var exported_voice: usize = 0;
+            // The vocal guide is a real, independent MusicXML part. This keeps
+            // it out of piano playback/assessment and prevents guide cues from
+            // being merged into grand-staff voices on exchange round trips.
+            const output_staff_count: usize = if (vocal_part) 1 else 2;
+            for (0..output_staff_count) |output_staff_index| {
+                for (0..256) |source_staff_index| {
+                    const source_staff: u8 = @intCast(source_staff_index);
+                    const output_staff = if (vocal_part) 1 else exportStaff(source_staff);
+                    if (output_staff != output_staff_index + 1) continue;
+                    var voices = [_]bool{false} ** 256;
+                    for (notes) |note| {
+                        if (note.staff != source_staff or noteIsVocal(note) != vocal_part) continue;
+                        const note_start = beatToTick(@max(0, note.start_beat));
+                        const note_end = note_start + @max(1, beatToTick(@max(note.duration_beats, 1.0 / @as(f32, @floatFromInt(divisions)))));
+                        if (note_start < measure_end and note_end > measure_start) voices[note.voice] = true;
+                    }
+                    for (voices, 0..) |present, source_voice_index| {
+                        if (!present) continue;
+                        if (emitted_track) try builder.print("      <backup><duration>{d}</duration></backup>\n", .{measure_ticks});
+                        emitted_track = true;
+                        exported_voice += 1;
+                        const count = collectSegments(&segments, notes, source_staff, @intCast(source_voice_index), measure_start, measure_end, vocal_part);
+                        std.mem.sort(Segment, segments[0..count], {}, segmentLessThan);
+                        try writeTrack(&builder, segments[0..count], output_staff_index + 1, exported_voice, measure_ticks);
+                        emitted_any_note = emitted_any_note or count != 0;
+                    }
+                }
+            }
+            if (!emitted_any_note) {
+                try builder.print("      <note><rest measure=\"yes\"/><duration>{d}</duration><voice>1</voice><staff>1</staff></note>\n", .{measure_ticks});
+            }
+            try builder.append("    </measure>\n");
         }
-        if (!emitted_any_note) {
-            try builder.print("      <note><rest measure=\"yes\"/><duration>{d}</duration><voice>1</voice><staff>1</staff></note>\n", .{measure_ticks});
-        }
-        try builder.append("    </measure>\n");
+        try builder.append("  </part>\n");
     }
-    try builder.append("  </part>\n</score-partwise>\n");
+    try builder.append("</score-partwise>\n");
     return builder.len;
+}
+
+fn writeTempo(builder: *Builder, quarter_bpm: f32, requested_beat_unit: u8, offset_ticks: i64) Error!void {
+    const beat_unit = if (tempoBeatUnitName(requested_beat_unit) != null) requested_beat_unit else 4;
+    const unit_name = tempoBeatUnitName(beat_unit) orelse "quarter";
+    const quarter = std.math.clamp(quarter_bpm, 1, 999);
+    const pulse = std.math.clamp(model.pulseTempoFromQuarter(quarter, beat_unit), 1, 999);
+    try builder.print("      <direction placement=\"above\"><direction-type><metronome><beat-unit>{s}</beat-unit><per-minute>{d:.3}</per-minute></metronome></direction-type>", .{ unit_name, pulse });
+    if (offset_ticks != 0) try builder.print("<offset>{d}</offset>", .{offset_ticks});
+    try builder.print("<sound tempo=\"{d:.3}\"/></direction>\n", .{quarter});
+}
+
+fn tempoBeatUnitName(beat_unit: u8) ?[]const u8 {
+    return switch (beat_unit) {
+        1 => "whole",
+        2 => "half",
+        4 => "quarter",
+        8 => "eighth",
+        16 => "16th",
+        32 => "32nd",
+        64 => "64th",
+        128 => "128th",
+        else => null,
+    };
 }
 
 fn writePedal(builder: *Builder, pedal: model.PedalEvent, offset_tick: i64) Error!void {
@@ -188,6 +243,11 @@ fn writePedal(builder: *Builder, pedal: model.PedalEvent, offset_tick: i64) Erro
     if ((pedal.flags & model.pedal_flag_sign) != 0) try builder.append(" sign=\"yes\"");
     try builder.append("/></direction-type>");
     if (offset_tick != 0) try builder.print("<offset>{d}</offset>", .{offset_tick});
+    // MusicXML's sound element carries continuous damper position as a
+    // percentage. Keep the visible pedal line/sign and the performed CC64
+    // value in the same exchange document so half-pedal guidance does not
+    // collapse to a binary on/off instruction after a round trip.
+    try builder.print("<sound damper-pedal=\"{d:.3}\"/>", .{@as(f32, @floatFromInt(pedal.value)) * 100.0 / 127.0});
     try builder.append("<staff>2</staff></direction>\n");
 }
 
@@ -237,6 +297,10 @@ fn exportStaff(source: u8) usize {
     return if ((source & 1) == 0) 1 else 2;
 }
 
+fn noteIsVocal(note: model.Note) bool {
+    return (note.flags & model.note_flag_vocal_guide) != 0;
+}
+
 fn collectSegments(
     destination: *[max_export_notes]Segment,
     notes: []const model.Note,
@@ -244,10 +308,11 @@ fn collectSegments(
     voice: u8,
     measure_start: i64,
     measure_end: i64,
+    vocal_part: bool,
 ) usize {
     var count: usize = 0;
     for (notes) |note| {
-        if (note.staff != source_staff or note.voice != voice) continue;
+        if (note.staff != source_staff or note.voice != voice or noteIsVocal(note) != vocal_part) continue;
         const note_start = beatToTick(@max(0, note.start_beat));
         const note_end = note_start + @max(1, beatToTick(@max(note.duration_beats, 1.0 / @as(f32, @floatFromInt(divisions)))));
         if (note_start >= measure_end or note_end <= measure_start) continue;
@@ -359,7 +424,8 @@ fn writeNote(builder: *Builder, segment: Segment, staff: usize, voice: usize, ch
     const articulation_mask = model.note_flag_staccato | model.note_flag_accent | model.note_flag_tenuto | model.note_flag_marcato;
     const has_articulations = segment.original_start and (segment.note.flags & articulation_mask) != 0;
     const fermata = segment.original_start and (segment.note.flags & model.note_flag_fermata) != 0;
-    if (!rest and (segment.tie_stop or segment.tie_start or slur_start or slur_stop or tuplet_start or tuplet_stop or has_articulations or fermata)) {
+    const has_fingering = segment.original_start and segment.note.fingering >= 1 and segment.note.fingering <= 5;
+    if (!rest and (segment.tie_stop or segment.tie_start or slur_start or slur_stop or tuplet_start or tuplet_stop or has_articulations or fermata or has_fingering)) {
         try builder.append("<notations>");
         if (segment.tie_stop) try builder.append("<tied type=\"stop\"/>");
         if (segment.tie_start) try builder.append("<tied type=\"start\"/>");
@@ -376,6 +442,7 @@ fn writeNote(builder: *Builder, segment: Segment, staff: usize, voice: usize, ch
             try builder.append("</articulations>");
         }
         if (fermata) try builder.append("<fermata/>");
+        if (has_fingering) try builder.print("<technical><fingering>{d}</fingering></technical>", .{segment.note.fingering});
         try builder.append("</notations>");
     }
     try builder.append("</note>\n");
@@ -411,8 +478,12 @@ test "writes interoperable two-staff MusicXML" {
     var harmonies = [_]model.Harmony{.{ .start_beat = 0, .root_step = 'B', .root_alter = -1, .bass_step = 'D', .bass_alter = -1 }};
     harmonies[0].setKind("minor-seventh");
     harmonies[0].setText("m7");
+    var playback: model.PlaybackBounds = .{ .tempo_base_bpm = 96 };
+    playback.tempos[0] = .{ .start_beat = 0, .bpm = 96 };
+    playback.tempos[1] = .{ .start_beat = 2, .bpm = 84 };
+    playback.tempo_count = 2;
     var output: [16 * 1024]u8 = undefined;
-    const len = try write(&output, &meta, &transport, &notes, &lyrics, &harmonies, &.{}, &.{});
+    const len = try write(&output, &meta, &transport, &notes, &lyrics, &harmonies, &.{}, &.{}, &playback);
     try std.testing.expect(std.mem.indexOf(u8, output[0..len], "<work-title>A &amp; B</work-title>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output[0..len], "<chord/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output[0..len], "<staff>2</staff>") != null);
@@ -420,9 +491,31 @@ test "writes interoperable two-staff MusicXML" {
     try std.testing.expect(std.mem.indexOf(u8, output[0..len], "<root-step>B</root-step><root-alter>-1</root-alter>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output[0..len], "<kind text=\"m7\">minor-seventh</kind>") != null);
     try std.testing.expect(std.mem.indexOf(u8, output[0..len], "<bass-step>D</bass-step><bass-alter>-1</bass-alter>") != null);
+    const roundtrip = try @import("../import/musicxml.zig").parse(output[0..len]);
+    try std.testing.expectEqual(@as(usize, 2), roundtrip.tempo_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 84), roundtrip.tempos[1].bpm, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), roundtrip.tempos[1].start_beat, 0.001);
 }
 
-test "keeps overlapping imported parts in separate export voices" {
+test "round trips an eighth-note pulse with quarter-note playback tempo" {
+    var meta: model.DocumentMeta = .{ .tempo_beat_unit = 8 };
+    meta.setTitle("Pulse semantics");
+    const transport: model.Transport = .{ .tempo_bpm = 147 };
+    const notes = [_]model.Note{.{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 61, .velocity = 88, .staff = 0, .voice = 0 }};
+    var playback: model.PlaybackBounds = .{ .tempo_base_bpm = 73.5, .tempo_beat_unit = 8 };
+    playback.tempos[0] = .{ .start_beat = 0, .bpm = 73.5 };
+    var output: [16 * 1024]u8 = undefined;
+    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &.{}, &playback);
+    const xml = output[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<beat-unit>eighth</beat-unit><per-minute>147.000</per-minute>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<sound tempo=\"73.500\"/>") != null);
+    const imported = try @import("../import/musicxml.zig").parse(xml);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), imported.tempo_bpm, 0.001);
+    try std.testing.expectEqual(@as(u8, 8), imported.tempo_beat_unit);
+    try std.testing.expectApproxEqAbs(@as(f32, 73.5), imported.tempos[0].bpm, 0.001);
+}
+
+test "keeps optional vocal guide in a separate export part" {
     const meta: model.DocumentMeta = .{ .beats_per_measure = 4, .beat_unit = 4 };
     const transport: model.Transport = .{};
     const notes = [_]model.Note{
@@ -432,21 +525,30 @@ test "keeps overlapping imported parts in separate export voices" {
         .{ .stable_id = 2, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 88, .staff = 8, .voice = 0 },
         .{ .stable_id = 3, .start_beat = 1, .duration_beats = 1, .pitch = 64, .velocity = 88, .staff = 8, .voice = 0 },
     };
+    var lyrics = [_]model.Lyric{.{ .start_beat = 0 }};
+    lyrics[0].setText("singer lane");
     var output: [16 * 1024]u8 = undefined;
-    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &.{});
+    const len = try write(&output, &meta, &transport, &notes, &lyrics, &.{}, &.{}, &.{}, &.{});
     const xml = output[0..len];
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<backup><duration>1920</duration></backup>") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, xml, "<part id="));
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<part-name>Piano</part-name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<part-name>Vocal guide (optional)</part-name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<direction placement=\"below\"><direction-type><words>singer lane</words>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<backup><duration>1920</duration></backup>") == null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<voice>1</voice>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<voice>2</voice>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<note><chord/><pitch>") == null);
 
     const imported = try @import("../import/musicxml.zig").parse(xml);
     try std.testing.expectEqual(@as(usize, 3), imported.note_count);
+    try std.testing.expectEqual(@as(usize, 1), imported.lyric_count);
     var sounding: usize = 0;
+    var vocal: usize = 0;
     for (imported.notes[0..imported.note_count]) |note| {
         if ((note.flags & model.note_flag_rest) == 0) sounding += 1;
+        if ((note.flags & model.note_flag_vocal_guide) != 0) vocal += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), sounding);
+    try std.testing.expectEqual(@as(usize, 1), vocal);
 }
 
 test "exports preserved flat spelling engraving and semantic spanners" {
@@ -454,11 +556,11 @@ test "exports preserved flat spelling engraving and semantic spanners" {
     meta.setTitle("Notation fidelity");
     const transport: model.Transport = .{};
     const notes = [_]model.Note{
-        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 0.75, .pitch = 73, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'D', .written_alter = -1, .written_octave = 5, .dots = 1, .flags = model.withDynamic(model.withTupletRatio(model.note_flag_explicit_accidental | model.note_flag_tie_start | model.note_flag_beam_begin | model.note_flag_slur_start | model.note_flag_slur_above | model.note_flag_tuplet_start | model.note_flag_staccato | model.note_flag_accent, 3, 2), model.dynamic_mf) },
+        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 0.75, .pitch = 73, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'D', .written_alter = -1, .written_octave = 5, .dots = 1, .flags = model.withDynamic(model.withTupletRatio(model.note_flag_explicit_accidental | model.note_flag_tie_start | model.note_flag_beam_begin | model.note_flag_slur_start | model.note_flag_slur_above | model.note_flag_tuplet_start | model.note_flag_staccato | model.note_flag_accent, 3, 2), model.dynamic_mf), .fingering = 4 },
         .{ .stable_id = 2, .start_beat = 0.75, .duration_beats = 0.25, .pitch = 73, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'D', .written_alter = -1, .written_octave = 5, .flags = model.withTupletRatio(model.note_flag_tie_stop | model.note_flag_beam_end | model.note_flag_slur_stop | model.note_flag_tuplet_stop | model.note_flag_fermata, 3, 2) },
     };
     var output: [16 * 1024]u8 = undefined;
-    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &.{});
+    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &.{}, &.{});
     const xml = output[0..len];
     try std.testing.expect(std.mem.indexOf(u8, xml, "<step>D</step><alter>-1</alter><octave>5</octave>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<dot/><accidental>flat</accidental>") != null);
@@ -469,10 +571,12 @@ test "exports preserved flat spelling engraving and semantic spanners" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "<slur type=\"start\" placement=\"above\"/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<staccato/><accent/>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<fermata/>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<technical><fingering>4</fingering></technical>") != null);
     const imported = try @import("../import/musicxml.zig").parse(xml);
     try std.testing.expectEqual(@as(i8, -1), imported.notes[0].written_alter);
     try std.testing.expectEqual(@as(u8, 1), imported.notes[0].dots);
     try std.testing.expectEqual(model.dynamic_mf, model.dynamic(imported.notes[0].flags));
+    try std.testing.expectEqual(@as(u8, 4), imported.notes[0].fingering);
     try std.testing.expectEqual(@as(u8, 3), model.tupletActual(imported.notes[0].flags));
     try std.testing.expect((imported.notes[0].flags & model.note_flag_slur_start) != 0);
     try std.testing.expect((imported.notes[0].flags & model.note_flag_staccato) != 0);
@@ -487,7 +591,7 @@ test "round trips explicit dotted and measure rests" {
         .{ .stable_id = 2, .start_beat = 4, .duration_beats = 4, .pitch = 71, .velocity = 0, .staff = 0, .voice = 0, .flags = model.note_flag_rest | model.note_flag_measure_rest },
     };
     var output: [16 * 1024]u8 = undefined;
-    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &.{});
+    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &.{}, &.{});
     const xml = output[0..len];
     try std.testing.expect(std.mem.indexOf(u8, xml, "<rest/><duration>720</duration>") != null);
     const imported = try @import("../import/musicxml.zig").parse(xml);
@@ -504,6 +608,8 @@ test "preserves authored measure boundaries and mid-score meter changes" {
         .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 90, .staff = 0, .voice = 0 },
         .{ .stable_id = 2, .start_beat = 4, .duration_beats = 1, .pitch = 62, .velocity = 90, .staff = 0, .voice = 0 },
         .{ .stable_id = 3, .start_beat = 6, .duration_beats = 1, .pitch = 64, .velocity = 90, .staff = 0, .voice = 0 },
+        // Ending exactly on the authored boundary must not synthesize an extra measure.
+        .{ .stable_id = 4, .start_beat = 9, .duration_beats = 1, .pitch = 67, .velocity = 90, .staff = 1, .voice = 1 },
     };
     const measures = [_]model.Measure{
         .{ .start_beat = 0, .duration_beats = 4, .number = 1, .beats = 4, .beat_unit = 4 },
@@ -511,13 +617,14 @@ test "preserves authored measure boundaries and mid-score meter changes" {
         .{ .start_beat = 6, .duration_beats = 4, .number = 3, .beats = 4, .beat_unit = 4 },
     };
     var output: [32 * 1024]u8 = undefined;
-    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &measures);
+    const len = try write(&output, &meta, &transport, &notes, &.{}, &.{}, &.{}, &measures, &.{});
     const xml = output[0..len];
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, xml, "<measure number="));
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, xml, "<beats>4</beats><beat-type>4</beat-type>"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, xml, "<beats>2</beats><beat-type>4</beat-type>"));
     const imported = try @import("../import/musicxml.zig").parse(xml);
     try std.testing.expectEqual(@as(usize, 3), imported.measure_count);
+    try std.testing.expectEqual(@as(usize, 4), imported.note_count);
     try std.testing.expectEqual(@as(f32, 0), imported.measures[0].start_beat);
     try std.testing.expectEqual(@as(f32, 4), imported.measures[1].start_beat);
     try std.testing.expectEqual(@as(f32, 6), imported.measures[2].start_beat);

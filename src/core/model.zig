@@ -90,7 +90,14 @@ pub const Note = extern struct {
     written_alter: i8 = 0,
     written_octave: i8 = -1,
     dots: u8 = 0,
-    selected: u32 = 0,
+    /// Transient editor state; stored as a byte so semantic technique data can
+    /// remain inside the 32-byte cache-friendly Flecs component.
+    selected: u8 = 0,
+    /// MusicXML `<technical><fingering>` value. Zero means the score leaves
+    /// the choice to the phrase optimizer; 1...5 is an explicit musician-
+    /// authored override that must survive native and MusicXML round trips.
+    fingering: u8 = 0,
+    reserved: [2]u8 = [_]u8{0} ** 2,
     flags: u32 = 0,
 };
 
@@ -217,12 +224,60 @@ pub const Transport = extern struct {
     metronome_enabled: u32 = 1,
 };
 
+pub const max_tempo_events: usize = 512;
+
+/// An authored tempo transition in quarter-note engine time.  Keeping tempo
+/// changes as score data (rather than UI state) preserves rubato through
+/// MusicXML/MIDI round trips and lets every platform share one transport.
+pub const TempoEvent = extern struct {
+    start_beat: f32 = 0,
+    bpm: f32 = 72,
+};
+
 /// Derived document timing consumed by transport systems. Keeping this in the
 /// Flecs world lets a hot-reloaded transport callback stop at the real score
 /// boundary without reaching back into host-owned note storage.
 pub const PlaybackBounds = extern struct {
     end_beat: f32 = 4,
+    /// `Transport.tempo_bpm` is the editable, displayed metronome pulse.
+    /// `tempo_base_bpm` and every authored map value are quarter-note engine
+    /// rates. Keeping those concepts separate makes, for example, eighth=147
+    /// play at 73.5 quarter notes/minute without lying in the score UI.
+    tempo_base_bpm: f32 = 72,
+    tempo_count: u32 = 1,
+    tempo_beat_unit: u32 = 4,
+    tempos: [max_tempo_events]TempoEvent = [_]TempoEvent{.{}} ** max_tempo_events,
 };
+
+/// Converts a displayed MusicXML metronome pulse to the engine's canonical
+/// quarter-note rate. MIDI tempo events and transport integration always use
+/// quarter notes, regardless of the note value printed beside the BPM.
+pub fn quarterTempoFromPulse(pulse_bpm: f32, beat_unit: u32) f32 {
+    const unit = @max(@as(u32, 1), beat_unit);
+    return pulse_bpm * 4.0 / @as(f32, @floatFromInt(unit));
+}
+
+pub fn pulseTempoFromQuarter(quarter_bpm: f32, beat_unit: u32) f32 {
+    const unit = @max(@as(u32, 1), beat_unit);
+    return quarter_bpm * @as(f32, @floatFromInt(unit)) / 4.0;
+}
+
+pub fn scoreTempoAt(bounds: *const PlaybackBounds, beat: f32) f32 {
+    const count = @min(@as(usize, bounds.tempo_count), bounds.tempos.len);
+    if (count == 0) return @max(1, bounds.tempo_base_bpm);
+    var result = @max(1, bounds.tempos[0].bpm);
+    for (bounds.tempos[0..count]) |event| {
+        if (event.start_beat > beat + 0.0001) break;
+        result = @max(1, event.bpm);
+    }
+    return result;
+}
+
+pub fn effectiveTempoAt(bounds: *const PlaybackBounds, transport: *const Transport, beat: f32) f32 {
+    const base = @max(1, bounds.tempo_base_bpm);
+    const editable_quarter = quarterTempoFromPulse(@max(1, transport.tempo_bpm), bounds.tempo_beat_unit);
+    return scoreTempoAt(bounds, beat) * editable_quarter / base;
+}
 
 pub const UiState = extern struct {
     viewport_width: f32 = 1280,
@@ -274,7 +329,8 @@ pub const DocumentMeta = extern struct {
     beats_per_measure: u8 = 4,
     beat_unit: u8 = 4,
     key_fifths: i8 = 0,
-    reserved: u8 = 0,
+    /// Printed note value for `Transport.tempo_bpm` (4=quarter, 8=eighth).
+    tempo_beat_unit: u8 = 4,
 
     pub fn setTitle(self: *DocumentMeta, value: []const u8) void {
         self.title_len = @intCast(@min(value.len, self.title.len));
@@ -372,9 +428,28 @@ test "portable score components have deterministic layouts" {
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(Lyric));
     try std.testing.expectEqual(@as(usize, 68), @sizeOf(Harmony));
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Transport));
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(PlaybackBounds));
+    try std.testing.expectEqual(@as(usize, 4112), @sizeOf(PlaybackBounds));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(UiState));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Measure));
+}
+
+test "authored tempo maps scale around the editable practice baseline" {
+    var bounds: PlaybackBounds = .{ .tempo_base_bpm = 120 };
+    bounds.tempos[0] = .{ .start_beat = 0, .bpm = 120 };
+    bounds.tempos[1] = .{ .start_beat = 8, .bpm = 90 };
+    bounds.tempo_count = 2;
+    const transport: Transport = .{ .tempo_bpm = 96 };
+    try std.testing.expectApproxEqAbs(@as(f32, 96), effectiveTempoAt(&bounds, &transport, 4), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 72), effectiveTempoAt(&bounds, &transport, 8), 0.001);
+}
+
+test "eighth-note metronome pulse preserves quarter-note engine time" {
+    var bounds: PlaybackBounds = .{ .tempo_base_bpm = 73.5, .tempo_beat_unit = 8 };
+    bounds.tempos[0] = .{ .start_beat = 0, .bpm = 73.5 };
+    const transport: Transport = .{ .tempo_bpm = 147 };
+    try std.testing.expectApproxEqAbs(@as(f32, 73.5), quarterTempoFromPulse(147, 8), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), pulseTempoFromQuarter(73.5, 8), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 73.5), effectiveTempoAt(&bounds, &transport, 0), 0.001);
 }
 
 test "measure lookup assigns exact barlines to the following measure" {

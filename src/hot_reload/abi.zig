@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const abi_version: u32 = 13;
+pub const abi_version: u32 = 15;
 pub const max_query_terms = 8;
 
 pub const ComponentKey = enum(u32) {

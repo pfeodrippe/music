@@ -9,6 +9,8 @@ pub const MidiReport = struct {
     pedal_count: usize = 0,
     ticks_per_quarter: u16 = 480,
     tempo_bpm: f32 = 120,
+    tempos: [model.max_tempo_events]model.TempoEvent = undefined,
+    tempo_count: usize = 0,
     beats_per_measure: u8 = 4,
     beat_unit: u8 = 4,
     key_fifths: i8 = 0,
@@ -20,7 +22,7 @@ pub const MidiReport = struct {
     }
 };
 
-pub const Error = error{ InvalidMidi, TooManyNotes, TooManyPedals, UnsupportedTimeDivision };
+pub const Error = error{ InvalidMidi, TooManyNotes, TooManyPedals, TooManyTempos, UnsupportedTimeDivision };
 
 const Active = struct { tick: u64 = 0, velocity: u8 = 0, flags: u32 = 0, active: bool = false };
 const RawPedal = struct {
@@ -79,7 +81,24 @@ pub fn parse(source: []const u8) Error!MidiReport {
                 if (offset + length > end) return error.InvalidMidi;
                 if (kind == 0x51 and length == 3) {
                     const micros = (@as(u32, source[offset]) << 16) | (@as(u32, source[offset + 1]) << 8) | source[offset + 2];
-                    if (micros != 0) report.tempo_bpm = 60_000_000.0 / @as(f32, @floatFromInt(micros));
+                    if (micros != 0) {
+                        const bpm = 60_000_000.0 / @as(f32, @floatFromInt(micros));
+                        const start_beat = @as(f32, @floatFromInt(tick)) / @as(f32, @floatFromInt(division));
+                        var replaced = false;
+                        for (report.tempos[0..report.tempo_count]) |*tempo| {
+                            if (@abs(tempo.start_beat - start_beat) <= 0.0001) {
+                                tempo.bpm = bpm;
+                                replaced = true;
+                                break;
+                            }
+                        }
+                        if (!replaced) {
+                            if (report.tempo_count == report.tempos.len) return error.TooManyTempos;
+                            report.tempos[report.tempo_count] = .{ .start_beat = start_beat, .bpm = bpm };
+                            report.tempo_count += 1;
+                        }
+                        if (report.tempo_count == 1 or start_beat <= 0.0001) report.tempo_bpm = bpm;
+                    }
                 } else if (kind == 0x03 and length != 0) {
                     const track_name = source[offset .. offset + @as(usize, @intCast(length))];
                     track_vocal_guide = containsIgnoreCase(track_name, "vocal");
@@ -150,6 +169,15 @@ pub fn parse(source: []const u8) Error!MidiReport {
         offset = end;
     }
     if (report.note_count == 0) return error.InvalidMidi;
+    if (report.tempo_count == 0) {
+        report.tempos[0] = .{ .start_beat = 0, .bpm = report.tempo_bpm };
+        report.tempo_count = 1;
+    }
+    std.mem.sort(model.TempoEvent, report.tempos[0..report.tempo_count], {}, struct {
+        fn lessThan(_: void, left: model.TempoEvent, right: model.TempoEvent) bool {
+            return left.start_beat < right.start_beat;
+        }
+    }.lessThan);
     std.mem.sort(model.Note, report.notes[0..report.note_count], {}, struct {
         fn lessThan(_: void, left: model.Note, right: model.Note) bool {
             return left.start_beat < right.start_beat or (left.start_beat == right.start_beat and left.pitch < right.pitch);

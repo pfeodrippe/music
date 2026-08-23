@@ -17,6 +17,7 @@ const Voice = struct {
     gain: f32 = 0,
     envelope: f32 = 0,
     key_down: bool = false,
+    sustain_latched: bool = false,
     sostenuto_latched: bool = false,
     soft_amount: f32 = 0,
     releasing: bool = false,
@@ -75,11 +76,22 @@ pub const Synth = struct {
                 const angle = voice.phase * std.math.tau;
                 const brightness = 1.0 - 0.36 * voice.soft_amount;
                 const tone = @sin(angle) + brightness * (0.32 * @sin(angle * 2.0) + 0.12 * @sin(angle * 3.0) + 0.045 * @sin(angle * 5.0));
-                if (voice.releasing) {
-                    voice.envelope *= 0.99935;
+                if (voice.key_down) {
+                    voice.envelope += (1.0 - voice.envelope) * 0.0045;
+                } else if (voice.sustain_latched or voice.sostenuto_latched) {
+                    const sustain_amount = @as(f32, @floatFromInt(self.sustain[voice.channel])) / 127.0;
+                    const hold_seconds: f32 = if (voice.sostenuto_latched)
+                        18.0
+                    else
+                        5.0 + 15.0 * sustain_amount * sustain_amount;
+                    voice.envelope *= @exp(-1.0 / (sample_rate * hold_seconds));
+                } else if (voice.releasing) {
+                    const half_amount = @as(f32, @floatFromInt(self.sustain[voice.channel])) / 63.0;
+                    const release_seconds = 0.18 + 1.65 * half_amount * half_amount;
+                    voice.envelope *= @exp(-1.0 / (sample_rate * release_seconds));
                     if (voice.envelope < 0.0005) voice.active = false;
                 } else {
-                    voice.envelope += (1.0 - voice.envelope) * 0.0045;
+                    voice.releasing = true;
                 }
                 mixed += tone * voice.gain * voice.envelope;
             }
@@ -122,6 +134,9 @@ pub const Synth = struct {
     fn apply(self: *Synth, event: Event) void {
         if (event.kind == 2) {
             for (&self.voices) |*voice| if (voice.active) {
+                voice.key_down = false;
+                voice.sustain_latched = false;
+                voice.sostenuto_latched = false;
                 voice.releasing = true;
             };
             self.sustain = [_]u8{0} ** 16;
@@ -140,7 +155,8 @@ pub const Synth = struct {
         if (event.kind == 0) {
             for (&self.voices) |*voice| if (voice.active and voice.pitch == event.pitch and voice.channel == event.channel) {
                 voice.key_down = false;
-                if (self.sustain[event.channel] < 64 and !voice.sostenuto_latched) voice.releasing = true;
+                voice.sustain_latched = self.sustain[event.channel] >= 64;
+                if (!voice.sustain_latched and !voice.sostenuto_latched) voice.releasing = true;
             };
             return;
         }
@@ -163,6 +179,7 @@ pub const Synth = struct {
             .gain = @as(f32, @floatFromInt(event.velocity)) / 127.0,
             .envelope = 0,
             .key_down = true,
+            .sustain_latched = false,
             .sostenuto_latched = false,
             .soft_amount = @as(f32, @floatFromInt(self.una_corda[event.channel])) / 127.0,
             .releasing = false,
@@ -175,8 +192,17 @@ pub const Synth = struct {
     fn applyControlChange(self: *Synth, channel: u8, controller: u8, value: u8) void {
         switch (controller) {
             64 => {
+                const was_down = self.sustain[channel] >= 64;
                 self.sustain[channel] = value;
-                if (value < 64) self.releaseUnheld(channel);
+                if (!was_down and value >= 64) {
+                    for (&self.voices) |*voice| {
+                        if (!voice.active or voice.channel != channel or voice.key_down or voice.sostenuto_latched) continue;
+                        voice.sustain_latched = true;
+                        voice.releasing = false;
+                    }
+                } else {
+                    self.updateUnheld(channel);
+                }
             },
             66 => {
                 const was_down = self.sostenuto[channel] >= 64;
@@ -190,7 +216,7 @@ pub const Synth = struct {
                         if (!voice.active or voice.channel != channel) continue;
                         voice.sostenuto_latched = false;
                     }
-                    self.releaseUnheld(channel);
+                    self.updateUnheld(channel);
                 }
             },
             67 => self.una_corda[channel] = value,
@@ -198,6 +224,7 @@ pub const Synth = struct {
                 for (&self.voices) |*voice| {
                     if (voice.active and voice.channel == channel) {
                         voice.key_down = false;
+                        voice.sustain_latched = false;
                         voice.sostenuto_latched = false;
                         voice.releasing = true;
                     }
@@ -209,9 +236,11 @@ pub const Synth = struct {
         }
     }
 
-    fn releaseUnheld(self: *Synth, channel: u8) void {
+    fn updateUnheld(self: *Synth, channel: u8) void {
         for (&self.voices) |*voice| {
-            if (voice.active and voice.channel == channel and !voice.key_down and !voice.sostenuto_latched) voice.releasing = true;
+            if (!voice.active or voice.channel != channel or voice.key_down or voice.sostenuto_latched) continue;
+            voice.sustain_latched = self.sustain[channel] >= 64;
+            voice.releasing = !voice.sustain_latched;
         }
     }
 };
@@ -253,6 +282,55 @@ test "sustain holds released keys until pedal up" {
     try std.testing.expect(!synth.voices[0].releasing);
     synth.controlChange(0, 64, 0);
     synth.renderInterleaved(&output, output.len, 1, 48_000);
+    try std.testing.expect(synth.voices[0].releasing);
+}
+
+test "pedal-held release decays without reattacking" {
+    var synth: Synth = .{};
+    var output: [512]f32 = undefined;
+    synth.noteOn(0, 60, 100);
+    synth.renderInterleaved(&output, output.len, 1, 48_000);
+    const before_release = synth.voices[0].envelope;
+    synth.controlChange(0, 64, 127);
+    synth.noteOff(0, 60);
+    synth.renderInterleaved(&output, output.len, 1, 48_000);
+    try std.testing.expect(synth.voices[0].sustain_latched);
+    try std.testing.expect(synth.voices[0].envelope < before_release);
+}
+
+test "continuous half pedal lengthens the release tail" {
+    var dry: Synth = .{};
+    var half: Synth = .{};
+    var output: [4_800]f32 = undefined;
+    for ([_]*Synth{ &dry, &half }) |synth| {
+        synth.noteOn(0, 60, 100);
+        synth.renderInterleaved(output[0..512], 512, 1, 48_000);
+    }
+    dry.noteOff(0, 60);
+    half.controlChange(0, 64, 63);
+    half.noteOff(0, 60);
+    dry.renderInterleaved(&output, output.len, 1, 48_000);
+    half.renderInterleaved(&output, output.len, 1, 48_000);
+    try std.testing.expect(half.voices[0].releasing);
+    try std.testing.expect(half.voices[0].envelope > dry.voices[0].envelope * 1.5);
+}
+
+test "repedaling catches a releasing note without an envelope jump" {
+    var synth: Synth = .{};
+    var output: [512]f32 = undefined;
+    synth.noteOn(0, 60, 100);
+    synth.renderInterleaved(&output, output.len, 1, 48_000);
+    synth.noteOff(0, 60);
+    synth.renderInterleaved(&output, output.len, 1, 48_000);
+    const before_repedal = synth.voices[0].envelope;
+    synth.controlChange(0, 64, 127);
+    synth.renderInterleaved(&output, output.len, 1, 48_000);
+    try std.testing.expect(synth.voices[0].sustain_latched);
+    try std.testing.expect(!synth.voices[0].releasing);
+    try std.testing.expect(synth.voices[0].envelope <= before_repedal);
+    synth.controlChange(0, 64, 0);
+    synth.renderInterleaved(&output, output.len, 1, 48_000);
+    try std.testing.expect(!synth.voices[0].sustain_latched);
     try std.testing.expect(synth.voices[0].releasing);
 }
 

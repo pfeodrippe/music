@@ -6,6 +6,7 @@ pub const max_import_lyrics = 1024;
 pub const max_import_harmonies = 1024;
 pub const max_import_pedals = 2048;
 pub const max_import_measures = 2048;
+pub const max_import_tempos = model.max_tempo_events;
 
 pub const ImportReport = struct {
     notes: [max_import_notes]model.Note = undefined,
@@ -18,8 +19,13 @@ pub const ImportReport = struct {
     pedal_count: usize = 0,
     measures: [max_import_measures]model.Measure = undefined,
     measure_count: usize = 0,
+    tempos: [max_import_tempos]model.TempoEvent = undefined,
+    tempo_count: usize = 0,
     divisions: u32 = 1,
+    /// Human-facing metronome pulse. Tempo events below remain quarter-note
+    /// rates so transport and MIDI timing have one canonical unit.
     tempo_bpm: f32 = 72,
+    tempo_beat_unit: u8 = 4,
     title: [96]u8 = [_]u8{0} ** 96,
     title_len: usize = 0,
     creator: [96]u8 = [_]u8{0} ** 96,
@@ -45,6 +51,7 @@ pub const Error = error{
     TooManyHarmonies,
     TooManyPedals,
     TooManyMeasures,
+    TooManyTempos,
     InvalidNumber,
 };
 
@@ -52,12 +59,19 @@ pub const Error = error{
 /// engine today. Unknown elements stay in the original source blob owned by
 /// persistence; the report makes approximations explicit.
 pub fn parse(source: []const u8) Error!ImportReport {
+    var report: ImportReport = undefined;
+    try parseInto(source, &report);
+    return report;
+}
+
+/// Parses into caller-owned storage so tools can keep the fixed-capacity
+/// report off their Debug stacks.
+pub fn parseInto(source: []const u8, report: *ImportReport) Error!void {
     if (std.mem.indexOf(u8, source, "<score-partwise") == null) return error.InvalidMusicXml;
-    var report: ImportReport = .{};
+    report.* = .{};
     if (tagContent(source, "work-title") orelse tagContent(source, "movement-title") orelse nthOpenTagContent(source, "credit-words", 0)) |title| copyText(&report.title, &report.title_len, title);
     if (creatorContent(source) orelse nthOpenTagContent(source, "credit-words", 1)) |creator| copyText(&report.creator, &report.creator_len, creator);
     if (tagContent(source, "divisions")) |value| report.divisions = @max(1, try parseUnsigned(value));
-    if (tempoFromSound(source)) |tempo| report.tempo_bpm = tempo;
     if (tagContent(source, "beats")) |value| report.beats_per_measure = @intCast(@min(32, try parseUnsigned(value)));
     if (tagContent(source, "beat-type")) |value| report.beat_unit = @intCast(@min(32, try parseUnsigned(value)));
     if (tagContent(source, "fifths")) |value| report.key_fifths = @intCast(std.math.clamp(try parseSigned(value), -7, 7));
@@ -69,10 +83,16 @@ pub fn parse(source: []const u8) Error!ImportReport {
     while (findOpenTag(source, part_cursor, "part")) |part_start| {
         const part_open_end = std.mem.indexOfPos(u8, source, part_start, ">") orelse return error.InvalidMusicXml;
         const part_end = std.mem.indexOfPos(u8, source, part_open_end, "</part>") orelse return error.InvalidMusicXml;
-        try parsePart(source[part_open_end + 1 .. part_end], &report, part_index, partIsVocalGuide(source, part_index), &stable_id);
+        try parsePart(source[part_open_end + 1 .. part_end], report, part_index, partIsVocalGuide(source, part_index), &stable_id);
         part_cursor = part_end + "</part>".len;
         part_index += 1;
     }
+    if (report.tempo_count == 0) try appendTempo(report, 0, model.quarterTempoFromPulse(report.tempo_bpm, report.tempo_beat_unit));
+    std.mem.sort(model.TempoEvent, report.tempos[0..report.tempo_count], {}, struct {
+        fn lessThan(_: void, left: model.TempoEvent, right: model.TempoEvent) bool {
+            return left.start_beat < right.start_beat;
+        }
+    }.lessThan);
     if (report.note_count == 0) return error.InvalidMusicXml;
     std.mem.sort(model.Note, report.notes[0..report.note_count], {}, struct {
         fn lessThan(_: void, left: model.Note, right: model.Note) bool {
@@ -84,7 +104,6 @@ pub fn parse(source: []const u8) Error!ImportReport {
             return left.start_beat < right.start_beat or (left.start_beat == right.start_beat and left.action < right.action);
         }
     }.lessThan);
-    return report;
 }
 
 fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_guide: bool, stable_id: *u64) Error!void {
@@ -169,6 +188,18 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                 const offset_units = if (tagContent(block, "offset")) |value| try parseSigned(value) else 0;
                 const offset_beats = @as(f32, @floatFromInt(offset_units)) / @as(f32, @floatFromInt(divisions));
                 try appendPedal(report, @max(0, measure_start + local_beat + offset_beats), block);
+            }
+            if (part_index == 0) {
+                if (tempoFromDirection(block)) |tempo| {
+                    const offset_units = if (tagContent(block, "offset")) |value| try parseSigned(value) else 0;
+                    const offset_beats = @as(f32, @floatFromInt(offset_units)) / @as(f32, @floatFromInt(divisions));
+                    const start_beat = @max(0, measure_start + local_beat + offset_beats);
+                    try appendTempo(report, start_beat, tempo.quarter_bpm);
+                    if (report.tempo_count == 1 or start_beat <= 0.0001) {
+                        report.tempo_bpm = tempo.pulse_bpm;
+                        report.tempo_beat_unit = tempo.beat_unit;
+                    }
+                }
             }
             cursor = end + "</direction>".len;
             continue;
@@ -276,6 +307,7 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                     .written_octave = @intCast(octave),
                     .dots = countOpenTags(block, "dot", 3),
                     .flags = flags,
+                    .fingering = authoredFingering(block),
                 };
                 report.note_count += 1;
                 stable_id.* += 1;
@@ -313,6 +345,12 @@ fn notationFlags(block: []const u8, vocal_guide: bool) u32 {
         if (std.mem.eql(u8, std.mem.trim(u8, beam, " \t\r\n"), "end")) flags |= model.note_flag_beam_end;
     }
     return flags;
+}
+
+fn authoredFingering(block: []const u8) u8 {
+    const text = tagContent(block, "fingering") orelse return 0;
+    const value = std.fmt.parseUnsigned(u8, std.mem.trim(u8, text, " \t\r\n"), 10) catch return 0;
+    return if (value >= 1 and value <= 5) value else 0;
 }
 
 fn dynamicFromDirection(block: []const u8) ?u8 {
@@ -421,7 +459,7 @@ fn appendLyric(report: *ImportReport, start_beat: f32, source: []const u8) Error
     if (source.len == 0) return;
     if (report.lyric_count == report.lyrics.len) return error.TooManyNotes;
     var lyric: model.Lyric = .{ .start_beat = start_beat };
-    lyric.setText(source);
+    lyric.text_len = @intCast(decodeXmlText(&lyric.text, source));
     report.lyrics[report.lyric_count] = lyric;
     report.lyric_count += 1;
 }
@@ -444,9 +482,9 @@ fn appendHarmony(report: *ImportReport, start_beat: f32, source: []const u8, div
         const open_end = std.mem.indexOfPos(u8, source, kind_start, ">") orelse return error.InvalidMusicXml;
         const close = std.mem.indexOfPos(u8, source, open_end, "</kind>") orelse return error.InvalidMusicXml;
         const kind_value = std.mem.trim(u8, source[open_end + 1 .. close], " \t\r\n");
-        harmony.setKind(kind_value);
+        harmony.kind_len = @intCast(decodeXmlText(&harmony.kind, kind_value));
         const opening = source[kind_start .. open_end + 1];
-        harmony.setText(attributeValue(opening, "text") orelse harmonyDisplayText(kind_value));
+        harmony.text_len = @intCast(decodeXmlText(&harmony.text, attributeValue(opening, "text") orelse harmonyDisplayText(kind_value)));
     } else {
         harmony.setKind("major");
     }
@@ -477,10 +515,18 @@ fn appendPedal(report: *ImportReport, start_beat: f32, source: []const u8) Error
     var flags: u8 = 0;
     if (attributeIsYes(opening, "line")) flags |= model.pedal_flag_line;
     if (attributeIsYes(opening, "sign")) flags |= model.pedal_flag_sign;
+    var value: u8 = if (action == model.pedal_action_stop or action == model.pedal_action_discontinue) 0 else 127;
+    if (findOpenTag(source, 0, "sound")) |sound_start| {
+        const sound_end = std.mem.indexOfPos(u8, source, sound_start, ">") orelse return error.InvalidMusicXml;
+        if (attributeValue(source[sound_start .. sound_end + 1], "damper-pedal")) |text| {
+            const percent = std.fmt.parseFloat(f32, text) catch -1;
+            if (std.math.isFinite(percent) and percent >= 0) value = @intFromFloat(@round(std.math.clamp(percent, 0, 100) * 127.0 / 100.0));
+        }
+    }
     report.pedals[report.pedal_count] = .{
         .start_beat = start_beat,
         .pedal = model.pedal_sustain,
-        .value = if (action == model.pedal_action_stop or action == model.pedal_action_discontinue) 0 else 127,
+        .value = value,
         .action = action,
         .flags = flags,
     };
@@ -563,9 +609,97 @@ fn tempoFromSound(source: []const u8) ?f32 {
     return std.fmt.parseFloat(f32, source[value_start..end]) catch null;
 }
 
+const DirectionTempo = struct {
+    quarter_bpm: f32,
+    pulse_bpm: f32,
+    beat_unit: u8,
+};
+
+fn tempoFromDirection(source: []const u8) ?DirectionTempo {
+    const sound_quarter = tempoFromSound(source);
+    const pulse = if (tagContent(source, "per-minute")) |value|
+        std.fmt.parseFloat(f32, value) catch return null
+    else
+        sound_quarter orelse return null;
+    if (!std.math.isFinite(pulse) or pulse <= 0) return null;
+    const beat_unit = if (tagContent(source, "beat-unit")) |value| tempoBeatUnit(value) orelse 4 else 4;
+    const calculated_quarter = model.quarterTempoFromPulse(pulse, beat_unit);
+    const quarter = sound_quarter orelse calculated_quarter;
+    if (!std.math.isFinite(quarter) or quarter <= 0) return null;
+    return .{ .quarter_bpm = quarter, .pulse_bpm = pulse, .beat_unit = beat_unit };
+}
+
+fn tempoBeatUnit(source: []const u8) ?u8 {
+    const value = std.mem.trim(u8, source, " \t\r\n");
+    if (std.mem.eql(u8, value, "whole")) return 1;
+    if (std.mem.eql(u8, value, "half")) return 2;
+    if (std.mem.eql(u8, value, "quarter")) return 4;
+    if (std.mem.eql(u8, value, "eighth")) return 8;
+    if (std.mem.eql(u8, value, "16th")) return 16;
+    if (std.mem.eql(u8, value, "32nd")) return 32;
+    if (std.mem.eql(u8, value, "64th")) return 64;
+    if (std.mem.eql(u8, value, "128th")) return 128;
+    return null;
+}
+
+fn appendTempo(report: *ImportReport, start_beat: f32, bpm: f32) Error!void {
+    if (!std.math.isFinite(start_beat) or !std.math.isFinite(bpm) or bpm <= 0) return error.InvalidNumber;
+    // A direction may carry both metronome text and a sound tempo. It is one
+    // transition, and a later direction at the same beat intentionally wins.
+    for (report.tempos[0..report.tempo_count]) |*event| {
+        if (@abs(event.start_beat - start_beat) <= 0.0001) {
+            event.bpm = bpm;
+            return;
+        }
+    }
+    if (report.tempo_count == report.tempos.len) return error.TooManyTempos;
+    report.tempos[report.tempo_count] = .{ .start_beat = start_beat, .bpm = bpm };
+    report.tempo_count += 1;
+}
+
 fn copyText(destination: []u8, length: *usize, source: []const u8) void {
-    length.* = @min(destination.len, source.len);
-    @memcpy(destination[0..length.*], source[0..length.*]);
+    length.* = decodeXmlText(destination, source);
+}
+
+fn decodeXmlText(destination: []u8, source: []const u8) usize {
+    var length = @min(destination.len, source.len);
+    @memcpy(destination[0..length], source[0..length]);
+    // Older private drafts passed encoded text through the exporter several
+    // times. Decode common entities until stable so one import/export cycle
+    // repairs those layers instead of preserving or multiplying them.
+    for (0..8) |_| {
+        var read: usize = 0;
+        var write: usize = 0;
+        var changed = false;
+        while (read < length) {
+            const remaining = destination[read..length];
+            const decoded: ?struct { value: u8, consumed: usize } = if (std.mem.startsWith(u8, remaining, "&amp;"))
+                .{ .value = '&', .consumed = 5 }
+            else if (std.mem.startsWith(u8, remaining, "&lt;"))
+                .{ .value = '<', .consumed = 4 }
+            else if (std.mem.startsWith(u8, remaining, "&gt;"))
+                .{ .value = '>', .consumed = 4 }
+            else if (std.mem.startsWith(u8, remaining, "&quot;"))
+                .{ .value = '"', .consumed = 6 }
+            else if (std.mem.startsWith(u8, remaining, "&apos;"))
+                .{ .value = '\'', .consumed = 6 }
+            else
+                null;
+            if (decoded) |entity| {
+                destination[write] = entity.value;
+                write += 1;
+                read += entity.consumed;
+                changed = true;
+            } else {
+                destination[write] = destination[read];
+                write += 1;
+                read += 1;
+            }
+        }
+        length = write;
+        if (!changed) break;
+    }
+    return length;
 }
 
 fn parseUnsigned(source: []const u8) Error!u32 {
@@ -600,6 +734,7 @@ test "imports a generated MusicXML melody with chords and rests" {
         \\<direction><sound tempo="84"/></direction>
         \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>2</duration><voice>1</voice><staff>1</staff></note>
         \\<note><chord/><pitch><step>E</step><octave>4</octave></pitch><duration>2</duration></note>
+        \\<direction><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>90</per-minute></metronome></direction-type></direction>
         \\<note><rest/><duration>1</duration></note>
         \\<note><pitch><step>G</step><alter>1</alter><octave>4</octave></pitch><duration>1</duration></note>
         \\</measure></part></score-partwise>
@@ -613,7 +748,29 @@ test "imports a generated MusicXML melody with chords and rests" {
     try std.testing.expectEqual(@as(f32, 0.5), report.notes[2].duration_beats);
     try std.testing.expectEqual(@as(u8, 68), report.notes[3].pitch);
     try std.testing.expectEqual(@as(f32, 0), report.notes[1].start_beat);
+    try std.testing.expectEqual(@as(usize, 2), report.tempo_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 84), report.tempos[0].bpm, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), report.tempos[1].start_beat, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 90), report.tempos[1].bpm, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 84), report.tempo_bpm, 0.01);
+    try std.testing.expectEqual(@as(u8, 4), report.tempo_beat_unit);
     try std.testing.expectEqualStrings("Generated Study", report.titleSlice());
+}
+
+test "imports printed eighth pulse separately from quarter-note playback tempo" {
+    const fixture =
+        \\<score-partwise version="4.0">
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<direction><direction-type><metronome><beat-unit>eighth</beat-unit><per-minute>147</per-minute></metronome></direction-type><sound tempo="73.5"/></direction>
+        \\<note><pitch><step>D</step><alter>-1</alter><octave>4</octave></pitch><duration>4</duration></note>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), report.tempo_bpm, 0.001);
+    try std.testing.expectEqual(@as(u8, 8), report.tempo_beat_unit);
+    try std.testing.expectEqual(@as(usize, 1), report.tempo_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 73.5), report.tempos[0].bpm, 0.001);
 }
 
 test "falls back to MusicXML page credits for title and composer" {
@@ -633,7 +790,7 @@ test "preserves professional note spelling dots beams accidentals and ties" {
         \\<?xml version="1.0"?>
         \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
         \\<part id="P1"><measure number="1"><attributes><divisions>8</divisions><key><fifths>-5</fifths></key><time><beats>6</beats><beat-type>4</beat-type></time></attributes>
-        \\<note><pitch><step>D</step><alter>-1</alter><octave>5</octave></pitch><duration>6</duration><dot/><accidental>flat</accidental><tie type="start"/><beam number="1">begin</beam><time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification><notations><tied type="start"/><slur type="start" placement="above"/><articulations><staccato/><accent/></articulations><tuplet type="start"/></notations></note>
+        \\<note><pitch><step>D</step><alter>-1</alter><octave>5</octave></pitch><duration>6</duration><dot/><accidental>flat</accidental><tie type="start"/><beam number="1">begin</beam><time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification><notations><tied type="start"/><slur type="start" placement="above"/><articulations><staccato/><accent/></articulations><tuplet type="start"/><technical><fingering>4</fingering></technical></notations></note>
         \\<note><pitch><step>D</step><alter>-1</alter><octave>5</octave></pitch><duration>2</duration><tie type="stop"/><beam number="1">end</beam><time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification><notations><tied type="stop"/><slur type="stop"/><tuplet type="stop"/></notations></note>
         \\</measure></part></score-partwise>
     ;
@@ -643,6 +800,7 @@ test "preserves professional note spelling dots beams accidentals and ties" {
     try std.testing.expectEqual(@as(i8, -1), report.notes[0].written_alter);
     try std.testing.expectEqual(@as(i8, 5), report.notes[0].written_octave);
     try std.testing.expectEqual(@as(u8, 1), report.notes[0].dots);
+    try std.testing.expectEqual(@as(u8, 4), report.notes[0].fingering);
     try std.testing.expect((report.notes[0].flags & model.note_flag_explicit_accidental) != 0);
     try std.testing.expect((report.notes[0].flags & model.note_flag_tie_start) != 0);
     try std.testing.expect((report.notes[0].flags & model.note_flag_beam_begin) != 0);
@@ -719,7 +877,7 @@ test "imports timed MusicXML pedal start change and stop directions" {
         \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
         \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
         \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration></note>
-        \\<direction placement="below"><direction-type><pedal type="start" line="yes"/></direction-type></direction>
+        \\<direction placement="below"><direction-type><pedal type="start" line="yes"/></direction-type><sound damper-pedal="42.52"/></direction>
         \\<note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration></note>
         \\<direction placement="below"><direction-type><pedal type="change" line="yes"/></direction-type><offset>2</offset></direction>
         \\<direction placement="below"><direction-type><pedal type="stop" line="yes"/></direction-type></direction>
@@ -729,7 +887,7 @@ test "imports timed MusicXML pedal start change and stop directions" {
     try std.testing.expectEqual(@as(usize, 3), report.pedal_count);
     try std.testing.expectApproxEqAbs(@as(f32, 1), report.pedals[0].start_beat, 0.001);
     try std.testing.expectEqual(model.pedal_action_start, report.pedals[0].action);
-    try std.testing.expectEqual(@as(u8, 127), report.pedals[0].value);
+    try std.testing.expectEqual(@as(u8, 54), report.pedals[0].value);
     try std.testing.expect((report.pedals[0].flags & model.pedal_flag_line) != 0);
     try std.testing.expectApproxEqAbs(@as(f32, 2), report.pedals[1].start_beat, 0.001);
     try std.testing.expectEqual(model.pedal_action_stop, report.pedals[1].action);
@@ -784,6 +942,21 @@ test "declared meter keeps later measures aligned when a measure is underfilled"
     try std.testing.expectEqual(@as(f32, 6), report.measures[2].start_beat);
     try std.testing.expectEqual(@as(u8, 2), report.measures[1].beats);
     try std.testing.expectEqual(@as(u8, 4), report.measures[1].beat_unit);
+}
+
+test "nested legacy XML entities decode to user-facing text" {
+    const xml =
+        \\<?xml version="1.0"?>
+        \\<score-partwise version="4.0"><work><work-title>A &amp;amp; B</work-title></work>
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions></attributes>
+        \\<direction><direction-type><words>You&amp;amp;amp;apos;re</words></direction-type></direction>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note></measure></part></score-partwise>
+    ;
+    const report = try parse(xml);
+    try std.testing.expectEqualStrings("A & B", report.titleSlice());
+    try std.testing.expectEqual(@as(usize, 1), report.lyric_count);
+    try std.testing.expectEqualStrings("You're", report.lyrics[0].textSlice());
 }
 
 test "implicit pickup advances by encoded extent" {

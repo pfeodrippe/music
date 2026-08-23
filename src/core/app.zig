@@ -162,23 +162,22 @@ pub const App = struct {
         if (after.playing != 0 and after.cursor_beat >= 0) {
             if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| {
                 const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-                const measures = self.measures[0..self.measure_count];
                 var window = if (state.score_view_mode == .continuous)
-                    ui.scoreContinuousForBeat(measures, state.view_start_beat, meta)
+                    self.scoreContinuousForState(state, meta, state.view_start_beat)
                 else
-                    ui.scorePageForBeat(measures, state.view_start_beat, meta);
+                    self.scorePageForState(state, meta, state.view_start_beat);
                 var visible_end = window.endBeat();
                 if (state.score_view_mode == .spread) {
-                    const right = ui.scorePageForBeat(measures, window.endBeat(), meta);
+                    const right = self.scorePageForState(state, meta, window.endBeat());
                     if (right.page_index != window.page_index) visible_end = right.endBeat();
                 }
                 if (after.cursor_beat < window.startBeat() or after.cursor_beat >= visible_end) {
                     window = if (state.score_view_mode == .continuous)
-                        ui.scoreContinuousForBeat(measures, after.cursor_beat, meta)
+                        self.scoreContinuousForState(state, meta, after.cursor_beat)
                     else
-                        ui.scorePageForBeat(measures, after.cursor_beat, meta);
+                        self.scorePageForState(state, meta, after.cursor_beat);
                     if (state.score_view_mode == .spread and (window.page_index & 1) != 0 and window.startBeat() > 0.0001) {
-                        window = ui.scorePageForBeat(measures, window.startBeat() - 0.001, meta);
+                        window = self.scorePageForState(state, meta, window.startBeat() - 0.001);
                     }
                     state.view_start_beat = window.startBeat();
                     c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
@@ -246,7 +245,8 @@ pub const App = struct {
                 transport.recording = if (transport.recording == 0) 1 else 0;
                 if (transport.recording != 0) {
                     self.take.reset(@intFromFloat(self.time_seconds * std.time.ns_per_s));
-                    self.take.tempo_bpm = transport.tempo_bpm;
+                    const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
+                    self.take.tempo_bpm = model.effectiveTempoAt(bounds, transport, @max(0, transport.cursor_beat));
                     (self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return).* = .{};
                     self.last_observed_pitch = 255;
                     self.last_observation_seconds = -10;
@@ -274,8 +274,12 @@ pub const App = struct {
                 transport.metronome_enabled = if (transport.metronome_enabled == 0) 1 else 0;
             } else if (layout.keyboard_toggle.contains(event.x, event.y)) {
                 state.keyboard_visible = if (state.keyboard_visible == 0) 1 else 0;
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                state.view_start_beat = self.scorePageForState(state, meta, state.view_start_beat).startBeat();
             } else if (layout.vocal_guide_toggle.contains(event.x, event.y)) {
                 state.vocal_guide_visible = if (state.vocal_guide_visible == 0) 1 else 0;
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                state.view_start_beat = self.scorePageForState(state, meta, state.view_start_beat).startBeat();
             } else if (layout.pedal_guide_toggle.contains(event.x, event.y)) {
                 state.pedal_guide_visible = if (state.pedal_guide_visible == 0) 1 else 0;
             } else if (layout.tempo_value.contains(event.x, event.y)) {
@@ -293,13 +297,15 @@ pub const App = struct {
                     .continuous => .spread,
                     .spread => .paged,
                 };
-                state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], state.view_start_beat, self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return).startBeat();
+                state.view_start_beat = self.scorePageForState(state, self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return, state.view_start_beat).startBeat();
             } else if (layout.zoom_minus.contains(event.x, event.y)) {
                 state.zoom = @max(0.65, state.zoom - 0.1);
             } else if (layout.zoom_plus.contains(event.x, event.y)) {
                 state.zoom = @min(1.05, state.zoom + 0.1);
             } else if (layout.focus_toggle.contains(event.x, event.y)) {
                 state.focus_score = if (state.focus_score == 0) 1 else 0;
+                const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
+                state.view_start_beat = self.scorePageForState(state, meta, state.view_start_beat).startBeat();
             } else if (layout.input_quick.contains(event.x, event.y)) {
                 self.host_request = .choose_microphone;
             } else if (layout.export_score.contains(event.x, event.y)) {
@@ -328,7 +334,7 @@ pub const App = struct {
                     .annotate => {
                         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
                         const hit = self.scoreHitContext(state, meta, layout.stage, event.x, event.y);
-                        self.annotations.begin(annotationPoint(hit.x, hit.y, event.pressure, hit.stage, self.time_seconds), hit.page.page_index);
+                        self.annotations.beginScore(self.annotationPointForHit(state, hit, event.pressure), hit.page.page_index);
                     },
                 };
                 for (layout.tool_buttons, 0..) |button, index| {
@@ -342,8 +348,8 @@ pub const App = struct {
                 const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
                 const hit = self.scoreHitContext(state, meta, layout.stage, event.x, event.y);
                 const active = self.annotations.active orelse return;
-                if (self.annotations.strokes[active].page_index == hit.page.page_index) {
-                    self.annotations.append(annotationPoint(hit.x, hit.y, event.pressure, hit.stage, self.time_seconds));
+                if (annotation.pageIndex(self.annotations.strokes[active]) == hit.page.page_index) {
+                    self.annotations.append(self.annotationPointForHit(state, hit, event.pressure));
                 }
             }
         } else if (event.kind == .up or event.kind == .cancel) {
@@ -462,6 +468,7 @@ pub const App = struct {
             const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
             self.previousScorePage(state, meta);
         }
+        if (state_for_navigation.tool == .edit and event.key >= '0' and event.key <= '5') self.setSelectedFingering(@intCast(event.key - '0'));
         if (event.key == 8 or event.key == 46 or event.key == 261) self.deleteSelectedNote();
         if (event.key == 38 or event.key == 265) self.moveSelectedNote(1, 0);
         if (event.key == 40 or event.key == 264) self.moveSelectedNote(-1, 0);
@@ -534,6 +541,7 @@ pub const App = struct {
         meta.beats_per_measure = report.beats_per_measure;
         meta.beat_unit = report.beat_unit;
         meta.key_fifths = report.key_fifths;
+        meta.tempo_beat_unit = report.tempo_beat_unit;
         const transport_state = self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
         transport_state.tempo_bpm = report.tempo_bpm;
         transport_state.cursor_beat = 0;
@@ -542,6 +550,7 @@ pub const App = struct {
         transport_state.loop_enabled = 0;
         transport_state.loop_start = 0;
         transport_state.loop_end = self.scoreEndBeat();
+        self.configureTempoMap(report.tempos[0..report.tempo_count], report.tempos[0].bpm, report.tempo_beat_unit);
         c.ecs_modified_id(self.world, self.session, self.ids.document_meta);
         c.ecs_modified_id(self.world, self.session, self.ids.transport);
         self.buildFrame();
@@ -562,6 +571,7 @@ pub const App = struct {
         meta.beats_per_measure = report.beats_per_measure;
         meta.beat_unit = report.beat_unit;
         meta.key_fifths = report.key_fifths;
+        meta.tempo_beat_unit = 4;
         const transport_state = self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
         transport_state.tempo_bpm = report.tempo_bpm;
         transport_state.cursor_beat = 0;
@@ -570,6 +580,7 @@ pub const App = struct {
         transport_state.loop_enabled = 0;
         transport_state.loop_start = 0;
         transport_state.loop_end = self.scoreEndBeat();
+        self.configureTempoMap(report.tempos[0..report.tempo_count], report.tempo_bpm, 4);
         c.ecs_modified_id(self.world, self.session, self.ids.document_meta);
         c.ecs_modified_id(self.world, self.session, self.ids.transport);
         self.buildFrame();
@@ -598,6 +609,7 @@ pub const App = struct {
         self.harmony_count = 0;
         self.pedal_count = 0;
         self.measure_count = 0;
+        self.configureTempoMap(&.{.{ .start_beat = 0, .bpm = 72 }}, 72, 4);
         (self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return).* = .{};
         if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| state.view_start_beat = 0;
     }
@@ -687,6 +699,11 @@ pub const App = struct {
         @memcpy(snapshot.pedals[0..self.pedal_count], self.pedals[0..self.pedal_count]);
         snapshot.measure_count = self.measure_count;
         @memcpy(snapshot.measures[0..self.measure_count], self.measures[0..self.measure_count]);
+        if (self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds)) |bounds| {
+            snapshot.tempo_base_bpm = bounds.tempo_base_bpm;
+            snapshot.tempo_count = @min(@as(usize, bounds.tempo_count), bounds.tempos.len);
+            @memcpy(snapshot.tempos[0..snapshot.tempo_count], bounds.tempos[0..snapshot.tempo_count]);
+        }
         snapshot.annotations = self.annotations;
         snapshot.take = self.take;
         return native_format.encode(snapshot, output);
@@ -704,7 +721,8 @@ pub const App = struct {
             notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
             count += 1;
         }
-        return musicxml_export.write(output, meta, transport, notes[0..count], self.lyrics[0..self.lyric_count], self.harmonies[0..self.harmony_count], self.pedals[0..self.pedal_count], self.measures[0..self.measure_count]);
+        const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
+        return musicxml_export.write(output, meta, transport, notes[0..count], self.lyrics[0..self.lyric_count], self.harmonies[0..self.harmony_count], self.pedals[0..self.pedal_count], self.measures[0..self.measure_count], bounds);
     }
 
     /// Exports the same editable notation inside the standard compressed
@@ -727,7 +745,8 @@ pub const App = struct {
             notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
             count += 1;
         }
-        return midi_export.write(output, meta, transport.tempo_bpm, notes[0..count], self.pedals[0..self.pedal_count]);
+        const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
+        return midi_export.write(output, meta, transport.tempo_bpm, bounds, notes[0..count], self.pedals[0..self.pedal_count]);
     }
 
     pub fn exportTakeMidi(self: *const App, output: []u8) !usize {
@@ -751,6 +770,7 @@ pub const App = struct {
         @memcpy(self.measures[0..self.measure_count], snapshot.measures[0..snapshot.measure_count]);
         self.rebuildTimeline();
         (self.getMut(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta).* = snapshot.meta;
+        self.configureTempoMap(snapshot.tempos[0..snapshot.tempo_count], snapshot.tempo_base_bpm, snapshot.meta.tempo_beat_unit);
         (self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport).* = snapshot.transport;
         self.annotations = snapshot.annotations;
         self.take = snapshot.take;
@@ -778,15 +798,20 @@ pub const App = struct {
 
         var result_len: usize = 0;
         if (std.mem.eql(u8, input, "help")) {
-            result_len = devResponse(response, "ok commands: state | load FILE | export FILE | export-take FILE | capture FILE | record start|stop | midi STATUS DATA1 DATA2 | sampler state | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | view paged|continuous|spread | zoom 0.65..1.05 | focus on|off|toggle | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
+            result_len = devResponse(response, "ok commands: state | fingering state|chord|set NOTE_ID 1..5|clear | ink dot BEAT HEIGHT|undo | load FILE | export FILE | export-take FILE | capture FILE.bmp | window WIDTH HEIGHT | record start|stop | midi STATUS DATA1 DATA2 | sampler state | sampler detail studio|dry|RELEASE HAMMER PEDAL_NOISE RESONANCE | reload | shader reload|state | play | pause | toggle | seek BEAT | page next|previous | tempo BPM | view paged|continuous|spread | zoom 0.65..1.05 | focus on|off|toggle | keys on|off|toggle | voice on|off|toggle | pedal on|off|toggle | metronome on|off|toggle | loop on|off|toggle | tool read|edit|ink|practice | plugin COMMAND", .{});
         } else if (std.mem.eql(u8, input, "state")) {
             const position = model.barBeatAt(self.measures[0..self.measure_count], transport_state.cursor_beat, meta);
-            result_len = devResponse(response, "ok generation={d} playing={d} cursor={d:.3} tempo={d:.2} end={d:.3} page={d:.3} view={s} zoom={d:.2} focus={d} bar={d} beat={d} measures={d} keys={d} voice={d} pedalguide={d} notes={d} harmonies={d} pedals={d} take={d} title={s}", .{
+            result_len = devResponse(response, "ok generation={d} playing={d} cursor={d:.3} tempo={d:.2} pulse_unit={d} quarter={d:.2} end={d:.3} loop={d} loop_start={d:.3} loop_end={d:.3} page={d:.3} view={s} zoom={d:.2} focus={d} bar={d} beat={d} measures={d} keys={d} voice={d} pedalguide={d} notes={d} harmonies={d} pedals={d} ink={d} take={d} title={s}", .{
                 self.plugin_generation,
                 transport_state.playing,
                 transport_state.cursor_beat,
                 transport_state.tempo_bpm,
+                bounds.tempo_beat_unit,
+                model.effectiveTempoAt(bounds, transport_state, @max(0, transport_state.cursor_beat)),
                 bounds.end_beat,
+                transport_state.loop_enabled,
+                transport_state.loop_start,
+                transport_state.loop_end,
                 ui_state.view_start_beat,
                 @tagName(ui_state.score_view_mode),
                 ui_state.zoom,
@@ -800,14 +825,62 @@ pub const App = struct {
                 self.note_count,
                 self.harmony_count,
                 self.pedal_count,
+                self.annotations.stroke_count,
                 self.take.midi_len,
                 meta.titleSlice(),
             });
+        } else if (std.mem.eql(u8, input, "fingering state") or std.mem.eql(u8, input, "fingering chord")) {
+            var notes: [musicxml.max_import_notes]model.Note = undefined;
+            for (self.note_entities[0..self.note_count], 0..) |entity, index| notes[index] = (self.getConst(model.Note, entity, self.ids.note) orelse return devResponse(response, "error missing note", .{})).*;
+            if (std.mem.eql(u8, input, "fingering chord")) {
+                result_len = chordFingeringResponse(response, ui.chordFingeringSnapshot(notes[0..self.note_count], @max(0, transport_state.cursor_beat)));
+            } else {
+                const guide = ui.fingeringSnapshot(notes[0..self.note_count], @max(0, transport_state.cursor_beat));
+                result_len = devResponse(response, "ok left={d}:{d} next={d}:{d} right={d}:{d} next={d}:{d}", .{
+                    guide.left_current_pitch,
+                    guide.left_current_finger,
+                    guide.left_next_pitch,
+                    guide.left_next_finger,
+                    guide.right_current_pitch,
+                    guide.right_current_finger,
+                    guide.right_next_pitch,
+                    guide.right_next_finger,
+                });
+            }
+        } else if (commandArgument(input, "fingering")) |argument| {
+            var fields = std.mem.tokenizeAny(u8, argument, " \t");
+            if (!std.mem.eql(u8, fields.next() orelse "", "set")) return devResponse(response, "error fingering expects state, chord, or set NOTE_ID 1..5|clear", .{});
+            const stable_id_text = fields.next() orelse return devResponse(response, "error fingering set expects NOTE_ID 1..5|clear", .{});
+            const finger_text = fields.next() orelse return devResponse(response, "error fingering set expects NOTE_ID 1..5|clear", .{});
+            if (fields.next() != null) return devResponse(response, "error fingering set expects NOTE_ID 1..5|clear", .{});
+            const stable_id = std.fmt.parseUnsigned(u64, stable_id_text, 10) catch return devResponse(response, "error invalid note id", .{});
+            const finger: u8 = if (std.mem.eql(u8, finger_text, "clear")) 0 else std.fmt.parseUnsigned(u8, finger_text, 10) catch return devResponse(response, "error fingering expects 1..5 or clear", .{});
+            if (finger > 5) return devResponse(response, "error fingering expects 1..5 or clear", .{});
+            if (!self.setNoteFingering(stable_id, finger, true)) return devResponse(response, "error note id {d} not found", .{stable_id});
+            result_len = devResponse(response, "ok note={d} fingering={d}", .{ stable_id, finger });
+        } else if (commandArgument(input, "ink")) |argument| {
+            if (std.mem.eql(u8, argument, "undo")) {
+                result_len = devResponse(response, "ok ink_undone={d} strokes={d}", .{ @intFromBool(self.annotations.undoLast()), self.annotations.stroke_count });
+            } else {
+                var fields = std.mem.tokenizeAny(u8, argument, " \t");
+                if (!std.mem.eql(u8, fields.next() orelse "", "dot")) return devResponse(response, "error ink expects dot BEAT HEIGHT or undo", .{});
+                const beat_text = fields.next() orelse return devResponse(response, "error ink dot expects BEAT HEIGHT", .{});
+                const height_text = fields.next() orelse return devResponse(response, "error ink dot expects BEAT HEIGHT", .{});
+                if (fields.next() != null) return devResponse(response, "error ink dot expects BEAT HEIGHT", .{});
+                const beat = std.fmt.parseFloat(f32, beat_text) catch return devResponse(response, "error invalid ink beat", .{});
+                const height = std.fmt.parseFloat(f32, height_text) catch return devResponse(response, "error invalid ink height", .{});
+                if (!std.math.isFinite(beat) or beat < 0 or beat > bounds.end_beat) return devResponse(response, "error ink beat outside score", .{});
+                if (!std.math.isFinite(height) or height < 0 or height > 1) return devResponse(response, "error ink height expects 0..1", .{});
+                const page = self.scorePageForState(ui_state, meta, beat);
+                self.annotations.beginScore(.{ .u = beat, .v = height, .pressure = 0.7, .time_ms = self.time_seconds * 1000 }, page.page_index);
+                self.annotations.end();
+                result_len = devResponse(response, "ok ink beat={d:.3} height={d:.3} page={d} strokes={d}", .{ beat, height, page.page_index + 1, self.annotations.stroke_count });
+            }
         } else if (commandArgument(input, "record")) |argument| {
             if (std.mem.eql(u8, argument, "start")) {
                 transport_state.recording = 1;
                 self.take.reset(@intFromFloat(self.time_seconds * std.time.ns_per_s));
-                self.take.tempo_bpm = transport_state.tempo_bpm;
+                self.take.tempo_bpm = model.effectiveTempoAt(bounds, transport_state, @max(0, transport_state.cursor_beat));
                 practice_state.* = .{};
                 self.host_request = .start_recording;
                 result_len = devResponse(response, "ok recording=1 tempo={d:.2}", .{self.take.tempo_bpm});
@@ -843,8 +916,17 @@ pub const App = struct {
         } else if (commandArgument(input, "seek")) |argument| {
             const beat = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error seek expects a number", .{});
             transport_state.cursor_beat = std.math.clamp(beat, 0, bounds.end_beat);
-            ui_state.view_start_beat = ui.scorePageForBeat(self.measures[0..self.measure_count], transport_state.cursor_beat, meta).startBeat();
-            result_len = devResponse(response, "ok cursor={d:.3} page={d:.3}", .{ transport_state.cursor_beat, ui_state.view_start_beat });
+            // A stale loop after a remote/dev seek can otherwise wrap the
+            // cursor into an unrelated bar on the first playback frame. A
+            // deliberate seek outside the active range means the user left
+            // that loop; seeking within it preserves the loop.
+            if (transport_state.loop_enabled != 0 and
+                (transport_state.cursor_beat < transport_state.loop_start or transport_state.cursor_beat >= transport_state.loop_end))
+            {
+                transport_state.loop_enabled = 0;
+            }
+            ui_state.view_start_beat = self.scorePageForState(ui_state, meta, transport_state.cursor_beat).startBeat();
+            result_len = devResponse(response, "ok cursor={d:.3} page={d:.3} loop={d}", .{ transport_state.cursor_beat, ui_state.view_start_beat, transport_state.loop_enabled });
         } else if (commandArgument(input, "page")) |argument| {
             if (std.mem.eql(u8, argument, "next")) {
                 self.nextScorePage(ui_state, meta);
@@ -853,7 +935,10 @@ pub const App = struct {
             } else {
                 return devResponse(response, "error page expects next or previous", .{});
             }
-            const page = ui.scorePageForBeat(self.measures[0..self.measure_count], ui_state.view_start_beat, meta);
+            const page = if (ui_state.score_view_mode == .continuous)
+                self.scoreContinuousForState(ui_state, meta, ui_state.view_start_beat)
+            else
+                self.scorePageForState(ui_state, meta, ui_state.view_start_beat);
             result_len = devResponse(response, "ok page={d} start={d:.3} end={d:.3}", .{ page.page_index + 1, page.startBeat(), page.endBeat() });
         } else if (commandArgument(input, "tempo")) |argument| {
             const bpm = std.fmt.parseFloat(f32, argument) catch return devResponse(response, "error tempo expects a number", .{});
@@ -1044,19 +1129,31 @@ pub const App = struct {
         return false;
     }
 
+    fn scoreSystemsForState(self: *const App, state: *const model.UiState) usize {
+        const layout = ui.Layout.calculateForState(state);
+        return ui.scoreSystemsPerPage(layout.stage.height, self.vocalStaffVisible(state));
+    }
+
+    fn scorePageForState(self: *const App, state: *const model.UiState, meta: *const model.DocumentMeta, beat: f32) ui.ScorePage {
+        return ui.scorePageForBeatLimited(self.measures[0..self.measure_count], beat, meta, state.zoom, self.scoreSystemsForState(state));
+    }
+
+    fn scoreContinuousForState(self: *const App, state: *const model.UiState, meta: *const model.DocumentMeta, beat: f32) ui.ScorePage {
+        return ui.scoreContinuousForBeatLimited(self.measures[0..self.measure_count], beat, meta, state.zoom, self.scoreSystemsForState(state));
+    }
+
     fn scoreHitContext(self: *const App, state: *const model.UiState, meta: *const model.DocumentMeta, stage: ui.Rect, x: f32, y: f32) ScoreHitContext {
-        const measures = self.measures[0..self.measure_count];
         var pane = stage;
         var page = if (state.score_view_mode == .continuous)
-            ui.scoreContinuousForBeat(measures, state.view_start_beat, meta)
+            self.scoreContinuousForState(state, meta, state.view_start_beat)
         else
-            ui.scorePageForBeat(measures, state.view_start_beat, meta);
+            self.scorePageForState(state, meta, state.view_start_beat);
         if (state.score_view_mode == .spread and stage.width >= 760) {
             const gap: f32 = 12;
             const pane_width = (stage.width - gap) * 0.5;
             if (x >= stage.x + pane_width + gap) {
                 pane = .{ .x = stage.x + pane_width + gap, .y = stage.y, .width = pane_width, .height = stage.height };
-                const right = ui.scorePageForBeat(measures, page.endBeat(), meta);
+                const right = self.scorePageForState(state, meta, page.endBeat());
                 if (right.page_index != page.page_index) page = right;
             } else {
                 pane.width = pane_width;
@@ -1073,6 +1170,31 @@ pub const App = struct {
         };
     }
 
+    fn annotationPointForHit(self: *const App, state: *const model.UiState, hit: ScoreHitContext, pressure: f32) annotation.Point {
+        const vocal_visible = self.vocalStaffVisible(state);
+        const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, vocal_visible);
+        var system: usize = 0;
+        if (hit.page.system_count > 1) {
+            const first_bottom = geometry.bass_y[0] + 49;
+            const second_top = if (vocal_visible) geometry.vocal_y[1] else geometry.treble_y[1];
+            if (hit.y >= (first_bottom + second_top) * 0.5) system = 1;
+        }
+        const top = if (vocal_visible) geometry.vocal_y[system] else geometry.treble_y[system];
+        const bottom = geometry.bass_y[system] + 49;
+        const score_system = hit.page.systems[system];
+        const beat = std.math.clamp(
+            ui.scoreBeatAtX(geometry, hit.page, self.measures[0..self.measure_count], system, hit.x),
+            score_system.start_beat,
+            @max(score_system.start_beat, score_system.end_beat - 0.001),
+        );
+        return .{
+            .u = beat,
+            .v = std.math.clamp((hit.y - top) / @max(1, bottom - top), -1, 2),
+            .pressure = if (pressure > 0) pressure else 0.5,
+            .time_ms = self.time_seconds * 1000,
+        };
+    }
+
     fn insertNoteAt(self: *App, x: f32, y: f32, stage: ui.Rect) void {
         if (self.note_count == self.note_entities.len) return;
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
@@ -1083,7 +1205,7 @@ pub const App = struct {
         const geometry = ui.ScoreGeometry.calculateWithVocal(hit.stage, vocal_visible);
         const page = hit.page;
         const next_system_top = if (vocal_visible) geometry.vocal_y[1] else geometry.treble_y[1];
-        const system_index: u8 = if (hit.y < (geometry.bass_y[0] + 48 + next_system_top) * 0.5) 0 else 1;
+        const system_index: u8 = if (page.system_count == 1 or hit.y < (geometry.bass_y[0] + 48 + next_system_top) * 0.5) 0 else 1;
         const treble_distance = @abs(hit.y - (geometry.treble_y[system_index] + 24));
         const bass_distance = @abs(hit.y - (geometry.bass_y[system_index] + 24));
         const staff: u8 = if (bass_distance < treble_distance) 1 else 0;
@@ -1169,6 +1291,28 @@ pub const App = struct {
         }
     }
 
+    fn setNoteFingering(self: *App, stable_id: u64, finger: u8, record_history: bool) bool {
+        for (self.note_entities[0..self.note_count]) |entity| {
+            const note = self.getConst(model.Note, entity, self.ids.note) orelse continue;
+            if (note.stable_id != stable_id) continue;
+            if (note.fingering == finger) return true;
+            var replacement = note.*;
+            replacement.fingering = finger;
+            self.replaceNote(stable_id, replacement, record_history);
+            return true;
+        }
+        return false;
+    }
+
+    fn setSelectedFingering(self: *App, finger: u8) void {
+        for (self.note_entities[0..self.note_count]) |entity| {
+            const note = self.getConst(model.Note, entity, self.ids.note) orelse continue;
+            if (note.selected == 0) continue;
+            _ = self.setNoteFingering(note.stable_id, finger, true);
+            return;
+        }
+    }
+
     fn selectNearestNote(self: *App, x: f32, y: f32, stage: ui.Rect) void {
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return;
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
@@ -1211,34 +1355,38 @@ pub const App = struct {
     }
 
     fn nextScorePage(self: *const App, state: *model.UiState, meta: *const model.DocumentMeta) void {
-        const measures = self.measures[0..self.measure_count];
         if (state.score_view_mode == .continuous) {
-            const window = ui.scoreContinuousForBeat(measures, state.view_start_beat, meta);
-            if (window.system_count > 1) state.view_start_beat = window.systems[1].start_beat;
+            const window = self.scoreContinuousForState(state, meta, state.view_start_beat);
+            if (window.system_count > 1) {
+                state.view_start_beat = window.systems[1].start_beat;
+            } else if (window.endBeat() < self.scoreEndBeat() - 0.0001) {
+                state.view_start_beat = window.endBeat();
+            }
             return;
         }
-        var page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        var page = self.scorePageForState(state, meta, state.view_start_beat);
+        state.view_start_beat = page.startBeat();
         const advances: usize = if (state.score_view_mode == .spread) 2 else 1;
         for (0..advances) |_| {
             if (page.endBeat() >= self.scoreEndBeat() - 0.0001) break;
             state.view_start_beat = page.endBeat();
-            page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+            page = self.scorePageForState(state, meta, state.view_start_beat);
         }
     }
 
     fn previousScorePage(self: *const App, state: *model.UiState, meta: *const model.DocumentMeta) void {
-        const measures = self.measures[0..self.measure_count];
         if (state.score_view_mode == .continuous) {
-            const window = ui.scoreContinuousForBeat(measures, state.view_start_beat, meta);
-            if (window.startBeat() > 0.0001) state.view_start_beat = ui.scoreContinuousForBeat(measures, window.startBeat() - 0.001, meta).startBeat();
+            const window = self.scoreContinuousForState(state, meta, state.view_start_beat);
+            if (window.startBeat() > 0.0001) state.view_start_beat = self.scoreContinuousForState(state, meta, window.startBeat() - 0.001).startBeat();
             return;
         }
-        var page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+        var page = self.scorePageForState(state, meta, state.view_start_beat);
+        state.view_start_beat = page.startBeat();
         const retreats: usize = if (state.score_view_mode == .spread) 2 else 1;
         for (0..retreats) |_| {
             if (page.startBeat() <= 0.0001) break;
-            state.view_start_beat = ui.scorePageForBeat(measures, page.startBeat() - 0.001, meta).startBeat();
-            page = ui.scorePageForBeat(measures, state.view_start_beat, meta);
+            state.view_start_beat = self.scorePageForState(state, meta, page.startBeat() - 0.001).startBeat();
+            page = self.scorePageForState(state, meta, state.view_start_beat);
         }
     }
 
@@ -1275,7 +1423,8 @@ pub const App = struct {
             }
         }
         const expected = nearest orelse return;
-        const milliseconds_per_beat = 60_000.0 / transport_state.tempo_bpm;
+        const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
+        const milliseconds_per_beat = 60_000.0 / model.effectiveTempoAt(bounds, transport_state, transport_state.cursor_beat);
         const result = practice_assessment.assess(expected.pitch, expected.start_beat * milliseconds_per_beat, played_pitch, transport_state.cursor_beat * milliseconds_per_beat, confidence);
         const state = self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return;
         state.total_notes += 1;
@@ -1307,7 +1456,8 @@ pub const App = struct {
             }
         }
         const expected = nearest orelse return;
-        const milliseconds_per_beat = 60_000.0 / @max(1, transport_state.tempo_bpm);
+        const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
+        const milliseconds_per_beat = 60_000.0 / model.effectiveTempoAt(bounds, transport_state, transport_state.cursor_beat);
         const delta_ms = (transport_state.cursor_beat - expected.start_beat) * milliseconds_per_beat;
         const practice_state = self.getMut(model.PracticeState, self.session, self.ids.practice) orelse return;
         practice_state.pedal_changes += 1;
@@ -1368,6 +1518,20 @@ pub const App = struct {
         self.timeline = playback.Timeline.build(notes[0..len]) catch .{};
         const bounds = self.getMut(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
         bounds.end_beat = self.scoreEndBeat();
+        c.ecs_modified_id(self.world, self.session, self.ids.playback_bounds);
+    }
+
+    fn configureTempoMap(self: *App, tempos: []const model.TempoEvent, base_bpm: f32, tempo_beat_unit: u8) void {
+        const bounds = self.getMut(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
+        bounds.tempo_base_bpm = if (std.math.isFinite(base_bpm) and base_bpm > 0) base_bpm else 72;
+        bounds.tempo_beat_unit = @max(@as(u8, 1), tempo_beat_unit);
+        bounds.tempo_count = @intCast(@min(tempos.len, bounds.tempos.len));
+        if (bounds.tempo_count == 0) {
+            bounds.tempo_count = 1;
+            bounds.tempos[0] = .{ .start_beat = 0, .bpm = bounds.tempo_base_bpm };
+        } else {
+            @memcpy(bounds.tempos[0..bounds.tempo_count], tempos[0..bounds.tempo_count]);
+        }
         c.ecs_modified_id(self.world, self.session, self.ids.playback_bounds);
     }
 
@@ -1586,19 +1750,33 @@ fn devResponse(output: []u8, comptime format: []const u8, arguments: anytype) us
     return value.len;
 }
 
+fn appendDevResponse(output: []u8, len: *usize, comptime format: []const u8, arguments: anytype) bool {
+    const value = std.fmt.bufPrint(output[len.*..], format, arguments) catch return false;
+    len.* += value.len;
+    return true;
+}
+
+fn chordFingeringResponse(output: []u8, guide: ui.ChordFingeringSnapshot) usize {
+    var len: usize = 0;
+    if (!appendDevResponse(output, &len, "ok", .{})) return 0;
+    const labels = [_][]const u8{ "left", "left-next", "right", "right-next" };
+    const chords = [_]ui.ChordFingering{ guide.left_current, guide.left_next, guide.right_current, guide.right_next };
+    for (labels, chords) |label, chord| {
+        if (!appendDevResponse(output, &len, " {s}[{d}]", .{ label, chord.len })) return len;
+        if (chord.overflow != 0 and !appendDevResponse(output, &len, "+{d}", .{chord.overflow})) return len;
+        if (!appendDevResponse(output, &len, "=", .{})) return len;
+        for (chord.pitches[0..chord.len], chord.fingers[0..chord.len], 0..) |pitch, finger, index| {
+            if (index != 0 and !appendDevResponse(output, &len, ",", .{})) return len;
+            if (!appendDevResponse(output, &len, "{d}:{d}", .{ pitch, finger })) return len;
+        }
+    }
+    return len;
+}
+
 fn createEntity(world: *c.ecs_world_t, name: ?[*:0]const u8) c.ecs_entity_t {
     var descriptor: c.ecs_entity_desc_t = std.mem.zeroes(c.ecs_entity_desc_t);
     descriptor.name = name;
     return c.ecs_entity_init(world, &descriptor);
-}
-
-fn annotationPoint(x: f32, y: f32, pressure: f32, stage: ui.Rect, time_seconds: f32) annotation.Point {
-    return .{
-        .u = std.math.clamp((x - stage.x) / stage.width, 0, 1),
-        .v = std.math.clamp((y - stage.y) / stage.height, 0, 1),
-        .pressure = if (pressure > 0) pressure else 0.5,
-        .time_ms = time_seconds * 1000,
-    };
 }
 
 fn registerComponent(world: *c.ecs_world_t, comptime T: type, name: [*:0]const u8) c.ecs_entity_t {
@@ -1706,9 +1884,128 @@ test "development commands control live Flecs state and invoke hot Zig code" {
     try std.testing.expectEqual(first_before + 1, first_after);
 
     len = app.runDevCommand("state", &response);
-    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "generation=11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "generation=13") != null);
     try std.testing.expect(std.mem.indexOf(u8, response[0..len], "keys=0") != null);
     try std.testing.expect(std.mem.indexOf(u8, response[0..len], "pedalguide=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "ink=0") != null);
+}
+
+test "development ink command creates removable score-space QA marks" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    var response: [256]u8 = undefined;
+
+    var len = app.runDevCommand("ink dot 10 0.5", &response);
+    try std.testing.expect(std.mem.startsWith(u8, response[0..len], "ok ink beat=10.000 height=0.500"));
+    try std.testing.expectEqual(@as(usize, 1), app.annotations.stroke_count);
+    try std.testing.expect(annotation.isScoreSpace(app.annotations.strokes[0]));
+    try std.testing.expectApproxEqAbs(@as(f32, 10), app.annotations.points[0].u, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.annotations.points[0].v, 0.001);
+
+    len = app.runDevCommand("ink undo", &response);
+    try std.testing.expectEqualStrings("ok ink_undone=1 strokes=0", response[0..len]);
+    try std.testing.expectEqual(@as(usize, 0), app.annotations.stroke_count);
+    len = app.runDevCommand("ink dot 10 1.5", &response);
+    try std.testing.expectEqualStrings("error ink height expects 0..1", response[0..len]);
+}
+
+test "development fingering state reports phrase-aware hands and ignores vocal guide" {
+    const fixture =
+        \\<score-partwise version="4.0"><work><work-title>Fingering Study</work-title></work>
+        \\<part-list>
+        \\<score-part id="P1"><part-name>Piano</part-name></score-part>
+        \\<score-part id="P2"><part-name>Voice</part-name></score-part>
+        \\</part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions><time><beats>5</beats><beat-type>4</beat-type></time><staves>2</staves></attributes>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><pitch><step>F</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><pitch><step>G</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<backup><duration>5</duration></backup>
+        \\<note><pitch><step>C</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><pitch><step>D</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><pitch><step>E</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><pitch><step>F</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><pitch><step>G</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\</measure></part>
+        \\<part id="P2"><measure number="1"><attributes><divisions>1</divisions><time><beats>5</beats><beat-type>4</beat-type></time></attributes>
+        \\<note><pitch><step>A</step><octave>5</octave></pitch><duration>1</duration></note>
+        \\<note><pitch><step>B</step><octave>5</octave></pitch><duration>1</duration></note>
+        \\<note><pitch><step>C</step><octave>6</octave></pitch><duration>1</duration></note>
+        \\<note><pitch><step>D</step><octave>6</octave></pitch><duration>1</duration></note>
+        \\<note><pitch><step>E</step><octave>6</octave></pitch><duration>1</duration></note>
+        \\</measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(fixture);
+
+    var response: [256]u8 = undefined;
+    const len = app.runDevCommand("fingering state", &response);
+    try std.testing.expectEqualStrings("ok left=48:5 next=50:4 right=60:1 next=62:2", response[0..len]);
+}
+
+test "authored fingering is editable through native keys and development commands" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions></attributes>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note>
+        \\</measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(fixture);
+
+    var response: [256]u8 = undefined;
+    var len = app.runDevCommand("fingering set 1 5", &response);
+    try std.testing.expectEqualStrings("ok note=1 fingering=5", response[0..len]);
+    try std.testing.expectEqual(@as(u8, 5), (app.getConst(model.Note, app.note_entities[0], app.ids.note) orelse return error.MissingNote).fingering);
+    len = app.runDevCommand("fingering state", &response);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..len], "right=60:5") != null);
+
+    const ui_state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    ui_state.tool = .edit;
+    const note = app.getMut(model.Note, app.note_entities[0], app.ids.note) orelse return error.MissingNote;
+    note.selected = 1;
+    app.key(.{ .key = '3', .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u8, 3), (app.getConst(model.Note, app.note_entities[0], app.ids.note) orelse return error.MissingNote).fingering);
+    app.undo();
+    try std.testing.expectEqual(@as(u8, 5), (app.getConst(model.Note, app.note_entities[0], app.ids.note) orelse return error.MissingNote).fingering);
+    len = app.runDevCommand("fingering set 1 clear", &response);
+    try std.testing.expectEqualStrings("ok note=1 fingering=0", response[0..len]);
+}
+
+test "development fingering chord reports every simultaneous piano tone" {
+    const fixture =
+        \\<score-partwise version="4.0"><work><work-title>Chord Fingering Study</work-title></work>
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions><time><beats>2</beats><beat-type>4</beat-type></time><staves>2</staves></attributes>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><chord/><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><chord/><pitch><step>G</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><chord/><pitch><step>F</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<note><chord/><pitch><step>A</step><octave>4</octave></pitch><duration>1</duration><staff>1</staff></note>
+        \\<backup><duration>2</duration></backup>
+        \\<note><pitch><step>C</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><chord/><pitch><step>E</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><chord/><pitch><step>G</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><pitch><step>D</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><chord/><pitch><step>F</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\<note><chord/><pitch><step>A</step><octave>3</octave></pitch><duration>1</duration><staff>2</staff></note>
+        \\</measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(fixture);
+
+    var response: [512]u8 = undefined;
+    const len = app.runDevCommand("fingering chord", &response);
+    try std.testing.expectEqualStrings(
+        "ok left[3]=48:5,52:3,55:1 left-next[3]=50:5,53:3,57:1 right[3]=60:1,64:3,67:5 right-next[3]=62:1,65:3,69:5",
+        response[0..len],
+    );
 }
 
 test "MusicXML harmony survives app import GPU state and export re-import" {
@@ -1972,6 +2269,23 @@ test "loop button isolates the current meter-aware measure" {
     try std.testing.expectEqual(@as(f32, 6), transport.loop_end);
 }
 
+test "development seek outside an active loop leaves the stale loop" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
+    transport.loop_enabled = 1;
+    transport.loop_start = 8;
+    transport.loop_end = 12;
+    var response: [256]u8 = undefined;
+
+    _ = app.runDevCommand("seek 10", &response);
+    try std.testing.expectEqual(@as(u32, 1), transport.loop_enabled);
+
+    const response_len = app.runDevCommand("seek 20", &response);
+    try std.testing.expectEqual(@as(u32, 0), transport.loop_enabled);
+    try std.testing.expect(std.mem.indexOf(u8, response[0..response_len], "loop=0") != null);
+}
+
 test "metronome accents every authored variable-meter barline" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
@@ -1990,9 +2304,13 @@ test "page navigation preserves the Flecs document and moves the GPU score windo
     const app = try App.create(std.heap.c_allocator, 1024, 768, 2);
     defer app.destroy(std.heap.c_allocator);
     try std.testing.expect(app.scoreEndBeat() > 31);
+    const initial_state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    const meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
+    const expected_start = app.scorePageForState(initial_state, meta, initial_state.view_start_beat).endBeat();
     app.key(.{ .key = 34, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
     const state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
-    try std.testing.expectEqual(@as(f32, 16), @floor(state.view_start_beat / 16) * 16);
+    try std.testing.expectEqual(expected_start, state.view_start_beat);
+    try std.testing.expect(state.view_start_beat > 0);
     try std.testing.expect(app.drawItems().len > 100);
 }
 
@@ -2057,7 +2375,7 @@ test "score viewport modes navigate at page system and spread granularity" {
     try std.testing.expect(focused.stage.height > 800);
 }
 
-test "spread annotations attach to the clicked page in unscaled score coordinates" {
+test "spread annotations attach to the clicked page in score coordinates" {
     const app = try App.create(std.heap.c_allocator, 1440, 900, 2);
     defer app.destroy(std.heap.c_allocator);
     const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
@@ -2073,12 +2391,16 @@ test "spread annotations attach to the clicked page in unscaled score coordinate
     const target_y = pane.y + pane.height * 0.4;
     const screen_x = pane.x + pane.width * 0.5 + (target_x - (pane.x + pane.width * 0.5)) * state.zoom;
     const screen_y = pane.y + pane.height * 0.5 + (target_y - (pane.y + pane.height * 0.5)) * state.zoom;
+    const meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
+    const hit = app.scoreHitContext(state, meta, layout.stage, screen_x, screen_y);
+    const expected = app.annotationPointForHit(state, hit, 0.5);
     app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 9, .buttons = 1, .x = screen_x, .y = screen_y, .pressure = 0.5, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 9, .buttons = 0, .x = screen_x, .y = screen_y, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     try std.testing.expectEqual(@as(usize, 1), app.annotations.stroke_count);
-    try std.testing.expectEqual(@as(u32, 1), app.annotations.strokes[0].page_index);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), app.annotations.points[0].u, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), app.annotations.points[0].v, 0.001);
+    try std.testing.expect(annotation.isScoreSpace(app.annotations.strokes[0]));
+    try std.testing.expectEqual(hit.page.page_index, annotation.pageIndex(app.annotations.strokes[0]));
+    try std.testing.expectApproxEqAbs(expected.u, app.annotations.points[0].u, 0.001);
+    try std.testing.expectApproxEqAbs(expected.v, app.annotations.points[0].v, 0.001);
 }
 
 test "clicking the GPU tempo readout edits and validates BPM" {
@@ -2113,6 +2435,54 @@ test "clicking the GPU tempo readout edits and validates BPM" {
     try std.testing.expectEqual(@as(u32, 0), state.tempo_editing);
 }
 
+test "MusicXML eighth pulse drives quarter-note transport time" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const source =
+        \\<score-partwise version="4.0">
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<direction><direction-type><metronome><beat-unit>eighth</beat-unit><per-minute>147</per-minute></metronome></direction-type><sound tempo="73.5"/></direction>
+        \\<note><pitch><step>D</step><alter>-1</alter><octave>4</octave></pitch><duration>16</duration></note>
+        \\</measure></part></score-partwise>
+    ;
+    try app.importMusicXml(source);
+    const meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
+    const bounds = app.getConst(model.PlaybackBounds, app.session, app.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
+    const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
+    try std.testing.expectEqual(@as(u8, 8), meta.tempo_beat_unit);
+    try std.testing.expectEqual(@as(u32, 8), bounds.tempo_beat_unit);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), transport.tempo_bpm, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 73.5), model.effectiveTempoAt(bounds, transport, 0), 0.001);
+    transport.playing = 1;
+    app.tick(0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1225), app.transportSnapshot().cursor_beat, 0.0001);
+}
+
+test "MusicXML quarter 147 never halves transport playback" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const source =
+        \\<score-partwise version="4.0">
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<direction><direction-type><metronome><beat-unit>quarter</beat-unit><per-minute>147</per-minute></metronome></direction-type><sound tempo="147"/></direction>
+        \\<note><pitch><step>D</step><alter>-1</alter><octave>4</octave></pitch><duration>16</duration></note>
+        \\</measure></part></score-partwise>
+    ;
+    try app.importMusicXml(source);
+    const meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
+    const bounds = app.getConst(model.PlaybackBounds, app.session, app.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
+    const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
+    try std.testing.expectEqual(@as(u8, 4), meta.tempo_beat_unit);
+    try std.testing.expectEqual(@as(u32, 4), bounds.tempo_beat_unit);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), transport.tempo_bpm, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 147), model.effectiveTempoAt(bounds, transport, 0), 0.001);
+    transport.playing = 1;
+    app.tick(0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.245), app.transportSnapshot().cursor_beat, 0.0001);
+}
+
 test "variable-meter page navigation and annotation anchors use authored systems" {
     const app = try App.create(std.heap.c_allocator, 1024, 768, 2);
     defer app.destroy(std.heap.c_allocator);
@@ -2127,16 +2497,19 @@ test "variable-meter page navigation and annotation anchors use authored systems
 
     var response: [256]u8 = undefined;
     var response_len = app.runDevCommand("page next", &response);
-    try std.testing.expectEqualStrings("ok page=2 start=17.000 end=24.000", response[0..response_len]);
+    try std.testing.expectEqualStrings("ok page=2 start=8.000 end=17.000", response[0..response_len]);
     const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
-    try std.testing.expectEqual(@as(f32, 17), state.view_start_beat);
+    try std.testing.expectEqual(@as(f32, 8), state.view_start_beat);
     state.tool = .annotate;
     state.keyboard_visible = 0;
     const stage = ui.Layout.calculate(state.viewport_width, state.viewport_height, false).stage;
     app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 7, .buttons = 1, .x = stage.x + stage.width * 0.5, .y = stage.y + stage.height * 0.5, .pressure = 0.7, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 7, .buttons = 0, .x = stage.x + stage.width * 0.5, .y = stage.y + stage.height * 0.5, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     try std.testing.expectEqual(@as(usize, 1), app.annotations.stroke_count);
-    try std.testing.expectEqual(@as(u32, 1), app.annotations.strokes[0].page_index);
+    // Hiding the keyboard gives the page enough height for both authored
+    // systems, so the second system correctly reflows onto page index zero.
+    try std.testing.expect(annotation.isScoreSpace(app.annotations.strokes[0]));
+    try std.testing.expectEqual(@as(u32, 0), annotation.pageIndex(app.annotations.strokes[0]));
 
     response_len = app.runDevCommand("page previous", &response);
     try std.testing.expectEqualStrings("ok page=1 start=0.000 end=17.000", response[0..response_len]);

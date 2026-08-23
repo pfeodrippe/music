@@ -1,10 +1,16 @@
 # Cross-Platform GPU Music Application — Implementation
 
+> Current correction (2026-08-23): the private study score and native
+> transport use **quarter-note = 147**. All historical statements below that
+> report eighth=147 / 73.5 quarter-QPM playback are superseded and require a
+> fresh musical QA pass. Repository score tooling is now consolidated in the
+> Zig `score-workbench`; the former Python pipeline is retired.
+
 Status: native macOS implementation under active completion and verification;
 WebGPU/Wasm and iOS/iPadOS ports exist but are intentionally deferred until the
 native release gate is clear
 
-Updated: 2026-08-22
+Updated: 2026-08-23
 
 Working name: **Score** (replace before public release)
 
@@ -26,18 +32,89 @@ This document started as the architecture plan and now also records the working 
   when only one side of the hot-module boundary changed. Debug builds can
   capture the real Dawn/Metal framebuffer for repeatable visual QA.
 - A signed macOS `.app` using Dawn/Metal, CoreAudio/AudioUnit, CoreMIDI, AudioQueue microphone capture, native import/export panels, app-support autosave, and WAV take replay.
+- Debug/native recovery uses a separate atomic `autosave-dev.score` journal:
+  it survives a hot-reload host relaunch without racing older release windows.
+  Cold-restart QA recovers the current private 193-measure score at exactly
+  2,739 events and an explicit quarter-note pulse of 147 BPM.
+- The current ignored private MXL contains a two-staff piano reduction plus a
+  separate optional vocal guide. Exact structural repeats and a narrowly
+  gated measures 90-97, 106-113, and 147-154 enrichments bring it to 1,933
+  pitched events while improving both anchored stem and independent
+  accompaniment-frame evidence. Evidence-generated notes retain key-aware
+  enharmonic spelling, so black-key pitches in this five-flat score engrave as
+  flats rather than arbitrary sharps.
+  A Zig playability audit also checks instrument range, duration validity,
+  simultaneous chord size, attack interval, and per-hand span. Its only two
+  over-octave attacks were the repeated G-flat2/B-flat3 left-hand tenth in
+  measure 106; pitch-preserving hand redistribution reduces the maximum hand
+  span to one octave with no out-of-range notes, invalid durations, or
+  over-five-note hand clusters.
+  It is technically playable, but remains `REVIEW_REQUIRED`: the complete
+  later-song reduction, recording-faithful dynamics/pedal directions, and a
+  professional pianist's interpretive pass are still release gates, so the
+  file is not represented as an authoritative concert transcription.
+- Opening fidelity is now gated by both retained-audio comparison and a native
+  sampler audition. A first 6/4 candidate was rejected because density hid an
+  incorrect B-flat-heavy cell and premature bass drone. The current unpromoted
+  candidate instead leaves the first three left-hand bars silent and follows
+  the recording-supported D-flat/A-flat/F contour. Across the exact
+  80-quarter-beat / 32.653-second opening it improves exact-pitch agreement
+  from 26.4% to 39.1% and pitch-class agreement from 66.7% to 75.5%, renders
+  192 piano attacks plus 14 continuous pedal events at -16.21 dBFS with zero
+  overloads, and passes the mechanical playability audit. It remains
+  `REVIEW_REQUIRED`; these detector metrics do not replace a musician ear and
+  piano pass, and the canonical private MXL is unchanged.
+- Debug audio evidence keeps its fixed-capacity score report on the heap, so a
+  full-length WAV and MXL can be compared without overflowing the macOS Debug
+  stack. Debug seek also leaves stale loop ranges and reports loop bounds;
+  verified q=147 transport progression is 9.89 quarter beats in four seconds.
+- The private authoring pipeline can apply STFT mixture-consistency projection
+  to separated stem groups, preserving the lawful source mixture's complex
+  phase while distributing separation residual by local spectral energy. The
+  retained whole-mix and accompaniment audits feed a 24-phrase/193-measure
+  verification ledger with timing/source provenance and explicit ambiguity
+  lists; neither detector output nor page completeness certifies a phrase.
+- Recording audit can rebase a numeric measure range onto a phrase-local audio
+  excerpt. This makes opening/section A/B comparisons meaningful without
+  warping the remainder of a full score into the excerpt; every result remains
+  explicitly `REVIEW_REQUIRED` pending an ear and piano pass.
 - A WebGPU-only Wasm/PWA export using Emdawnwebgpu, IndexedDB recovery, Service Worker offline caching, Web MIDI, getUserMedia, MediaRecorder, and a Zig DSP AudioWorklet. No Canvas 2D, WebGL, DOM product controls, or software renderer exists.
 - A stable iOS C ABI plus device and simulator application bundles: CAMetalLayer rendering, AVAudioEngine synthesis/metronome/microphone capture, CoreMIDI, system document import/export, atomic recovery, Pencil/touch/mouse input, and external keyboard commands.
-- MusicXML/XML, compressed MXL, standard MIDI, and versioned `.score` v12 import;
+- MusicXML/XML, compressed MXL, standard MIDI, and versioned `.score` v15 import;
   multi-part/polyphonic MusicXML timing; semantic explicit rests, tuplets,
   dynamics, slurs, articulations, fermatas, lyrics, and harmonies with tested
-  MusicXML export/re-import; note edits with undo/redo; page-anchored pressure
-  ink; measure-aware system layout; transport looping/count-in/metronome/tempo;
+  MusicXML export/re-import; note edits with undo/redo; score-time-anchored
+  pressure ink; measure-aware system layout; transport looping/count-in/metronome/tempo;
   synchronized audio/MIDI takes; and pitch/timing practice feedback.
 - Score drawing and interaction share one imported-measure layout: note insert
-  and selection hit-testing, annotation page anchors, playback following,
+  and selection hit-testing, annotation score-time anchors, playback following,
   seeking, and next/previous navigation all resolve authored system/page
   boundaries. Debug control exposes the same navigation for live Metal QA.
+- Pagination is stage-height aware. A constrained score pane maps one complete
+  system per page; a sufficiently tall pane maps two and distributes the
+  second below the first system's complete glyph bounds. The same map drives
+  page totals, navigation, playback following, annotations, selection, and
+  edits. This removes the former next-system 4/4 collision and prevents paper
+  or piano keys from extending into adjacent GPU panels. Native readbacks pass
+  at 720x540 with the keyboard and 1440x900 with one- and two-system layouts.
+- New ink stores an absolute quarter-note beat plus a normalized vertical
+  location within its voice-plus-piano system. Rendering resolves that anchor
+  through the current responsive page map, so the mark follows the same music
+  when a former second system becomes a first system. A tag in the existing
+  stroke page field keeps `.score` v15 binary layout stable; legacy page-space
+  strokes still deserialize and render with their original semantics.
+- Score zoom is layout-aware: the bounded system beat capacity varies with
+  zoom, so zooming out reflows more complete authored measures and recomputes
+  page/system counts. Rendering, playback following, page turns, spread/
+  continuous views, annotation anchors, selection, and edit hit tests all use
+  that same density. On the current private piano-only score, 65% overview
+  reduces the real Metal page count from 49 to 33 and shows six rather than
+  four opening measures.
+- Piano systems use the Bravura SMuFL brace from the same generated MTSDF atlas
+  as clefs and noteheads. Its GPU rectangle is derived from atlas plane bounds
+  and spans the exact treble-to-bass staff height; the adjoining vertical staff
+  connector remains an analytic primitive. This is verified in unit geometry
+  and a real Dawn/Metal framebuffer at 65% overview zoom.
 - Playback resolves connected MusicXML tie chains into one sustained sampler
   attack/release, while malformed dangling tie marks remain bounded and cannot
   leave a voice stuck.
@@ -45,25 +122,69 @@ This document started as the architecture plan and now also records the working 
   below the bass staff and drive a toggleable live/expected three-pedal guide;
   the same state is controllable from the GPU transport bar, keyboard,
   accessibility tree, and Debug hot-control channel.
+- The GPU virtual piano derives current/next fingers from an allocation-free
+  dynamic program over each hand's surrounding 24 score attacks. Direction,
+  reachable span, stable repetitions, thumb crossings, phrase gaps, and
+  black-key ergonomics are scored independently for left and right staff
+  material; rests and the separately modeled vocal guide are excluded. The
+  chord layer exhaustively assigns distinct fingers to every simultaneous tone
+  in a playable one-to-five-note hand voicing, mirrors finger order between
+  hands, and penalizes avoidable black-key thumbs; impossible >5-note hand
+  clusters are visibly flagged for redistribution. Debug `fingering state`
+  exposes the phrase anchors and `fingering chord` exposes every current/next
+  pitch/finger pair used to compose the frame. Standard MusicXML
+  `<technical><fingering>` values now import into the compact 32-byte Flecs
+  note, survive `.score` v15 and MusicXML/MXL export/re-import, participate in
+  undo/redo, and override only their matching phrase/chord tone. In Edit mode,
+  `1`...`5` assigns the selected note and `0` restores automatic fingering;
+  `fingering set NOTE_ID 1..5|clear` exposes the same operation to the live
+  development socket. Version-14 journals migrate with automatic fingering.
+  Native host QA loaded a five-note two-hand fixture, proved authored
+  `5/4/3/5/4` guide assignments, changed note 1 live, exported MXL, re-imported
+  the five standard fingering elements unchanged, and captured the Dawn/Metal
+  framebuffer. The host then restored the ignored 193-measure private study,
+  advanced playback from beat 716 to 717.267 at `1/8 = 147`, hot-reloaded both
+  systems and WGSL, and retained zero sampler drops/overloads.
+  Native Dawn/Metal readback at
+  eighth=147 matched that state before and
+  after a Flecs/WGSL reload and while playback advanced, with no sampler queue
+  fault.
 - Native playback uses pinned sfizz on the CoreAudio callback through a bounded
   SPSC MIDI queue. When the ignored Accurate-Salamander Grand V6.2beta2 pack is
   installed, its recommended 48 kHz/24-bit live SFZ (1,704 regions / 641
   preloaded samples) is selected; the 1,121-region Salamander V3 pack is the
   development fallback. Both remain optional local assets rather than silently
   bundled content, and an explicit `SCORE_INSTRUMENT`/`--sfz` override supports
-  other instruments.
-- `score-sampler-verify` is an executable native acceptance gate, not a demo
+  other instruments. The sfizz event argument is correctly treated as an
+  intra-block sample delay—not a MIDI channel—so source-channel events enter at
+  delay zero while channel identity remains in the portable model and exports.
+  One studio profile enables its CC20...23 sampled release, hammer, pedal noise,
+  and damper-resonance layers; the audio-thread-applied values are inspectable
+  and adjustable live through the Debug control socket.
+- `score-sampler-workbench verify` is an executable native acceptance gate, not a demo
   render. It checks silence/finite output, an eight-point velocity sweep,
-  sustain and continuous half-pedal behavior, release and pedal mechanics,
-  exact replay, nonzero MIDI channels, queue drops, and raw pre-limiter
-  overload. It emits JSON plus PCM16 WAV evidence and exits nonzero on failure.
+  a seven-point continuous half-pedal curve, isolated sampled-release, hammer,
+  pedal-mechanism and resonance A/B probes, repedaling, stable replay from fresh
+  sampler instances, nonzero source-channel events, queue drops, and raw
+  pre-limiter overload. It emits schema-2 JSON plus PCM16 WAV evidence and exits
+  nonzero on failure. Both V6.2 and V3 permit legitimate sample variation, so
+  replay is bounded by correlation and normalized error rather than falsely
+  requiring every run to be bit-identical.
   The Accurate-Salamander live preset currently passes with a 33.478 dB measured
-  velocity span, distinct pedal-up/half/full release tails, and zero drops or
-  overloads under the stress chord.
+  velocity span, its documented CC64 curve, all four acoustic detail layers,
+  6.235 dB greater held-note energy in the repedaled A/B probe, and zero drops
+  or overloads under the stress chord across three consecutive gate runs.
 - Standard MIDI import preserves ordered CC64/66/67 automation, continuous
   controller values, and PPQ timing. Type-1 tracks keep independent active-note
   state, malformed high-bit data bytes are rejected, and the imported pedal
   tail participates in document bounds and native sampler playback.
+- MusicXML and Standard MIDI tempo changes are first-class score events. The
+  Flecs transport consumes event boundaries without frame-size drift, the
+  visible BPM remains an editable practice baseline that proportionally scales
+  authored rubato, and MusicXML, MIDI, and `.score` v14 preserve the map.
+  Printed metronome pulse and engine timing are distinct: MusicXML
+  eighth=147 round-trips with `sound tempo=73.5`, while transport integration
+  and Standard MIDI correctly use 73.5 quarter notes/minute.
 - Standard MIDI export writes deterministic format-1 files at 480 PPQ with
   conductor metadata, a piano track, an optional vocal-guide track, connected
   tie chains, velocity/channel data, and ordered CC64/66/67 automation. Native
@@ -74,27 +195,41 @@ This document started as the architecture plan and now also records the working 
   nanosecond timebase using the take's recorded tempo, preserves channel voice
   and continuous controller messages, and is available through GPU controls,
   accessibility, a native save panel, and the Debug control socket. Portable
-  `.score` v12 persists the take tempo and raw events; a live note-plus-pedal
+  `.score` v14 persists the take tempo and raw events; a live note-plus-pedal
   take was saved, reloaded, and exported byte-identically.
 - Standards-based MusicXML 4.0 export, metrical bar alignment even when an OMR
   measure is underfilled, semantic harmony import/persistence/GPU
   rendering/export, clef-aware seven-accidental key signatures, live MIDI
   CC64/66/67 pedal state, sustain and sostenuto semantics in the Zig diagnostic
-  synth, and GPU three-pedal status. Timed MusicXML sustain-pedal directions now
-  survive `.score` v12 and MusicXML round trips, render as analytic pedal lines,
+  synth, and GPU three-pedal status. The diagnostic synth continuously scales
+  release through CC64 0...63, decays held notes without re-attacking, supports
+  envelope-safe repedaling, and resolves overlapping sustain/sostenuto state.
+  Timed MusicXML sustain-pedal directions now
+  survive `.score` v14 and MusicXML round trips, render as analytic pedal lines,
   drive native sampler CC64 playback, and provide a score marker against the
   continuous live hardware fill with late-transition practice feedback.
-- Multi-part MusicXML export keeps each imported source staff/voice lane
-  distinct until the final two-staff projection. This prevents overlapping
-  vocal-guide and piano material from being serialized as one overfilled voice;
-  the private acceptance export passes the structural audit and preserves all
-  1,286 sounding note onsets across export/re-import.
+- Multi-part MusicXML export keeps the playable piano reduction and optional
+  singer guide as separate score parts. The piano remains a braced two-staff
+  instrument; the guide exports as its own labeled one-staff cue part and may be
+  hidden without changing the piano notation. A live native export/re-import of
+  the private 193-measure acceptance score preserves all 1,439 pitched piano
+  events and all 355 pitched guide events. Its structural audit reports zero
+  issues; 15 otherwise-empty guide measures gain explicit non-sounding rests.
 - Imported measure maps are now first-class portable core data. MusicXML import,
-  `.score` v12 persistence, hot-reloaded GPU UI, measure loops, bar/beat labels,
+  `.score` v14 persistence, hot-reloaded GPU UI, measure loops, bar/beat labels,
   metronome accents, and MusicXML export all retain pickups, irregular measure
   durations, source numbers, and mid-score meters. The private acceptance file
-  round-trips as 175 measures with all 17 time-signature entries instead of the
-  former 171-bar fixed-4/4 reflow.
+  round-trips as exactly 193 measures with all 17 time-signature entries instead
+  of the former 171-bar fixed-4/4 reflow. The last 19 measures are a private,
+  recording-gated repeat extension, not invented generic app content.
+- Mid-system time signatures own horizontal engraving space. The opening meter
+  remains in the fixed clef/key/meter lead, while a later meter change gives
+  the affected measure a larger left content inset before beat one. The exact
+  same inset is used by GPU note/rest placement and inverse pointer hit-testing,
+  preventing the lower-staff 4/4 from colliding with notes while retaining the
+  conventional meter on both staves of the grand staff. Unit coverage exercises
+  a 2/4-to-4/4 transition, and native Dawn/Metal page-1 readback verifies the
+  result with the optional vocal guide visible.
 - A shared instanced WGSL renderer with responsive desktop/iPad/phone layout and a generated original PWA/macOS icon.
 - A core-owned semantic accessibility snapshot mirrored through NSAccessibility on macOS, hidden semantic DOM controls in the browser, and UIAccessibilityElement on iOS/iPadOS. Actions route back through the same Zig hit-testing path as pointer input.
 - Native, web, and iOS build gates plus portable unit/integration tests and a pinned macOS CI workflow.
@@ -108,7 +243,8 @@ content licensing remain open. The code must not describe those items as
 complete until their acceptance tests pass.
 
 The private, gitignored Holocene fixture is also explicitly incomplete. Its
-current 12-page OMR-derived MXL is useful for exercising import and playback,
+12-page OMR-derived core plus a separately gated repeated-finale extension are
+useful for exercising import and playback,
 and its meter/cursor structure now passes with zero structural issues. That
 pass is deliberately separate from musical review: 265 inserted `<forward>`
 spans initially identified unrecovered recognition time. Complete source-page
@@ -125,14 +261,33 @@ Complete page-11 transcription (P2 measures 147-164) restores the last
 C5-G5-C5 cell, the full un-beamed right-hand figure, and every printed bass
 quarter alternation. Complete page-12 transcription (P2 measures 165-174)
 finishes six more two-hand figures, both arpeggiated half-note cadence bars,
-and the tied low E2 close. The resulting 174-measure/2,217-event MXL retains 114
-gaps across 83 part/measures, and 86 original Audiveris rhythm warnings remain
-in ignored JSON/Markdown ledgers. A separate 348-entry part/measure review
-matrix records 77 page-complete accompaniment measures, 271 entries requiring
+and the tied low E2 close. A subsequent high-resolution review restores the
+whole-note cadence sonorities that the combined OMR omitted in measures 37 and
+96. Four gap-free, page-local rest-lane recoveries in piano measures 32, 35,
+68, and 88 then improved the recording-alignment cost without changing the
+priority distribution. Two later lyric-constrained, recording-gated donor
+transplants, a four-measure combined gate, and a vocal-free accompaniment-led
+bass repair bring the source-page core to 174 measures / 2,348 events. The
+recording-backed final repeat extends the file to 193 measures / 2,564 events;
+the later dual-reference measure-94 repair brings the live file to 2,575
+events. The source ledger still retains 77 gaps across 62 part/measures, and 86
+original Audiveris rhythm warnings remain in ignored JSON/Markdown ledgers.
+Copied repeat bars inherit those review statuses. A separate 348-entry
+part/measure review matrix records
+133 page-complete entries, 215 entries requiring
 page review, and zero recording-verified entries. The native renderer has also
 survived ten consecutive combined system/WGSL hot reloads with clean text and
 SMuFL output; atlas metadata changes are deliberately escalated to a host
 rebuild/relaunch rather than allowed to sample a stale GPU texture.
+
+A second, independent-page Audiveris 5.11.0 pass now validates every printed
+page and system boundary before stitching. It preserves all 174 measures and
+contains 527 voice plus 1,822 piano note/rest events, while explicitly logging
+the removal of two shared 24/25-pixel non-pitched phantom slivers. After
+normalization it still has 21 structural issues, 15 source rhythm warnings,
+and 77 high-priority recording-review measures. Its lower global audio-alignment
+cost is useful evidence, but those local failures prohibit promoting it over
+the current private draft.
 Authored page navigation was additionally exercised through the live control
 socket on pages 42-44; a Metal readback of the short final page retained clean
 text, SMuFL rests, and the tied closing E2 after the host rebuild. The short
@@ -140,9 +295,709 @@ page now draws only its populated system rather than a phantom empty staff.
 The source is a voice/harp edition rather than a finished two-hand piano
 reduction. It must not be called professional or accurate until every ledgered
 gap and every musical symbol has been reviewed against the user-supplied pages
-and a lawful local copy of the official recording. No such recording is
-currently present in ignored local content, so the recording-led accuracy gate
-remains open rather than waived.
+and the private reference recording. A user-authorized SoundCloud playback has
+now been captured through BlackHole into ignored local content. The accepted
+evidence timeline combines a main take, a clean retry anchored at 3:05, and a
+trimmed cadence take anchored at 5:11. It covers 1,330 of 1,344 quarter-second
+frames through 5:32.7 of the 5:35.827 track; the remaining 14 fade/silence
+frames are explicit. The accidentally paused take and the raw cadence take
+containing autoplay are excluded by filename and reason in the ledger.
+A later browser-title-verified retry from the 3:05 marker independently matches
+the accepted overlap at 0.868 chroma similarity. It remains corroborating
+evidence rather than replacing the accepted segment because doing so worsened
+the recording-alignment cost and review queue. The capture helper now rejects
+prematurely-ended files before analysis as well as silent files.
+A fresh browser-controlled retry after the user resumed SoundCloud contains no
+internal silence after its 12.62-second pre-roll and matches the accepted
+opening at 0.919838 chroma similarity with a 0.25-second content offset.
+AVFoundation still ends at 298.494 seconds, before the displayed 5:35.827
+duration, so the duration gate excludes the take and the accepted split/tail
+timeline remains authoritative.
+A later browser-controlled retry starts from a verified 0:00 and the official
+player remains visibly active through 5:33, yet AVFoundation emits only
+287.505 seconds. Its opening aligns to the accepted take at 0.855510 chroma
+similarity with a 2.5-second content offset. The evidence ledger therefore
+retains it only as corroborating review material and does not replace any
+accepted segment.
+
+The recording evidence also exposed a source-key error: the page-derived draft
+was in C major while the recording and the user-supplied fragment are in
+D-flat major. The private finalizer now transposes both accompaniment and
+optional vocal guide up one semitone, writes a five-flat key signature, and is
+idempotent. This changes the deterministic audio comparison from 39.45% to
+65.26% pitch-class agreement and from 7.28% to 25.56% exact-pitch agreement;
+it is strong evidence for the key correction, not proof of individual notes.
+The accompaniment auditor now uses piecewise centers from 23 lyric anchors
+agreed by independent score-text and page-OCR paths. Seventeen cover the page
+core and six distinguish both final-refrain occurrences. This prevents the
+repeated finger-picking pattern from jumping between verses; 21 anchors remain
+inside their named measure and two are at most 0.52 seconds outside. Its local cost
+also treats an empty reduction over strong audio as a mismatch instead of
+rewarding silence. The corrected baseline is 0.330879 / 69 HIGH measures.
+Review-only score-native transplants are kept in a separate MXL and must pass a
+structural/recording gate before promotion. Measures 39<-110 and 63<-1 first
+lowered cost to 0.328968 and HIGH measures to 67. A later combined candidate
+38<-47, 62<-114, 64<-115, and 97<-147 passes the same gate, lowering cost to
+0.327081 and HIGH measures to 64 while preserving all lyric-anchor diagnostics.
+The four targets have 78.65%-100% pitch-class and 50%-100% bass agreement and
+are still marked MANUAL, not certified. Measure 65's full-mix detector was
+confounded by vocal overtones, so guitar/piano/other/bass stems were mixed into
+a separate vocal-free accompaniment reference. Its A-flat/A-natural eighth-note
+bass inflection and upper A-flat-E-flat-F figure pass the same gate at 100%
+pitch-class / 100% bass agreement, reducing that audit from 0.315818 to
+0.314392 and HIGH measures from 63 to 62. The full-mix result is retained too
+(0.327166 / 63 HIGH, target MEDIUM). No aligned audible bar is now entirely
+empty, but the score remains `REVIEW_REQUIRED` pending musician review.
+The next dual-reference correction preserves the printed quarter-note rhythm
+in measures 150 and 152 while retuning only their bass motion to A-A-A-Ab and
+Gb-Gb-Gb-G. Both the whole mix (0.321189 / 61 HIGH) and vocal-free audit
+(0.310129 / 60 HIGH) pass their strict gates; the two targets are MANUAL at
+86.38%-93.71% pitch and 50%-72.73% bass agreement. Native Metal pagination
+shows only the necessary natural/flat cancellations in the five-flat key.
+Measure 60 then passes both gates with an even narrower edit: its existing two
+half-note bass rhythm is retained and only B-flat/G-flat is retuned to
+D-flat/F, the pitch classes independently present in the full mix and
+vocal-free accompaniment. The whole-mix result is 0.321093 / 60 HIGH with
+99.46% pitch and 75% bass agreement; vocal-free is 0.309862 / 59 HIGH with
+99.39% pitch and 50% bass agreement. Native GPU capture, playback, sampler
+telemetry, and MXL export/reimport all pass at 174 measures / 2,348 events.
+The rhythm-preserving authoring path then retunes only the two existing lower
+half notes in measure 133 from G-flat to A-flat. It leaves durations, rests,
+beams, voices, staves, and every other part untouched. The full-mix gate reaches
+0.318847 / 59 HIGH with 95.73% pitch and 100% bass agreement; the vocal-free
+gate reaches 0.306919 / 58 HIGH with 95.8% pitch and 100% bass agreement. The
+native Metal page at bar 133 renders cleanly and playback keeps the sampler at
+zero drops and zero overloads.
+The first recording-gated opening correction preserves both existing lower
+eighth-note attacks in measure 5 and retunes only A-flat2/A-flat3 to
+G-flat2/G-flat3. Whole-mix alignment improves 0.280010 to 0.279377 with HIGH
+58 to 57 and the target at 83.27% pitch / 50% bass; the independent vocal-free
+audit improves 0.263877 to 0.263063 with HIGH 57 to 56 and the target at 90.47%
+pitch / 66.67% bass. The XML diff contains only those two pitch steps and an
+explicit private evidence field. A measure-9 A-flat octave candidate initially
+remained unpromoted because free whole-song DTW shifted adjacent measure 8 into
+HIGH even though the local opening crop and vocal-free reference improved.
+That boundary shift exposed a comparison flaw: two altered pitches could move
+an otherwise unrelated repeated-phrase DTW path. The audit therefore supports
+locked baseline measure windows. Candidate pitches are scored inside the exact
+same recording windows as the current score, and a regression test proves they
+cannot retime other measures. Free-DTW reports remain useful diagnostics, but
+promotion deltas now use like-for-like locked mappings.
+
+With that correction, opening measure 3's A-flat2/A-flat3 candidate passes both
+independent references and the bounded phrase audit. Locked whole-mix cost
+improves 0.319907 to 0.318745 with HIGH 63 to 62 and target agreement 82.71%
+pitch / 100% bass; locked vocal-free cost improves 0.292284 to 0.291094 with
+HIGH 60 to 59 and 94.71% pitch / 100% bass. The 12-measure crop improves
+0.272430 to 0.249940 and HIGH 7 to 6. Only B-flat2/B-flat3 become
+A-flat2/A-flat3; rhythm, rests, voice/staff assignment, and all non-target XML
+are identical. Native Metal playback at bar 3 retains eighth=147 timing and
+zero sampler faults. A measure-2 F2/F3 hypothesis is rejected because the
+whole-mix cost and HIGH count worsen and vocal-free bass agreement remains 0%.
+The same locked-window method then clears measure 9 without moving measure 8:
+G-flat2/G-flat3 become A-flat2/A-flat3, locked whole-mix cost improves 0.318745
+to 0.317536 with HIGH 62 to 61 and 88.86% pitch / 75% bass, and locked
+vocal-free cost improves 0.291094 to 0.289975 with HIGH 59 to 58 and 78% pitch
+/ 75% bass. The bounded opening cost reaches 0.241808 with HIGH 5. Exact-tree
+comparison again limits the edit to two pitch nodes plus private provenance.
+The following opening correction treats measure 10 as a complete piano texture
+instead of optimizing an isolated lower octave. Its five existing right-hand
+attacks become F4-D-flat4-D-flat4-F4-D-flat4 and its two existing left-hand
+attacks become A-flat2-B-flat2, with every onset, duration, rest, beam, voice,
+and staff retained. Locked whole-mix cost improves 0.317536 to 0.314599 with
+HIGH 61 to 60 and target agreement 95.24% pitch / 80% bass. Locked
+accompaniment cost improves 0.289975 to 0.286912 with HIGH 58 to 57 and 85.17%
+pitch / 50% bass; the 12-measure opening cost reaches 0.217273 with only three
+HIGH bars. A canonical semantic comparison masks only those seven pitches and
+the two new private provenance fields, then proves the complete remaining XML
+identical. The audit report now stores its exact evidence path because three
+similarly named accompaniment analyses intentionally produce different
+metrics; candidate promotion can no longer rely on an implicit filename.
+Native M3 Max Metal readback at bar 10 is clean, playback advances 2.48 quarter
+beats in two seconds at eighth=147, and the 1,704-region sampler stays at zero
+drops/overloads. Native export/re-import remains structurally clean with 193
+measures, a separate 1,439-note/two-staff piano part, and an optional vocal
+guide containing 355 pitched notes plus 468 cues. This is still
+`REVIEW_REQUIRED`, not a professional musical certification.
+Measure 11 follows with F4-D-flat4-D-flat4-F4-F4 over B-flat2/B-flat3, again
+retuning only existing attacks. Locked whole-mix cost improves 0.314599 to
+0.312613 and the target moves MEDIUM to MANUAL at 100% pitch / 75% bass while
+the global HIGH count stays at 60. Locked accompaniment improves 0.286912 to
+0.285514 and HIGH 57 to 56, with the target HIGH to MANUAL at 87.66% pitch /
+75% bass. The bounded opening cost improves 0.217273 to 0.208844 without
+increasing its three HIGH bars. The promotion gate therefore implements an
+explicit Pareto rule: alignment cost and HIGH count cannot regress, at least
+one must strictly improve, and all unchanged local two-hand/pitch/bass gates
+must pass. This handles a MEDIUM-to-MANUAL correction without pretending it
+removed an unrelated HIGH bar. Exact-tree masking limits the score change to
+six pitch nodes and two private evidence fields. Native Metal rendering and
+playback at bar 11 remain clean at eighth=147 with zero sampler faults.
+An earlier opening bar then clears with only two changed pitches. In measure 8,
+the first upper A-flat4 becomes F4 and the second lower B-flat3 becomes
+A-flat3; the remaining A-flat/F upper figure and initial B-flat2 are retained.
+Time-resolved guitar, piano, and other-stem events independently support this
+mixed contour. Locked whole-mix cost improves 0.312613 to 0.311322 and HIGH 60
+to 59, with the target HIGH to MANUAL at 92.10% pitch / 60% bass. Locked
+accompaniment improves 0.285514 to 0.284850 with HIGH unchanged at 56 and the
+target MEDIUM to MANUAL at 95.75% pitch / 50% bass. The bounded opening remains
+MANUAL at 100% pitch / 100% bass and improves to 0.206276. Exact-tree masking
+proves every non-target semantic node unchanged; native Metal rendering and
+sampled playback at bar 8 are clean. Measures 6, 7, and 12 are deliberately
+not force-cleared: their fixed whole-mix and accompaniment bass frames conflict,
+and no two-attack preserved-rhythm pair reaches the unchanged local threshold
+in both references. Extra attacks and relaxed gates are not substituted for a
+musician decision.
+The first later dual-HIGH bar then clears through an even narrower correction.
+Measure 50 retains its complete upper voice and rhythm; only B-flat2/B-flat3
+become A-flat2/A-flat3. Both fixed references and time-resolved guitar, piano,
+and other-stem events sustain A-flat through those attacks. Five plausible
+upper-voice alternatives were evaluated and all score worse than retaining the
+authored line. Locked whole-mix cost improves 0.311322 to 0.310638 and HIGH 59
+to 58 with target agreement 92.73% pitch / 100% bass. Locked accompaniment
+improves 0.284850 to 0.283416 and HIGH 56 to 55 with 91.49% pitch / 100% bass.
+Canonical diffing proves only two pitch nodes and one private provenance field
+change. Native Metal readback/playback at bar 50 is clean at eighth=147 and the
+sampled grand reports zero queue or overload faults.
+Measure 59 is the next complete two-hand correction. Its existing five upper
+attacks are retuned to G-flat4-D-flat4-D-flat4-A-flat4-A-flat4 and its two
+lower attacks to B-flat2/G-flat3 without changing any rhythm, rest, beam,
+voice, or staff. Half-beat evidence from the locked whole mix, accepted
+accompaniment, and separated guitar/other events supports the contour; three
+weaker preserved-rhythm variants remain diagnostic only. The whole-mix gate
+improves 0.310638 to 0.308245 and HIGH 58 to 57, while the accompaniment gate
+improves 0.283416 to 0.280379 and HIGH 55 to 54. Measure 59 becomes MANUAL in
+both reports at 100% pitch-class and 66.67% bass agreement. Canonical diffing
+confines the score change to its seven pitch nodes plus private provenance;
+all 2,575 note/rest events remain intact. Native Metal readback/playback,
+MusicXML export/re-import, systems/WGSL hot reload, the Accurate-Salamander
+V6.2 offline sampler gate, and strict ReleaseSafe arm64 bundle signing all
+pass without queue drops, overloads, clipping, or shader fallback. The result
+is still `REVIEW_REQUIRED` until a musician adjudicates its voicing, fingering,
+dynamics, articulation, pedal, and sound at the piano.
+The following 2/4 bar, measure 66, receives an even narrower correction. Its
+first upper A-flat4 becomes F4 while the supported second A-flat4 remains, and
+the two lower attacks become A2/A-flat3. The apparent chromatic bass follows
+the time-resolved evidence: the locked whole mix begins on A2 and reaches
+A-flat3, while the accepted accompaniment sustains A-flat. Whole-mix cost
+improves 0.308245 to 0.307313 and HIGH 57 to 56 with 87.16% pitch / 66.67%
+bass; accompaniment cost improves 0.280379 to 0.279697 and HIGH 54 to 53 with
+85.85% pitch / 66.67% bass. Canonical diffing finds exactly three pitch-node
+changes and no rhythmic or structural mutation. Native Metal readback,
+playback, export/re-import, systems/WGSL reload, sampled-grand telemetry, and
+the Python/Zig suites pass. The bar remains `REVIEW_REQUIRED` for a musician's
+voicing, fingering, dynamics, articulation, pedal, and final ear decision.
+Measure 72 then replaces the unsupported G-flat lower octave with
+B-flat2/B-flat3 and uses the preserved upper contour
+B-flat4-B-flat4-D-flat4-F4-D-flat4. Both fixed references and the separated
+guitar support B-flat; four upper variants pass structural comparison and are
+kept as diagnostics. The selected one is not the numerically cheapest: it
+retains the authored quarter-note F4 because Basic Pitch detects that event
+continuously from 121.681 to 122.180 seconds. Whole-mix cost improves 0.307313
+to 0.305325 and HIGH 56 to 55 at 94.35% pitch / 100% bass; accompaniment cost
+improves 0.279697 to 0.277542 and HIGH 53 to 52 at 96.23% pitch / 100% bass.
+Six pitch nodes change while all onsets, rests, durations, voices, staves,
+beams, and the 2,575-event document remain intact. Native Metal rendering,
+playback, export/re-import, stateful systems/WGSL reload, and sampled-grand
+telemetry pass. This bar also remains `REVIEW_REQUIRED` for musician review.
+Measure 76 is deliberately not changed. Its locked whole-mix fundamentals move
+from G-flat to C while the accepted accompaniment moves from C to D-flat, but
+the higher-resolution guitar transcription repeatedly reports D-flat3 through
+the relevant 126.002-126.873-second span. A diagnostic C3/C3 replacement is
+the only frame-threshold compromise: it clears the whole-mix HIGH bar without
+changing global cost, but worsens accompaniment cost 0.277542 to 0.277805 and
+therefore fails the unchanged Pareto gate. The authored D-flat figure remains
+`HIGH` / `REVIEW_REQUIRED` pending improved alignment or musician adjudication;
+the implementation does not turn detector disagreement into a false edit.
+Measure 96 supplies the next convergent sustained-bass correction. Its existing
+four-quarter A-flat3/D-flat4 upper dyad remains intact and only the lower whole
+note moves from D-flat3 to G-flat2. Both locked recording references sustain
+G-flat through the bar. Whole-mix cost improves 0.305325 to 0.304103 and HIGH
+55 to 54 with 93.17% pitch / 66.67% bass agreement; accompaniment cost improves
+0.277542 to 0.276789 and HIGH 52 to 51 with 97.41% pitch / 75% bass agreement.
+Canonical diffing finds one P2/m96 pitch change and no timing, voice, staff, or
+event-count mutation. Native Metal page-24 readback/playback, systems/WGSL hot
+reload, eighth=147 transport, fingering, and the 1,704-region sampled grand are
+clean. Export/re-import preserves all 1,439 pitched piano and 355 pitched vocal
+events; the exporter additionally writes 15 standard full-measure rests into
+otherwise empty vocal-guide bars. The bar remains `REVIEW_REQUIRED` pending a
+musician's voicing, fingering, dynamics, articulation, pedal, and ear decision.
+The next flagged bar demonstrates why the gates are necessary but not
+sufficient. Measure 102's musically plausible octave correction,
+B-flat2-F3-B-flat2-F3, agrees with the five-flat key, secondary page, and
+separated guitar, yet fails the unchanged local thresholds: the whole mix
+reaches only 72.54% pitch / 25% bass and accompaniment remains HIGH at 61.28%
+pitch / 14.29% bass. A detector-led A-natural2-F3-A-flat2-E-flat3 alternative
+passes numerically, but its chromatic A-natural contradicts that independent
+musical evidence. It is retained only as a diagnostic; m102 stays `HIGH` /
+`REVIEW_REQUIRED` pending better alignment or musician adjudication.
+Measure 103 then converges on a complete D-flat-major sonority over A-flat.
+The repeated upper B-flat4 attacks become F4 while both D-flat5 attacks remain;
+the lower B-flat3/F4 pairs become A-flat2/A-flat3. The recording frames and
+separated guitar sustain A-flat, D-flat, and F, so this full chord is selected
+over third-less or detector-only variants. Whole-mix cost improves 0.304103 to
+0.302313 and HIGH 54 to 53 at 84.15% pitch / 85.71% bass; accompaniment cost
+improves 0.276789 to 0.274686 and HIGH 51 to 50 at 79.52% pitch / 100% bass.
+Exact event comparison confines the edit to six P2/m103 pitches with every
+rest, onset, duration, beam, voice, staff, and all 2,575 events unchanged.
+Native Metal page-26 rendering, fingering, sampled playback, MusicXML
+export/re-import, systems/WGSL hot reload, and the Python/Zig suites pass with
+zero sampler queue faults. The bar remains `REVIEW_REQUIRED` for musician
+voicing, fingering, dynamics, articulation, pedal, and final ear confirmation.
+Measure 106 resolves the next dense arpeggio as a playable G-flat-major-seventh
+spread. Its existing lower simultaneous attack becomes G-flat2+B-flat3,
+followed by D-flat4; the existing upper pair becomes D-flat4-F4, and that
+complete figure repeats after the authored quarter rest. Locked frames and
+separated guitar events independently contain G-flat, B-flat, D-flat, and F.
+Twelve same-rhythm distributions were evaluated; the selected one retains the
+third and seventh and is the musically complete dual-gate pass. Whole-mix cost
+improves 0.302313 to 0.301416 and HIGH 53 to 52 at 80.09% pitch / 66.67% bass;
+accompaniment improves 0.274686 to 0.273175 and HIGH 50 to 49 at 92.98% pitch /
+100% bass. Exact event comparison confines the edit to ten P2/m106 pitch nodes
+and keeps all 2,575 notes/rests plus every onset, duration, chord flag, rest,
+beam, voice, and staff intact. Native Metal page-27 rendering, fingering,
+sampled playback, MusicXML export/re-import, systems/WGSL reload, and automated
+tests pass without sampler queue faults. The result remains `REVIEW_REQUIRED`
+for musician voicing, fingering, dynamics, articulation, pedal, and ear review.
+Measure 110 becomes a D-flat/add-nine color over A-flat using the same authored
+chord-plus-arpeggio rhythm. Each lower simultaneous attack is retuned to
+A-flat2+E-flat3 and followed by D-flat4; the upper pair becomes A-flat3-F4.
+Locked frames and separated guitar repeatedly contain all four pitch classes.
+Ten complete distributions were gated, and this is the only musically coherent
+dual pass. Whole-mix cost improves 0.301416 to 0.299985 and HIGH 52 to 51 at
+79.72% pitch / 100% bass; accompaniment improves 0.273175 to 0.272603 and HIGH
+49 to 48 at 79.41% pitch / 50% bass. Exact event comparison finds ten P2/m110
+pitch changes, no non-pitch changes, and the same 2,575 notes/rests. Native
+Metal page-28 rendering, fingering, sampled playback, MXL export/re-import,
+systems/WGSL hot reload, and automated tests pass without sampler queue faults.
+The bar stays `REVIEW_REQUIRED` pending musician voicing, fingering, dynamics,
+articulation, pedal, and final ear review.
+The adjacent measure 111 is intentionally not forced into the same voicing.
+Its locked bass frames alternate A-flat, A-natural, E-flat, and D-natural.
+The repeated m110 figure plus seven complete diatonic D-flat/add-nine and
+F-minor-seven distributions were gated; none clears both local references.
+The strongest full-mix F-minor candidate reaches 68.28% pitch / 50% bass while
+accompaniment reaches only 66.68% pitch / 25% bass. The source bar therefore
+remains `HIGH` / `REVIEW_REQUIRED` pending improved alignment or musician
+adjudication; chromatic detector noise is not promoted into the score.
+
+Measure 114 resolves as a time-varying transition rather than a repeated static
+voicing. Its existing lower eighth-note pairs become B-flat2-D-flat4 followed
+by C3-B-flat3, while the existing upper pairs are B-flat4-D-flat5 followed by
+A-flat4-D-flat5. This captures the common B-flat/D-flat opening, the C bass in
+the vocal-free frames, and the later B-flat/A-flat/D-flat material across the
+full mix and separated guitar/other/piano events. Nine complete same-rhythm
+controls were gated. The selected shell improves locked whole-mix cost from
+0.299985 to 0.299385 and HIGH 51 to 50 at 79.89% pitch / 66.67% bass;
+vocal-free cost improves from 0.272603 to 0.272299 and HIGH 48 to 47 at 78.47%
+pitch / 60% bass. Exact formatted-XML and event-ledger comparison proves that
+only four P2/m114 pitches and two private provenance fields changed. A first
+generic voice rewrite was discarded because it added redundant stem nodes;
+the promoted MXL was rebuilt with the rhythm-preserving retuner. Native Metal
+page-29 rendering, fingering, sampled playback at eighth=147, MXL
+export/re-import matched by semantic part name, systems/WGSL hot reload, the
+1,704-region grand-piano sampler, Python tests, and Zig tests all pass without
+sampler drops or overloads. The result remains `REVIEW_REQUIRED` pending a
+musician's voicing, fingering, dynamics, articulation, pedal, and ear review.
+
+Measure 115 uses the same authored broken-chord rhythm but changes bass harmony
+inside the bar. Its first lower pair is D-flat3-D-flat4 and its second is
+A-flat2-A-flat3; both upper pairs are A-flat4-D-flat5. Six static/register
+controls showed why the split matters: the locked full mix begins on D-flat
+before settling onto the A-flat bass that dominates the separated guitar and
+vocal-free frames. The accepted candidate improves locked whole-mix cost from
+0.299385 to 0.296574 and HIGH 50 to 49 at 87.02% pitch / 71.43% bass;
+vocal-free cost improves from 0.272299 to 0.269897 and HIGH 47 to 46 at 94.18%
+pitch / 100% bass. Exact formatted-XML comparison limits the promotion to six
+P2/m115 pitch nodes and two private evidence fields. Native Metal page-29
+rendering, two-hand fingering, sampled playback at eighth=147, semantic
+MusicXML/MXL export/re-import, systems/WGSL reload, and sampler telemetry all
+pass without drops or overloads. The bar remains `REVIEW_REQUIRED` for a
+musician's voicing, fingering, dynamics, articulation, pedal, and ear review.
+
+Measure 124 is a layered reduction rather than a choice between competing bass
+detectors. The isolated piano sustains F3 while the guitar sustains B-flat3, so
+the existing two left-hand half notes become F3+B-flat3 dyads and the authored
+upper E-flat5-A-flat5-F5 figures remain unchanged. Seven single-bass and
+alternate-upper controls each dropped one simultaneous layer and missed the
+vocal-free bass gate by one mapped frame. The complete dyad improves locked
+whole-mix cost from 0.296574 to 0.296037 and HIGH 49 to 48 at 81.54% pitch /
+100% bass; vocal-free cost improves from 0.269897 to 0.268431 and HIGH 46 to 45
+at 97.58% pitch / 85.71% bass. The exact XML diff retunes the two original bass
+notes, adds one chord tone at each existing onset, and records one private
+evidence field, intentionally increasing the score from 2,575 to 2,577 events.
+Native Metal page-31 engraving, F3(5)-B-flat3(2) fingering, sampled playback,
+semantic MXL export/re-import, systems/WGSL reload, and sampler telemetry all
+pass. The bar stays `REVIEW_REQUIRED` for musician voicing, dynamics,
+articulation, pedal, and ear review.
+
+Measure 131 preserves the existing E-flat5-A-flat5-F5 right-hand figure and
+reconstructs the two sustained left-hand attacks as D-flat/F/A-flat shells.
+The full locked recording repeatedly supports F, D-flat, and A-flat, while
+separated guitar sustains D-flat4/A-flat3/F4 and separated piano independently
+supports F4. A-flat-only and A-flat/D-flat controls were rejected because they
+failed at least one local reference. The complete shell improves locked
+whole-mix cost from 0.296037 to 0.293537 and HIGH 48 to 47 at 100% pitch / 100%
+bass; vocal-free cost improves from 0.268431 to 0.265771 and HIGH 45 to 44 at
+97.55% pitch / 50% bass. Exact XML comparison finds only two B-flat3-to-A-flat3
+retunes, four new chord-tone nodes at the existing two half-note onsets, and
+one private provenance field, increasing the private document from 2,577 to
+2,581 events. Native page-33 GPU readback, D-flat4/F4/A-flat3 fingering,
+eighth=147 playback timing, semantic MXL export/re-import, systems/WGSL reload,
+and the 1,704-region sampler all pass without queue drops or overloads. The bar
+remains `REVIEW_REQUIRED` for musician voicing, dynamics, articulation, pedal,
+and final ear review.
+
+The review-only voice authoring helper now omits stems unless a replacement or
+event explicitly requests one. This keeps chord candidates from adding
+redundant notation nodes to source voices that intentionally rely on engraving
+defaults; regression tests cover both omitted and explicitly authored stems.
+
+The accepted recording continues through a second final refrain that is absent
+after the supplied page-12 double bar. Sparse-layout OCR recovers the page-11
+and page-12 lyric lanes, and page-local ASR windows independently distinguish
+the first occurrence (measures 156/164/169 at 258.47/273.79/279.39 seconds)
+from the second (appended 175/183/188 at 288.84/304.79/316.21 seconds). A
+review-only authoring tool copies both voice guide and piano measures 156-174
+exactly to 175-193 and moves the terminal barline to the new ending. Its
+dedicated dual-reference gate passes with 23 anchors, complete recording-end
+coverage, unchanged 0.52-second maximum anchor deviation, and normalized costs
+0.296776 full mix / 0.279735 vocal-free. The live native app and its exported
+MXL both re-import as 193 measures / 2,564 events with 1,785 pitched events;
+pages 44-49 render cleanly, end playback stops at beat 756, and sampler faults
+remain zero. This closes the structural missing-repeat gap but leaves every
+copied note, transition, dynamic, articulation, pedal, and tempo choice
+`REVIEW_REQUIRED` for a musician.
+Recording-led review of the two final-refrain occurrences then corrects five
+existing lower-staff bars without changing rhythm or structure. Measures
+159/178 use B-flat2/F3 instead of the OCR draft's G-flat/D-flat, with an E-flat3
+approach only in the second occurrence; measures 161/180 use A-flat octaves;
+and later measure 185 independently uses A-flat octaves. Applying the same last
+edit to source measure 166 is rejected because its bass agreement remains zero,
+so the recording—not the copied page pattern—decides. The combined whole-mix
+gate improves 0.296776 -> 0.284912 and 70 -> 64 HIGH bars; the vocal-free gate
+improves 0.279735 -> 0.268818 and 68 -> 63 HIGH bars. All five accepted targets
+are two-hand MANUAL bars with 86.52%-100% pitch and 50%-100% bass agreement.
+Native GPU captures on pages 40 and 45 are clean; native export/reimport retains
+193 measures / 2,564 events at eighth=147 (73.5 QPM) with zero sampler faults.
+Post-unpause SoundCloud diagnostics preserve the accepted split timeline. One
+clean retry has no internal pause but ends at 298.494 seconds and matches the
+accepted opening at 0.919838 chroma similarity; a second ends at 297.459
+seconds. A nominally 340-second experiment is rejected after the UI reveals a
+hidden 30-second ad and ASR places its audio near 1:26, and a real-opening
+routing probe is rejected at -91 dBFS silence. The capture path does not smooth
+timestamp gaps or invent the missing tail merely to satisfy a duration check.
+The next lower-staff review at measure 132 deliberately stops without editing
+the private score. Four rhythm-preserving G/A-flat half-note candidates reduce
+the global HIGH queue, but no candidate passes both local references: A-flat
+octaves pass only the vocal-free target gate, while all four fail the whole-mix
+target pitch threshold. The existing G-flat octaves therefore remain
+`REVIEW_REQUIRED`; a lower aggregate cost is not treated as musical proof.
+Measure 136 reaches the same conservative conclusion for a different reason.
+Its upper E-flat/A-flat/F figure already reaches 94.08% accompaniment pitch
+agreement, while the two authored D-flat bass notes have zero agreement. Seven
+same-rhythm lower-line controls were gated. B-flat3/A-flat2 is strongest in the
+whole mix (70.29% pitch / 50% bass and HIGH 47 to 46) but substantially regresses
+the vocal-free reference; A-flat2/D-flat4 retains 94.08% pitch / 100% bass in
+the vocal-free window but fails the whole mix. Since no candidate clears both
+locked references, measure 136 remains unchanged and `REVIEW_REQUIRED`.
+Measure 138 resolves as a sustained D-flat/F/A-flat left-hand shell under the
+existing E-flat5-A-flat5-F5 upper figure. Separated guitar and the two locked
+references repeatedly support D-flat, F, and A-flat; the whole-mix bass favors
+F3 while accompaniment favors A-flat3. Eight register and completeness controls
+were gated with the same 23 timing anchors. F3-A-flat3-D-flat4 strictly
+dominates the other dual passes: whole-mix cost improves 0.293537 to 0.292779
+and HIGH 47 to 46 at 100% pitch / 50% bass, while accompaniment improves
+0.265771 to 0.264673 and HIGH 44 to 43 at 100% pitch / 100% bass. Exact XML
+comparison limits the change to one B-flat3-to-F3 retune, two chord tones at the
+same half-note onset, and one private provenance field, increasing the score
+from 2,581 to 2,583 events. Native page-35 GPU readback verifies the 2/4 meter
+clearance and 5-4-2 left-hand guide; one-second playback advances 1.253 quarter
+beats against 1.225 expected, sampler faults remain zero, and semantic
+MusicXML/MXL export/reimport preserves all seven piano events despite normalized
+part IDs. The bar remains `REVIEW_REQUIRED` for musician voicing, dynamics,
+articulation, pedal, and final ear review.
+Measure 139 does not resolve under the same gate. Seven A-flat-rooted dyad and
+shell candidates follow the separated guitar's A-flat/E-flat/F first half and
+A-flat/D-flat/F second half; they reach as high as 100% pitch agreement and
+improve both global costs and HIGH queues, but only 28.57% whole-mix / 33.33%
+accompaniment bass agreement. Five G/G-flat motion controls test the conflicting
+mixture bass detections without treating them as truth. G3-to-A-flat3 is the
+only whole-mix pass and fails accompaniment with zero bass agreement. No
+candidate clears both locked references, so measure 139 remains unchanged,
+`HIGH`, and `REVIEW_REQUIRED` rather than acquiring detector-led chromatic
+notes unsupported by the separated instruments.
+Measure 140 is likewise held. Six A-flat/D-flat/F register and time-resolved
+controls all pass the vocal-free reference, reaching 100% pitch / 100% bass,
+but remain at 20% whole-mix bass agreement because those frames are dominated
+by A-natural2. That pitch is absent from the separated guitar/piano and the
+vocal-free bass, so it is treated as full-mix contamination rather than a
+sustained chromatic piano note. Measure 140 stays unchanged, `HIGH`, and
+`REVIEW_REQUIRED` pending cleaner evidence or musician adjudication.
+Measure 150 replaces the contradicted A-natural/A-flat lower line with four
+playable B-flat2-F3-B-flat3 quarter-note shells. Both locked references and the
+separated guitar support B-flat/F. The selected octave-and-fifth voicing is
+preferred over a slightly cheaper D-flat extension because that extension
+forms an impractical left-hand tenth and has weaker direct stem support.
+Whole-mix cost falls 0.292779 to 0.290657 and HIGH 46 to 45 at 93.61% pitch /
+50% bass; accompaniment falls 0.264673 to 0.263269 and HIGH 43 to 42 at 99.13%
+pitch / 71.43% bass. Only m150 changes semantically and the added chord tones
+grow the score from 2,583 to 2,591 events. Native Metal readback, 5-3-1
+fingering, eighth=147 playback, normalized semantic export/reimport, WGSL
+reload, and sampler telemetry all pass with zero faults.
+Measure 151 then follows the audible harmonic transition with B-flat2-F3 dyads
+for its first two quarter attacks and A-flat2-E-flat3 dyads for the last two.
+This is the only one of seven static, shell, and time-resolved controls that
+passes both locked gates: whole-mix cost 0.290657 to 0.289700, HIGH 45 to 44,
+91.49% pitch / 50% bass; accompaniment cost 0.263269 to 0.261618, HIGH 42 to
+41, 90.89% pitch / 64.29% bass. The exact semantic diff is confined to m151,
+the document grows from 2,591 to 2,595 events, and strong dual-reference
+coverage reaches 61 measures. Native page-38 engraving, playback, guided
+fingering, semantic MXL export/reimport, WGSL reload, and the 1,704-region
+sampled grand pass without drops or overloads. Both bars remain
+`REVIEW_REQUIRED` for musician voicing, dynamics, articulation, pedal, and
+final ear adjudication.
+Measure 152 remains deliberately unpromoted. Its directly supported
+A-flat2-A-flat2-A-flat2-A2 correction, its octave realization, and a fifth-shell
+control all pass the vocal-free reference, but the first two miss the unchanged
+whole-mix bass gate by one 250 ms frame: 41.67% versus 45%. The full-mix cost
+and HIGH queue still improve substantially, but the process does not weaken a
+local gate or invent an unsupported G pitch to turn a near miss into a pass.
+The current bar remains `HIGH` pending cleaner alignment or musician review.
+Measure 153 is a cleaner semitone error. Its four existing alternating
+B-flat2/B-flat3 quarter notes become A2/A3 without changing rhythm, texture, or
+event count. Both locked gates pass: whole-mix cost 0.289700 to 0.287885 and
+HIGH 44 to 43 at 81.93% pitch / 57.14% bass; accompaniment cost 0.261618 to
+0.260527 and HIGH 41 to 40 at 90.17% pitch / 58.33% bass. Exact comparison
+finds only four m153 pitch-node changes. Native page-39 rendering, octave
+fingering, eighth=147 playback, normalized semantic MXL export/reimport, WGSL
+reload, and the sampled grand pass without faults; strong dual-reference
+coverage reaches 62 measures. The bar remains `REVIEW_REQUIRED` for musician
+dynamics, articulation, pedal, and final ear adjudication.
+Measure 155 remains unresolved after six E-flat/G-flat transition, octave, and
+shell controls. Every playable line worsens both locked global costs, while the
+only accompaniment pass is an unplayable 18-semitone diagnostic shell. Measure
+160 likewise stays unchanged after five time-resolved F/E-flat/A controls: the
+best full-mix line misses the bass gate by one mapped frame at 42.86%, and the
+remaining accompaniment passes either regress whole mix or fail its local
+threshold. Neither bar is changed merely to reduce a local HIGH count.
+Measure 163 supplies the next convergent correction. Its four alternating
+A-flat2/A-flat3 quarter notes become G-flat2/G-flat3, preserving rhythm,
+texture, and event count. Whole-mix cost falls 0.287885 to 0.286583 and HIGH 43
+to 42 at 79.07% pitch / 83.33% bass; accompaniment falls 0.260527 to 0.259538
+and HIGH 40 to 39 at 77.66% pitch / 71.43% bass. Exact comparison finds only
+four pitch-node changes. Native page-41 rendering, octave fingering,
+eighth=147 playback, normalized semantic MXL export/reimport, WGSL reload, and
+the sampled grand pass without faults; strong dual-reference coverage reaches
+63 measures. The bar remains `REVIEW_REQUIRED` for musician dynamics,
+articulation, pedal, and final ear adjudication.
+Measure 165 remains unresolved after four time-resolved and common-class
+controls. None clears both local gates, and the direct D-flat/C/D/C frame
+sequence slightly worsens accompaniment cost. Measure 166 does converge after
+distinguishing a chromatic pickup from a repeating pattern: one D3 quarter is
+followed by three E-flat3 quarters. Static E-flat misses whole mix by one frame;
+alternating D/E-flat passes but overstates the separated-stem D onset. The
+tightened line improves whole-mix cost 0.286583 to 0.285635 and HIGH 42 to 41
+at 86.81% pitch / 50% bass, and accompaniment cost 0.259538 to 0.258985 and
+HIGH 39 to 38 at 88.80% pitch / 50% bass. Exact comparison changes only four
+pitch nodes. Native page-42 rendering, fingering, eighth=147 playback,
+normalized semantic MXL export/reimport, WGSL reload, and sampler telemetry
+pass without faults; strong dual-reference coverage reaches 64 measures. The
+bar remains `REVIEW_REQUIRED` for musician dynamics, articulation, pedal, and
+final ear adjudication.
+Measure 177 resolves a different late-repeat bass texture rather than blindly
+copying its source bar. Six plausible register and alternating-line controls
+either regress a locked cost or miss the bass threshold. The separated stems
+and the intersection of both fixed frame mappings instead support D-flat3 on
+beat one followed by three B-flat3 quarters. Whole-mix cost falls 0.285635 to
+0.284812 and HIGH 41 to 40 at 85.57% pitch / 57.14% bass; accompaniment falls
+0.258985 to 0.258550 and HIGH 38 to 37 at 83.18% pitch / 50% bass. Exact
+comparison finds only four m177 pitch-node changes and keeps 2,595 events.
+Native page-45 engraving, guided fingering, eighth=147 playback, normalized
+semantic MXL export/reimport, WGSL/system reload, and the 1,704-region sampled
+grand pass without faults; strong dual-reference coverage reaches 65 measures.
+The bar remains `REVIEW_REQUIRED` for musician dynamics, articulation, pedal,
+and final ear adjudication.
+Measure 179 also differs from its copied source texture. Preserving the four
+quarter attacks while replacing the B-flat octave with
+F3-A-flat3-A-flat2-A-flat3 follows the shared locked window and separated
+guitar transition. It outperforms passing D-flat-led and static-octave controls:
+whole-mix cost falls 0.284812 to 0.283430 and HIGH 40 to 39 at 100% pitch /
+62.5% bass; accompaniment falls 0.258550 to 0.255678 and HIGH 37 to 36 at
+97.03% pitch / 87.5% bass. Exact comparison finds only four m179 pitch-node
+changes and keeps 2,595 events. Native page-45 engraving, guided fingering,
+eighth=147 playback, normalized semantic MXL export/reimport, and the sampled
+grand pass without faults; strong dual-reference coverage reaches 66 measures.
+The bar remains `REVIEW_REQUIRED` for musician dynamics, articulation, pedal,
+and final ear adjudication.
+Measure 183 needs chord shells because the two fixed evidence windows are
+slightly offset and no coherent single-note line covers both. Its four-beat
+lower voice becomes B-flat2, B-flat2+A-flat3, B-flat2+F3, D-flat3+F3: a
+playable seventh, fifth, and minor-third progression assembled only from
+independently supported tones. Whole-mix cost falls 0.283430 to 0.281225 and
+HIGH 39 to 38 at 96.46% pitch / 78.57% bass; accompaniment falls 0.255678 to
+0.254951 and HIGH 36 to 35 at 87.18% pitch / 71.43% bass. Exact comparison is
+confined to m183 and adds three intentional chord tones, bringing the private
+source to 2,598 events. Native page-46 engraving, guided fingering,
+eighth=147 playback, normalized semantic MXL export/reimport, and the sampled
+grand pass without faults; strong dual-reference coverage reaches 67 measures.
+The bar remains `REVIEW_REQUIRED` for musician dynamics, articulation, pedal,
+and final ear adjudication.
+Measure 184 has a simpler common solution: D-flat3 followed by three E-flat3
+quarters. The rhythm stays untouched and the exact full/accompaniment frame
+intersection supports the pickup and repeated E-flat without added harmony.
+Whole-mix cost falls 0.281225 to 0.280087 and HIGH 38 to 37 at 98.13% pitch /
+62.5% bass; accompaniment falls 0.254951 to 0.252827 and HIGH 35 to 34 at
+96.14% pitch / 56.25% bass. Exact comparison finds only four m184 pitch-node
+changes and keeps 2,598 events. Native page-46 engraving, guided fingering,
+eighth=147 playback, normalized semantic MXL export/reimport, and the sampled
+grand pass without faults; strong dual-reference coverage reaches 68 measures.
+The bar remains `REVIEW_REQUIRED` for musician dynamics, articulation, pedal,
+and final ear adjudication.
+The recording triage also distinguishes disagreement from absence of audible
+evidence. Below the audit's existing 0.003 RMS boundary, authored accompaniment
+is `MANUAL` with an explicit sustain/release ear-review reason instead of being
+declared wrong by empty chroma; a structurally missing left hand is still
+`HIGH`. A regression test fixes that ordering. The change affects only
+full-mix m191-m193 and accompaniment m192 classifications—no timing, cost,
+pitch, or score data changes. Accompaniment m191/m193 remain `HIGH`, every tail
+bar remains `REVIEW_REQUIRED`, and the shared-HIGH intersection falls to 13
+without manufacturing a silent-tail correction.
+Measure 96's restored Db-Ab cadence now reaches 91.8% pitch-class and 70% bass
+agreement; measure 37's restored Gb-add2 sonority reaches 90.1% pitch-class
+agreement but still fails the automated bass check. Those bars and the
+remaining voicing, rhythm, dynamics, articulation,
+and pedal decisions must be reconstructed as a coherent two-hand piano
+reduction before the recording-led accuracy gate can close.
+Measure 94 is the next accepted full-voice correction. A reusable authoring
+tool replaces only one named part/measure/staff/voice from explicit JSON,
+requires exact meter duration, supports rests/chords/beams and key-aware
+accidentals, removes the selected voice's forwards, preserves every unrelated
+XML element, and records evidence metadata. The promoted candidate replaces
+the unsupported A-flat fragment with recording-led D-flat/E-flat/F/B-flat
+upper texture and B-flat-F-A-flat-B-flat lower motion. It passes both unchanged
+gates: full-mix cost 0.284912 -> 0.281513 and HIGH 64 -> 63 (96.57% pitch,
+66.67% bass), while vocal-free cost 0.268818 -> 0.266360 and HIGH 63 -> 62
+(91.45% pitch, 71.43% bass). The current private MXL is structurally clean at
+193 measures / 2,575 events; native playback, export/reimport, guided keys,
+sampler telemetry, and live Flecs/WGSL reload all pass. This is a measured
+improvement, not professional certification: dynamics, articulation, pedal,
+fingering, and final musician ear review remain open.
+
+Measure 55 is the next accepted lower-register correction. The supplied draft's
+D-flat3/D-flat4 bass has no support in the aligned full mix, vocal-free
+accompaniment, or six-stem review; the guitar stem repeatedly identifies
+A-flat2/A-flat3 through the target window. A rhythm-preserving A-flat-octave
+candidate changes only those two pitches and its provenance metadata. The
+full-mix gate improves 0.281513 -> 0.281508 and HIGH 63 -> 62, with 91.25%
+target pitch-class and 50% bass agreement. The vocal-free global cost remains
+exactly 0.266360 while HIGH falls 62 -> 61, with 100% target pitch-class and
+50% bass agreement. That cost-neutral result is accepted because global DTW is
+pitch-class/onset based while the independently gated bass metric is
+register-aware; candidates still may not regress the global cost and must lower
+the HIGH queue. Native Metal playback at bar 55, the 1,704-region/641-preloaded
+sampled grand, live Flecs/WGSL reload, GPU readback, and native
+export/re-import all pass with zero sampler drops or overloads. The score
+remains structurally clean at 193 measures, 2,575 note/rest events, and 1,794
+pitched events. Measure 55 remains `REVIEW_REQUIRED` pending a musician's ear,
+voicing, fingering, dynamics, articulation, and pedal confirmation.
+
+Measure 61 is the next accepted lower-register correction. Both aligned audits
+already had 100% target pitch-class agreement but 0% bass agreement for the
+draft A-flat3/E-flat3 half notes. Time-resolved Basic Pitch events across the
+separated guitar, other, and piano stems repeatedly identify F3 through both
+halves of the bar; both aligned references independently rank F3 first in the
+bass. The authorized page is retained only as secondary rhythm/engraving
+evidence, not as the pitch authority. F3-D-flat3 and F3-C3 alternatives are
+rejected by the unchanged local or global gates. The promoted sustained-F3
+candidate changes only the two lower pitches plus provenance and preserves
+both half-note durations. Global costs remain 0.281508 full mix / 0.266360
+vocal-free while HIGH falls 62 -> 61 and 61 -> 60. Target agreement is 100%
+pitch class in both references and 75% / 87.5% bass. Native Metal playback,
+GPU readback, live Flecs/WGSL reload, sampler telemetry, and export/re-import
+all pass; the latter retains 193 measures, 2,575 note/rest events, and 1,794
+pitched events. Measure 61 remains `REVIEW_REQUIRED` pending musician voicing,
+fingering, dynamics, articulation, pedal, and final ear confirmation.
+
+Measure 120 is the next accepted bass-register correction. Its draft lower
+voice alternates A-flat3/E-flat4 in four existing eighth-note attacks; both
+aligned references report 100% overall pitch-class agreement but 0% bass
+agreement. All three separated instrument stems identify F3, and the
+time-resolved piano stem repeats it across the target window. Four
+rhythm-preserving F3 attacks are the only tested ordering to pass both unchanged
+gates; three F/D-flat orderings fail a target bass threshold or increase the
+full-mix HIGH queue. The promoted candidate changes only those four lower
+pitches plus provenance. Full-mix cost improves 0.281508 -> 0.281096 and HIGH
+61 -> 60, with 100% pitch / 60% bass agreement. Vocal-free cost improves
+0.266360 -> 0.266033 and HIGH 60 -> 59, with 100% pitch / 75% bass agreement.
+Native Metal playback, GPU readback, live Flecs/WGSL reload, zero-fault sampled
+grand telemetry, and export/re-import all pass with exact 193-measure / 2,575
+note-rest / 1,794-pitched-event retention. Measure 120 remains
+`REVIEW_REQUIRED` pending musician voicing, fingering, dynamics, articulation,
+pedal, and final ear confirmation.
+
+Measure 119 is the next accepted rhythm-preserving lower-register correction.
+Its A-flat3/E-flat4 alternation has 0% bass agreement in both timelines. The
+accepted full/accompaniment frame mappings plus separated guitar, piano, and
+other stems support C3-D-flat3-F3-C3 on the four existing eighth-note slots;
+both quarter rests and the beaming remain unchanged. Full-mix cost improves
+0.281096 -> 0.281024 and HIGH 60 -> 59 with 100% pitch / 60% bass. Vocal-free
+cost improves 0.266033 -> 0.265124 and HIGH 59 -> 58 with 100% pitch / 66.67%
+bass. Parsed-tree comparison proves all non-target semantics unchanged. Native
+Metal playback/readback at bar 119, phrase-aware finger state, live Flecs/WGSL
+reload, the 1,704-region/641-preloaded sampled grand, and export/re-import all
+pass with no sampler faults and exact 193-measure / 2,575-note-rest /
+1,794-pitched-event retention. The bar remains `REVIEW_REQUIRED` for musician
+voicing, fingering, dynamics, articulation, pedal, and final ear confirmation.
+
+Measure 121 is the next accepted unambiguous lower-register correction. Its
+four existing attacks carry B-flat/D-flat/G-flat/B-flat, while every mapped
+bass frame in both accepted timelines is F3. Four F3 eighth notes retain the
+original two-beam/two-rest rhythm. Both gates reach 100% pitch / 100% bass:
+full-mix cost improves 0.281024 -> 0.280010 and HIGH 59 -> 58; vocal-free cost
+improves 0.265124 -> 0.263877 and HIGH 58 -> 57. Non-target parsed semantics
+are identical. Native Metal playback/readback, phrase finger state, live
+Flecs/WGSL reload, the zero-fault sampled grand, and export/re-import all pass
+with 193 measures, 2,575 note/rest events, and 1,794 pitched events. The bar
+remains `REVIEW_REQUIRED` for musician articulation, dynamics, voicing, pedal,
+and final ear confirmation.
+
+Measure 118 is deliberately not edited. A rhythm-preserving
+B-flat2-B-flat2-G-flat2-A-flat2 candidate follows the separated guitar/other
+events and improves both global costs (0.281024 -> 0.280847 full and 0.265124
+-> 0.263546 vocal-free). It passes the vocal-free gate at 100% pitch / 80%
+bass, but the whole mix reaches 94.75% pitch / 40% bass and fails the unchanged
+45% target. Substituting the detector-favored A-natural would lack independent
+stem support and would turn the gate into metric gaming. Retain the authored
+bar as `HIGH` / `REVIEW_REQUIRED` for an ear-and-piano decision.
+
+The recording audit now reports `low_register_candidate_agreement` beside its
+strict primary-bass agreement. This non-gating diagnostic considers the frame's
+single bass estimate plus ranked pitches below C4, exposing a likely harmonic
+or semitone mistake without promoting it to an authoritative fundamental.
+Measure 43 demonstrates the distinction: the primary field gives 0%/25% for
+the authored A-flat2/A-flat3, while the same frames provide 50%/75% low-register
+A-flat support and all three separated stems repeatedly transcribe A-flat. The
+score is deliberately unchanged; replacing it with detector-favored A-natural
+would discard stronger independent evidence.
+
+An earlier measure-114 pass rejected five lower-voice-only candidates: each
+either improved one reference while worsening the other or missed a bass
+threshold. That rejection remains useful evidence against a static bass edit,
+but it was superseded by the later complete two-voice, time-resolved matrix
+described above. The accepted B-flat/D-flat to C/B-flat transition clears both
+locked references while preserving the authored rhythm; the bar is now
+`MANUAL` but remains `REVIEW_REQUIRED` for musician adjudication.
+
+Measure 171 is also deliberately not edited. Its authored A-flat3/F3 halves
+produce 100% pitch-class but 0% bass agreement in both accepted timelines.
+Time-resolved full-mix, vocal-free, and separated guitar/piano/other evidence
+suggests B-flat/G-flat/A-flat motion, so seven register and rhythm variants are
+audited. The strongest sparse line—B-flat2 quarter, G-flat2 half, A-flat2
+quarter—turns the bar MANUAL with 100% pitch and 50%/87.5% bass and lowers both
+HIGH queues by one. It nevertheless worsens the global costs from 0.281096 to
+0.281143 and 0.266033 to 0.266088. The unchanged Pareto gates reject it: a
+local detector fit is not enough to distinguish the intended musical bass
+from stem fundamentals or onset/alignment ambiguity.
 
 ## 1. Product definition
 
@@ -304,6 +1159,13 @@ bounded note-snapshot edits back into Flecs at the same frame boundary. The
 same control surface exposes `sampler state` telemetry and routes validated
 `midi` commands to both the core/practice recorder and the live sfizz instance,
 which makes channel, velocity, and pedal behavior testable without GUI input.
+`sampler state` includes the four detail values confirmed on the audio thread;
+`sampler detail studio|dry|RELEASE HAMMER PEDAL_NOISE RESONANCE` changes them
+without replacing the document or restarting the process.
+The server never unlinks a socket merely because bind failed: it first probes
+the existing endpoint, returns `SocketInUse` for a live owner, and only removes
+a stale path before retrying. This prevents a second app instance from silently
+stealing hot-reload control from the watched native session.
 - A failed compile, load, ABI check, or migration keeps the last working module active and reports the error through the GPU developer overlay.
 - Browser development rebuilds the Wasm application and performs a live restart from a versioned serialized world snapshot. This avoids making Wasm dynamic linking a production dependency while retaining rapid stateful iteration.
 - The generated glyph atlas is hashed into the hot-module descriptor. A changed
@@ -638,25 +1500,57 @@ Both sources can run together. All input is mapped once onto the `AudioContext`/
 
 Do not attempt blind full-song transcription in the live path. The expected score provides a narrow pitch/time hypothesis window. An online Viterbi/beam-search follower aligns observations to score states while allowing repeats, pauses, restarts, skipped notes, and tempo drift.
 
-For offline authoring, `score-audio-analyze` accepts a lawful local PCM WAV and
+For offline authoring, `score-workbench audio-evidence` accepts a lawful local PCM WAV and
 emits a versioned JSON evidence ledger: onset envelope, tempo estimate, bass
 candidate, pitch candidates, normalized chroma, and optional MusicXML/MXL
 alignment. Its deterministic Goertzel-based implementation is deliberately a
 review aid, not a claim of professional automatic transcription. A later
 source-separation/learned transcription stage must preserve confidence and feed
 the same manual correction/audit workflow. Streaming-site ripping is outside
-the content pipeline; private reference recordings must be supplied locally by
-the user and remain ignored.
+the content pipeline; user-authorized private reference captures and local
+exports remain ignored and must never be bundled or redistributed.
 
 For native development on macOS, `scripts/capture-browser-reference.sh`
 provides a reusable user-authorized loopback workflow for browser or app
 playback. It discovers the current AVFoundation index for `BlackHole 16ch`,
-temporarily selects that device as the macOS output, captures stereo PCM24 WAV,
+temporarily selects that device as the macOS output by default, or accepts a
+separate `--output-device` for an already configured aggregate/multi-output
+route, captures stereo PCM24 WAV,
 restores the previous output from an exit/signal trap, and invokes
-`score-audio-analyze` with an optional MusicXML/MXL comparison. The capture
+`score-workbench audio-evidence` with an optional MusicXML/MXL comparison. The capture
 command allows an application-settle interval, rejects silent captures,
 refuses to overwrite evidence, and keeps acquisition separate from analysis so
 the same workflow works for any song or local player.
+
+Repository automation in `scripts/` is limited to thin platform build,
+packaging, development, and authorized capture wrappers. MusicXML/MXL
+inspection, transformation, audio alignment, and candidate gates are
+subcommands of the tested Zig `score-workbench`; sampler gates live in the
+single Zig `sampler_workbench`, and live native control in `dev_control`.
+Licensed/private sources, generated score candidates, capture WAVs, analysis
+ledgers, rendered output, scratch files, and Python bytecode live only in
+ignored `local-content/`, `captures/`, `output/`, or `tmp/` paths. The policy is
+recorded in `scripts/README.md`; genuinely one-off probes are deleted after
+their conclusion is documented instead of accumulating as repository tools.
+
+The 2026-08-23 SoundCloud redo also demonstrates why container duration and a
+visible song title are not acceptance evidence. A long routed take was rejected
+after content fingerprinting and small-model ASR disagreed with the accepted
+recording. A separately visible 4:20 seek captured the actual late refrain and
+overlapped the accepted 3:05 take at 0.842153 chroma similarity. Replacing the
+accepted tail with it lowered global score-alignment cost from 0.280010 to
+0.276901, but raised the HIGH queue from 58 to 62 and timing-anchor escapes from
+2 to 3, so it remains independent review evidence and authors no notes.
+
+After the user resumed playback, a further retry was verified as Holocene by
+small-model ASR: the opening `part of me`/`laying waste` phrases recur after a
+browser restart. BlackHole nevertheless receives active audio only through
+74.65 seconds and then records silence. Four overlapping chunk attempts and two
+pause/reload route probes are exactly -91 dBFS because Chrome retains the
+speaker stream across later default-device changes. All are explicitly
+excluded. The already accepted split timeline and the independently valid 4:20
+tail remain the musical evidence; no score edit is promoted merely because a
+new WAV exists.
 
 MusicXML lyric text is modeled independently from notes. A named vocal part or
 cue note is tagged as a vocal guide: it may render as an optional singer cue,
@@ -708,7 +1602,7 @@ Replaying a take offers:
 - **Together**: aligned audio and MIDI with a user-adjustable correction offset.
 - **Compare**: A/B two takes or place the reference performance against the user take.
 
-Export audio in its original lossless/encoded track plus a widely playable derived file when available. Export MIDI as a Type-1 Standard MIDI File from the raw monotonic take timebase, preserving performance timing, channel data, and controller automation without notation quantization. Portable `.score` v12 stores the captured take tempo so the same take exports deterministically after recovery. Recording audio is opt-in for sync because it is large and sensitive; MIDI/assessment-only sync is the default. Show duration/size/quota before long recordings and write chunks incrementally so a refresh does not lose the whole take.
+Export audio in its original lossless/encoded track plus a widely playable derived file when available. Export MIDI as a Type-1 Standard MIDI File from the raw monotonic take timebase, preserving performance timing, channel data, and controller automation without notation quantization. Portable `.score` v14 stores the captured take tempo so the same take exports deterministically after recovery. Recording audio is opt-in for sync because it is large and sensitive; MIDI/assessment-only sync is the default. Show duration/size/quota before long recordings and write chunks incrementally so a refresh does not lose the whole take.
 
 ### 8.5 Practice features and coaching
 

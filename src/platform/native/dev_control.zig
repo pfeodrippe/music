@@ -32,21 +32,23 @@ pub const Server = struct {
     path_len: usize,
 
     pub fn init() !Server {
-        var self = Server{ .fd = -1, .path = [_:0]u8{0} ** 104, .path_len = 0 };
         const configured = c.getenv("SCORE_DEV_SOCKET");
-        const value = if (configured != null and configured[0] != 0)
-            std.mem.span(configured)
-        else
-            std.fmt.bufPrint(self.path[0 .. self.path.len - 1], "/tmp/score-dev-{d}.sock", .{c.getuid()}) catch return error.SocketPathTooLong;
+        if (configured != null and configured[0] != 0) return initAt(std.mem.span(configured));
+        var path_buffer: [104]u8 = undefined;
+        const value = std.fmt.bufPrint(&path_buffer, "/tmp/score-dev-{d}.sock", .{c.getuid()}) catch return error.SocketPathTooLong;
+        return initAt(value);
+    }
+
+    fn initAt(value: []const u8) !Server {
+        var self = Server{ .fd = -1, .path = [_:0]u8{0} ** 104, .path_len = 0 };
         if (value.len >= self.path.len) return error.SocketPathTooLong;
-        if (configured != null and configured[0] != 0) @memcpy(self.path[0..value.len], value);
+        @memcpy(self.path[0..value.len], value);
         self.path[value.len] = 0;
         self.path_len = value.len;
 
         self.fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (self.fd < 0) return error.SocketCreateFailed;
         errdefer _ = c.close(self.fd);
-        _ = c.unlink(self.path[0..self.path_len :0].ptr);
 
         var address: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
         const address_len: c.socklen_t = @intCast(@offsetOf(c.struct_sockaddr_un, "sun_path") + self.path_len + 1);
@@ -54,7 +56,16 @@ pub const Server = struct {
         address.sun_family = c.AF_UNIX;
         const destination: [*]u8 = @ptrCast(&address.sun_path);
         @memcpy(destination[0 .. self.path_len + 1], self.path[0 .. self.path_len + 1]);
-        if (c.bind(self.fd, @ptrCast(&address), address_len) != 0) return error.SocketBindFailed;
+        if (c.bind(self.fd, @ptrCast(&address), address_len) != 0) {
+            const probe = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+            if (probe >= 0) {
+                const live = c.connect(probe, @ptrCast(&address), address_len) == 0;
+                _ = c.close(probe);
+                if (live) return error.SocketInUse;
+            }
+            _ = c.unlink(self.path[0..self.path_len :0].ptr);
+            if (c.bind(self.fd, @ptrCast(&address), address_len) != 0) return error.SocketBindFailed;
+        }
         if (c.chmod(self.path[0..self.path_len :0].ptr, 0o600) != 0) return error.SocketPermissionsFailed;
         if (c.listen(self.fd, 8) != 0) return error.SocketListenFailed;
         if (c.fcntl(self.fd, c.F_SETFL, c.O_NONBLOCK) < 0) return error.SocketNonBlockingFailed;
@@ -85,3 +96,12 @@ pub const Server = struct {
         return self.path[0..self.path_len];
     }
 };
+
+test "a second dev server cannot steal a live control socket" {
+    var path_buffer: [104:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, "/tmp/score-dev-test-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    var first = try Server.initAt(path);
+    defer first.deinit();
+    try std.testing.expectError(error.SocketInUse, Server.initAt(path));
+}

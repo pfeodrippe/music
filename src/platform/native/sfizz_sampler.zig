@@ -50,6 +50,30 @@ const Api = struct {
     }
 };
 
+/// Conventional detail controls used by the two Salamander piano packs. The
+/// SFZ files label CC20...23 explicitly; keeping the values in one type avoids
+/// the native host, verifier, and live tuning path silently drifting apart.
+pub const PianoDetailProfile = struct {
+    sampled_release: u8,
+    hammer_noise: u8,
+    pedal_noise: u8,
+    pedal_resonance: u8,
+
+    pub const studio: PianoDetailProfile = .{
+        .sampled_release = 64,
+        .hammer_noise = 64,
+        .pedal_noise = 64,
+        .pedal_resonance = 64,
+    };
+
+    pub const dry: PianoDetailProfile = .{
+        .sampled_release = 0,
+        .hammer_noise = 0,
+        .pedal_noise = 0,
+        .pedal_resonance = 0,
+    };
+};
+
 fn symbol(library: *std.DynLib, comptime T: type, name: [:0]const u8) !T {
     return library.lookup(T, name) orelse error.MissingSamplerSymbol;
 }
@@ -67,6 +91,10 @@ pub const Sampler = struct {
     read_index: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     dropped_events: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     overloaded_samples: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    applied_sampled_release: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    applied_hammer_noise: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    applied_pedal_noise: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    applied_pedal_resonance: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     left: [max_frames]f32 = undefined,
     right: [max_frames]f32 = undefined,
     click_stereo: [max_frames * 2]f32 = undefined,
@@ -119,6 +147,24 @@ pub const Sampler = struct {
 
     pub fn controlChange(self: *Sampler, channel: u8, controller: u8, value: u8) void {
         self.enqueue(.{ .kind = 4, .channel = channel & 0x0f, .pitch = 0, .velocity = value, .controller = controller });
+    }
+
+    pub fn applyPianoDetailProfile(self: *Sampler, profile: PianoDetailProfile) void {
+        self.controlChange(0, 20, profile.sampled_release);
+        self.controlChange(0, 21, profile.hammer_noise);
+        self.controlChange(0, 22, profile.pedal_noise);
+        self.controlChange(0, 23, profile.pedal_resonance);
+    }
+
+    /// Values confirmed as consumed by the audio thread, rather than merely
+    /// queued by the UI thread.
+    pub fn pianoDetailProfile(self: *const Sampler) PianoDetailProfile {
+        return .{
+            .sampled_release = self.applied_sampled_release.load(.acquire),
+            .hammer_noise = self.applied_hammer_noise.load(.acquire),
+            .pedal_noise = self.applied_pedal_noise.load(.acquire),
+            .pedal_resonance = self.applied_pedal_resonance.load(.acquire),
+        };
     }
 
     pub fn click(self: *Sampler, accent: bool) void {
@@ -178,12 +224,26 @@ pub const Sampler = struct {
         const write = self.write_index.load(.acquire);
         while (read != write) {
             const event = self.events[read];
+            // sfizz's first integer is an intra-render-block sample delay, not
+            // a MIDI channel. This process owns one piano instrument, so every
+            // queued event starts at the next callback boundary (delay zero)
+            // while the original MIDI channel remains preserved in the score
+            // and recording models.
             switch (event.kind) {
-                0 => self.api.send_note_off(self.handle, event.channel, event.pitch, event.velocity),
-                1 => self.api.send_note_on(self.handle, event.channel, event.pitch, @max(1, event.velocity)),
+                0 => self.api.send_note_off(self.handle, 0, event.pitch, event.velocity),
+                1 => self.api.send_note_on(self.handle, 0, event.pitch, @max(1, event.velocity)),
                 2 => self.api.all_sound_off(self.handle),
                 3 => self.click_synth.click(event.velocity >= 120),
-                4 => self.api.send_cc(self.handle, event.channel, event.controller, event.velocity),
+                4 => {
+                    self.api.send_cc(self.handle, 0, event.controller, event.velocity);
+                    switch (event.controller) {
+                        20 => self.applied_sampled_release.store(event.velocity, .release),
+                        21 => self.applied_hammer_noise.store(event.velocity, .release),
+                        22 => self.applied_pedal_noise.store(event.velocity, .release),
+                        23 => self.applied_pedal_resonance.store(event.velocity, .release),
+                        else => {},
+                    }
+                },
                 else => {},
             }
             read = (read + 1) % queue_capacity;

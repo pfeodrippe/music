@@ -1,5 +1,7 @@
 const model = @import("model.zig");
+const fingering = @import("fingering.zig");
 const render = @import("../render/packet.zig");
+const glyph_atlas = @import("../render/glyph_atlas.zig");
 const annotation = @import("annotation.zig");
 const std = @import("std");
 
@@ -76,16 +78,18 @@ pub const Layout = struct {
     }
 
     fn calculateWithFocus(width: f32, height: f32, keyboard_visible: bool, focus_score: bool) Layout {
-        const top_height: f32 = if (focus_score) 0 else 70;
-        const transport_height: f32 = if (focus_score) 58 else 76;
-        const compact_tools_height: f32 = if (!focus_score and width < 760) 54 else 0;
+        const constrained = !focus_score and width < 760 and height < 650;
+        const top_height: f32 = if (focus_score) 0 else if (constrained) 56 else 70;
+        const transport_height: f32 = if (focus_score or constrained) 58 else 76;
+        const compact_tools_height: f32 = if (!focus_score and width < 760) (if (constrained) 44 else 54) else 0;
         const tool_width: f32 = if (!focus_score and width >= 760) 78 else 0;
         const coach_width: f32 = if (!focus_score and width >= 1120) 300 else 0;
         const stage_x = tool_width;
         const stage_width = width - tool_width - coach_width;
         const content_height = height - top_height - transport_height - compact_tools_height;
-        const desired_keyboard_height: f32 = if (height < 650) 128 else if (width < 760) 150 else 180;
-        const keyboard_height: f32 = if (keyboard_visible and !focus_score) @min(desired_keyboard_height, @max(112, content_height * 0.34)) else 0;
+        const desired_keyboard_height: f32 = if (constrained) 80 else if (width < 760) 150 else 180;
+        const keyboard_floor: f32 = if (constrained) 72 else 112;
+        const keyboard_height: f32 = if (keyboard_visible and !focus_score) @min(desired_keyboard_height, @max(keyboard_floor, content_height * 0.30)) else 0;
         const stage_height = content_height - keyboard_height;
         const transport = Rect{ .x = 0, .y = height - transport_height, .width = width, .height = transport_height };
         const play_size: f32 = 48;
@@ -95,7 +99,7 @@ pub const Layout = struct {
         for (0..4) |index| tool_buttons[index] = if (tool_width != 0)
             .{ .x = 14, .y = top_height + 20 + @as(f32, @floatFromInt(index)) * 58, .width = 50, .height = 48 }
         else
-            .{ .x = @as(f32, @floatFromInt(index)) * width / 4 + 5, .y = top_height + stage_height + 5, .width = width / 4 - 10, .height = 44 };
+            .{ .x = @as(f32, @floatFromInt(index)) * width / 4 + 5, .y = top_height + content_height + 5, .width = width / 4 - 10, .height = @max(0, compact_tools_height - 10) };
         const compact_button_width: f32 = if (width < 420) 78 else 94;
         const import_width: f32 = if (width < 600) compact_button_width else 154;
         const export_width: f32 = if (width < 600) compact_button_width else 94;
@@ -185,9 +189,11 @@ pub const ScoreGeometry = struct {
     pub fn calculateWithVocal(stage: Rect, vocal_visible: bool) ScoreGeometry {
         const margin: f32 = if (stage.width < 700) 20 else 46;
         const page_width = @max(280, stage.width - margin * 2);
-        const page_height = @max(280, stage.height - 34);
+        // The paper must remain inside the stage. A previous 280 px minimum
+        // painted the score underneath the keyboard in a constrained window.
+        const page_height = @max(220, stage.height - 20);
         const page_x = stage.x + (stage.width - page_width) * 0.5;
-        const page_y = stage.y + 18;
+        const page_y = stage.y + 10;
         const page_padding: f32 = if (page_width < 500) 24 else 48;
         const staff_x = page_x + page_padding;
         const staff_width = page_width - page_padding * 2;
@@ -197,22 +203,26 @@ pub const ScoreGeometry = struct {
         const notation_lead: f32 = if (page_width < 500) 110 else 126;
         const music_x = staff_x + notation_lead;
         const music_width = staff_width - notation_lead;
-        const first_treble = page_y + @as(f32, if (page_height < 360) 96 else 112);
-        const system_gap = std.math.clamp(page_height - 340, 126, 200);
-        const compact_vocal = page_height < 480;
+        const ultra_compact = page_height < 340;
+        const first_treble = page_y + @as(f32, if (ultra_compact) 76 else if (page_height < 440) 96 else 112);
+        const piano_group_height: f32 = 140;
+        const system_gap = @max(150, page_height - (first_treble - page_y) - piano_group_height - 28);
+        const compact_vocal = page_height < 680;
         // The first singer staff starts below the complete page heading. SMuFL
         // treble clefs extend well above the top staff line, so anchoring this
         // at the old 84 px offset let the clef collide with the source label.
-        const first_vocal = page_y + @as(f32, if (compact_vocal) 86 else 88);
+        const first_vocal = page_y + 88;
         // Lyrics own the lane immediately below the vocal staff. Keep enough
         // clearance for descenders, note stems/dynamics, and the next piano
         // staff instead of allowing text to collide with either notation row.
-        const vocal_to_treble: f32 = if (compact_vocal) 102 else 110;
-        const treble_to_bass: f32 = if (compact_vocal) 56 else 58;
+        const vocal_to_treble: f32 = if (ultra_compact) 78 else if (compact_vocal) 102 else 110;
+        const treble_to_bass: f32 = if (ultra_compact) 56 else if (compact_vocal) 56 else 58;
         const vocal_group_height = vocal_to_treble + treble_to_bass + 48;
-        const vocal_system_gap = @min(
-            @as(f32, if (compact_vocal) 210 else 230),
-            @max(vocal_group_height + 4, page_height - (first_vocal - page_y) - vocal_group_height - @as(f32, if (compact_vocal) 24 else 32)),
+        // When two systems fit, distribute them down the page so the next
+        // clef and time signature cannot intrude into the previous bass staff.
+        const vocal_system_gap = @max(
+            vocal_group_height + 48,
+            page_height - (first_vocal - page_y) - vocal_group_height - @as(f32, if (compact_vocal) 24 else 32),
         );
         const resolved_treble = if (vocal_visible) first_vocal + vocal_to_treble else first_treble;
         const resolved_bass = if (vocal_visible) resolved_treble + treble_to_bass else first_treble + 68;
@@ -231,7 +241,7 @@ pub const ScoreGeometry = struct {
             .vocal_y = if (vocal_visible) .{ first_vocal, first_vocal + vocal_system_gap } else .{ first_treble, first_treble + system_gap },
             // The lyric baseline is a distinct engraving lane: 34 px below
             // the lowest staff line and still above the piano grand staff.
-            .lyric_y = if (vocal_visible) .{ first_vocal + 82, first_vocal + vocal_system_gap + 82 } else .{ first_treble + 82, first_treble + system_gap + 82 },
+            .lyric_y = if (vocal_visible) .{ first_vocal + vocal_to_treble - 20, first_vocal + vocal_system_gap + vocal_to_treble - 20 } else .{ first_treble + 82, first_treble + system_gap + 82 },
             .treble_y = .{ resolved_treble, resolved_treble + resolved_gap },
             .bass_y = .{ resolved_bass, resolved_bass + resolved_gap },
         };
@@ -267,7 +277,14 @@ pub const ScorePage = struct {
 
 pub const ScoreBeatPosition = struct { x: f32, system: usize };
 
-fn nextScoreSystem(measures: []const model.Measure, first_measure: usize) ScoreSystem {
+fn scoreSystemBeatCapacity(zoom: f32) f32 {
+    // Zooming out must reveal more authored measures, not merely shrink the
+    // same sparse page. Keep the density bounded so note spacing remains
+    // readable and zooming in still has a useful optical effect.
+    return std.math.clamp(9.0 / std.math.clamp(zoom, 0.65, 1.05), 8.0, 14.0);
+}
+
+fn nextScoreSystem(measures: []const model.Measure, first_measure: usize, beat_capacity: f32) ScoreSystem {
     if (first_measure >= measures.len) {
         const end = if (measures.len == 0) @as(f32, 0) else measures[measures.len - 1].start_beat + measures[measures.len - 1].duration_beats;
         return .{ .start_beat = end, .end_beat = end, .first_measure = measures.len, .measure_end = measures.len };
@@ -278,75 +295,114 @@ fn nextScoreSystem(measures: []const model.Measure, first_measure: usize) ScoreS
     while (measure_end < measures.len) {
         const measure = measures[measure_end];
         const candidate_end = measure.start_beat + @max(0.0001, measure.duration_beats);
-        if (measure_end > first_measure and candidate_end - start > 9.0001) break;
+        if (measure_end > first_measure and candidate_end - start > beat_capacity + 0.0001) break;
         end = @max(end, candidate_end);
         measure_end += 1;
     }
     return .{ .start_beat = start, .end_beat = end, .first_measure = first_measure, .measure_end = measure_end };
 }
 
-pub fn scorePageForBeat(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta) ScorePage {
+/// Select the number of complete systems that physically fit in a score pane.
+/// Vocal-guide pages need substantially more vertical space because the vocal
+/// staff and lyric lane are independent from the piano grand staff.
+pub fn scoreSystemsPerPage(stage_height: f32, vocal_visible: bool) usize {
+    const page_height = @max(220, stage_height - 20);
+    return if (vocal_visible)
+        (if (page_height >= 680) 2 else 1)
+    else
+        (if (page_height >= 430) 2 else 1);
+}
+
+pub fn scorePageForBeat(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32) ScorePage {
+    return scorePageForBeatLimited(measures, requested_beat, meta, zoom, 2);
+}
+
+pub fn scorePageForBeatLimited(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32, requested_systems: usize) ScorePage {
+    const systems_per_page = std.math.clamp(requested_systems, 1, 2);
     if (measures.len == 0) {
-        const page_start = meta.pageStart(requested_beat);
         const system_beats = meta.systemBeats();
+        const page_beats = system_beats * @as(f32, @floatFromInt(systems_per_page));
+        const page_start = @floor(@max(0, requested_beat) / page_beats) * page_beats;
+        const second_start = page_start + system_beats;
         return .{ .systems = .{
             .{ .start_beat = page_start, .end_beat = page_start + system_beats },
-            .{ .start_beat = page_start + system_beats, .end_beat = page_start + system_beats * 2 },
-        }, .page_index = @intFromFloat(@floor(page_start / meta.pageBeats())) };
+            .{ .start_beat = second_start, .end_beat = if (systems_per_page == 2) second_start + system_beats else second_start },
+        }, .system_count = systems_per_page, .page_index = @intFromFloat(@floor(page_start / page_beats)) };
     }
 
     const target = @max(measures[0].start_beat, requested_beat);
+    const beat_capacity = scoreSystemBeatCapacity(zoom);
     var first_measure: usize = 0;
     var page_index: u32 = 0;
     while (true) : (page_index += 1) {
-        const first = nextScoreSystem(measures, first_measure);
-        const second = nextScoreSystem(measures, first.measure_end);
+        const first = nextScoreSystem(measures, first_measure, beat_capacity);
+        const second = if (systems_per_page == 2)
+            nextScoreSystem(measures, first.measure_end, beat_capacity)
+        else
+            ScoreSystem{ .start_beat = first.end_beat, .end_beat = first.end_beat, .first_measure = first.measure_end, .measure_end = first.measure_end };
         const page = ScorePage{
             .systems = .{ first, second },
-            .system_count = if (second.measure_end > second.first_measure) 2 else 1,
+            .system_count = if (systems_per_page == 2 and second.measure_end > second.first_measure) 2 else 1,
             .page_index = page_index,
         };
-        if (target < page.endBeat() - 0.0001 or second.measure_end >= measures.len) return page;
-        first_measure = second.measure_end;
+        const page_measure_end = page.systems[page.system_count - 1].measure_end;
+        if (target < page.endBeat() - 0.0001 or page_measure_end >= measures.len) return page;
+        first_measure = page_measure_end;
     }
 }
 
-pub fn scoreContinuousForBeat(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta) ScorePage {
-    if (measures.len == 0) return scorePageForBeat(measures, requested_beat, meta);
+pub fn scoreContinuousForBeat(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32) ScorePage {
+    return scoreContinuousForBeatLimited(measures, requested_beat, meta, zoom, 2);
+}
+
+pub fn scoreContinuousForBeatLimited(measures: []const model.Measure, requested_beat: f32, meta: *const model.DocumentMeta, zoom: f32, requested_systems: usize) ScorePage {
+    const systems_per_page = std.math.clamp(requested_systems, 1, 2);
+    if (measures.len == 0) return scorePageForBeatLimited(measures, requested_beat, meta, zoom, systems_per_page);
     const target = @max(measures[0].start_beat, requested_beat);
+    const beat_capacity = scoreSystemBeatCapacity(zoom);
     var first_measure: usize = 0;
     var system_index: u32 = 0;
     while (first_measure < measures.len) : (system_index += 1) {
-        const first = nextScoreSystem(measures, first_measure);
+        const first = nextScoreSystem(measures, first_measure, beat_capacity);
         if (target < first.end_beat - 0.0001 or first.measure_end >= measures.len) {
-            const second = nextScoreSystem(measures, first.measure_end);
+            const second = if (systems_per_page == 2)
+                nextScoreSystem(measures, first.measure_end, beat_capacity)
+            else
+                ScoreSystem{ .start_beat = first.end_beat, .end_beat = first.end_beat, .first_measure = first.measure_end, .measure_end = first.measure_end };
             return .{
                 .systems = .{ first, second },
-                .system_count = if (second.measure_end > second.first_measure) 2 else 1,
+                .system_count = if (systems_per_page == 2 and second.measure_end > second.first_measure) 2 else 1,
                 .page_index = system_index,
             };
         }
         first_measure = first.measure_end;
     }
-    return scorePageForBeat(measures, requested_beat, meta);
+    return scorePageForBeatLimited(measures, requested_beat, meta, zoom, systems_per_page);
 }
 
-pub fn scoreSystemCount(measures: []const model.Measure) u32 {
+pub fn scoreSystemCount(measures: []const model.Measure, zoom: f32) u32 {
     if (measures.len == 0) return 1;
+    const beat_capacity = scoreSystemBeatCapacity(zoom);
     var count: u32 = 0;
     var first_measure: usize = 0;
-    while (first_measure < measures.len) : (count += 1) first_measure = nextScoreSystem(measures, first_measure).measure_end;
+    while (first_measure < measures.len) : (count += 1) first_measure = nextScoreSystem(measures, first_measure, beat_capacity).measure_end;
     return @max(1, count);
 }
 
-pub fn scorePageCount(measures: []const model.Measure, meta: *const model.DocumentMeta) u32 {
+pub fn scorePageCount(measures: []const model.Measure, meta: *const model.DocumentMeta, zoom: f32) u32 {
+    return scorePageCountLimited(measures, meta, zoom, 2);
+}
+
+pub fn scorePageCountLimited(measures: []const model.Measure, meta: *const model.DocumentMeta, zoom: f32, requested_systems: usize) u32 {
     if (measures.len == 0) return 1;
+    const systems_per_page = std.math.clamp(requested_systems, 1, 2);
+    const beat_capacity = scoreSystemBeatCapacity(zoom);
     var page_count: u32 = 0;
     var first_measure: usize = 0;
     while (first_measure < measures.len) {
-        const first = nextScoreSystem(measures, first_measure);
-        const second = nextScoreSystem(measures, first.measure_end);
-        first_measure = second.measure_end;
+        const first = nextScoreSystem(measures, first_measure, beat_capacity);
+        first_measure = first.measure_end;
+        if (systems_per_page == 2 and first_measure < measures.len) first_measure = nextScoreSystem(measures, first_measure, beat_capacity).measure_end;
         page_count += 1;
     }
     _ = meta;
@@ -355,6 +411,30 @@ pub fn scorePageCount(measures: []const model.Measure, meta: *const model.Docume
 
 fn measureBoundaryX(geometry: ScoreGeometry, system: ScoreSystem, beat: f32) f32 {
     return geometry.music_x + std.math.clamp((beat - system.start_beat) / system.duration(), 0, 1) * geometry.music_width;
+}
+
+const MeasureContentInsets = struct {
+    left: f32,
+    right: f32,
+};
+
+/// Keep authored content clear of a mid-system meter change. The opening
+/// meter lives in the fixed notation lead, but later meters are engraved just
+/// inside their measure and therefore need horizontal space before beat one.
+/// Hit-testing uses the same insets below so pointer edits remain reversible.
+fn measureContentInsets(system: ScoreSystem, measures: []const model.Measure, measure_index: usize, left: f32, right: f32) MeasureContentInsets {
+    const width = @max(1, right - left);
+    const regular = @min(14, width * 0.12);
+    const meter_changed = measure_index > system.first_measure and measure_index < measures.len and
+        (measures[measure_index].beats != measures[measure_index - 1].beats or measures[measure_index].beat_unit != measures[measure_index - 1].beat_unit);
+    // A 48 px SMuFL time signature centered eight pixels after the barline
+    // occupies roughly the first 27 px. Forty pixels, capped for narrow bars,
+    // leaves an optical gap before the first notehead/rest.
+    const meter_clearance: f32 = if (meter_changed) @min(40, width * 0.24) else 0;
+    return .{
+        .left = @min(width * 0.44, @max(regular, meter_clearance)),
+        .right = regular,
+    };
 }
 
 pub fn scoreBeatPosition(geometry: ScoreGeometry, page: ScorePage, measures: []const model.Measure, absolute_beat: f32) ?ScoreBeatPosition {
@@ -369,9 +449,9 @@ pub fn scoreBeatPosition(geometry: ScoreGeometry, page: ScorePage, measures: []c
             if (absolute_beat >= measure_end - 0.0001 and measure_index + 1 < system.measure_end) continue;
             const left = measureBoundaryX(geometry, system, measure.start_beat);
             const right = measureBoundaryX(geometry, system, measure_end);
-            const padding = @min(14, (right - left) * 0.12);
+            const insets = measureContentInsets(system, measures, measure_index, left, right);
             const local = std.math.clamp((absolute_beat - measure.start_beat) / @max(0.0001, measure.duration_beats), 0, 1);
-            return .{ .x = left + padding + local * @max(1, right - left - padding * 2), .system = system_index };
+            return .{ .x = left + insets.left + local * @max(1, right - left - insets.left - insets.right), .system = system_index };
         }
         return .{ .x = measureBoundaryX(geometry, system, absolute_beat), .system = system_index };
     }
@@ -413,9 +493,9 @@ pub fn scoreBeatAtX(geometry: ScoreGeometry, page: ScorePage, measures: []const 
         if (raw_beat >= measure_end - 0.0001 and measure_index + 1 < system.measure_end) continue;
         const left = measureBoundaryX(geometry, system, measure.start_beat);
         const right = measureBoundaryX(geometry, system, measure_end);
-        const padding = @min(14, (right - left) * 0.12);
-        const usable = @max(1, right - left - padding * 2);
-        const local = std.math.clamp((x - left - padding) / usable, 0, 1);
+        const insets = measureContentInsets(system, measures, measure_index, left, right);
+        const usable = @max(1, right - left - insets.left - insets.right);
+        const local = std.math.clamp((x - left - insets.left) / usable, 0, 1);
         return std.math.clamp(measure.start_beat + local * measure_duration, measure.start_beat, measure_end - 0.0001);
     }
     return system.end_beat - 0.0001;
@@ -656,6 +736,22 @@ fn drawTimeSignature(packet: *render.Packet, center_x: f32, treble_y: f32, bass_
     drawTimeSignatureNumber(packet, @max(1, beat_unit), center_x, bass_y + 36, music_em, color);
 }
 
+fn drawGrandStaffBrace(packet: *render.Packet, staff_x: f32, treble_y: f32, bass_y: f32, color: Color) void {
+    const glyph = glyph_atlas.findMusic(0xe000) orelse return;
+    const height_ems = glyph.plane[3] - glyph.plane[1];
+    if (height_ems <= 0) return;
+
+    const top = treble_y;
+    const bottom = bass_y + 48;
+    const em_size = (bottom - top) / height_ems;
+    const baseline_y = top - glyph.plane[1] * em_size;
+    // Keep a small optical gap between the brace and the analytic staff
+    // connector. Deriving the origin from the right plane bound keeps this
+    // exact when the Bravura atlas is regenerated.
+    const origin_x = staff_x - 4 - glyph.plane[2] * em_size;
+    packet.musicGlyph(0xe000, origin_x, baseline_y, em_size, color);
+}
+
 fn drawSingleTimeSignature(packet: *render.Packet, center_x: f32, staff_y: f32, beats: u8, beat_unit: u8, music_em: f32, color: Color) void {
     drawTimeSignatureNumber(packet, @max(1, beats), center_x, staff_y + 12, music_em, color);
     drawTimeSignatureNumber(packet, @max(1, beat_unit), center_x, staff_y + 36, music_em, color);
@@ -672,6 +768,19 @@ test "five-flat concert key signature emits five positioned GPU glyphs per staff
     try std.testing.expect(!packet.clipped);
 }
 
+test "SMuFL grand-staff brace spans both piano staves without touching the connector" {
+    var packet: render.Packet = undefined;
+    packet.reset();
+    drawGrandStaffBrace(&packet, 100, 20, 88, palette.ink);
+    try std.testing.expectEqual(@as(usize, 1), packet.len);
+    const item = packet.slice()[0];
+    try std.testing.expectEqual(@as(u32, @intFromEnum(render.Kind.glyph)), @as(u32, @intFromFloat(item.params[0] + 0.5)));
+    try std.testing.expectApproxEqAbs(@as(f32, 20), item.rect[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 116), item.rect[3], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 96), item.rect[0] + item.rect[2], 0.001);
+    try std.testing.expect(!packet.clipped);
+}
+
 test "score pages preserve authored variable-meter systems and positions" {
     const measures = [_]model.Measure{
         .{ .start_beat = 0, .duration_beats = 4, .number = 136, .beats = 4, .beat_unit = 4 },
@@ -680,7 +789,7 @@ test "score pages preserve authored variable-meter systems and positions" {
         .{ .start_beat = 10, .duration_beats = 4, .number = 139, .beats = 4, .beat_unit = 4 },
     };
     const meta: model.DocumentMeta = .{};
-    const page = scorePageForBeat(&measures, 8, &meta);
+    const page = scorePageForBeat(&measures, 8, &meta, 1);
     try std.testing.expectEqual(@as(usize, 0), page.systems[0].first_measure);
     try std.testing.expectEqual(@as(usize, 2), page.systems[0].measure_end);
     try std.testing.expectEqual(@as(usize, 2), page.systems[1].first_measure);
@@ -694,7 +803,12 @@ test "score pages preserve authored variable-meter systems and positions" {
     try std.testing.expectEqual(@as(usize, 1), short_bar.system);
     try std.testing.expectEqual(@as(usize, 1), return_to_common.system);
     try std.testing.expect(short_bar.x < return_to_common.x);
-    try std.testing.expectApproxEqAbs(geometry.music_x + geometry.music_width / 3, measureBoundaryX(geometry, page.systems[1], 10), 0.01);
+    const return_barline_x = measureBoundaryX(geometry, page.systems[1], 10);
+    try std.testing.expectApproxEqAbs(geometry.music_x + geometry.music_width / 3, return_barline_x, 0.01);
+    // The mid-system 4/4 glyph is centered at barline + 8. Beat-one content
+    // must begin beyond its right edge instead of colliding with the meter.
+    try std.testing.expect(return_to_common.x >= return_barline_x + 39.9);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), scoreBeatAtX(geometry, page, &measures, 1, return_to_common.x), 0.001);
 
     const inside_short_bar = scoreBeatPosition(geometry, page, &measures, 9) orelse return error.TestUnexpectedResult;
     try std.testing.expectApproxEqAbs(
@@ -712,7 +826,7 @@ test "short final score page contains no phantom empty system" {
         .{ .start_beat = 12, .duration_beats = 4, .number = 4 },
         .{ .start_beat = 16, .duration_beats = 4, .number = 5 },
     };
-    const page = scorePageForBeat(&measures, 16, &.{});
+    const page = scorePageForBeat(&measures, 16, &.{}, 1);
     try std.testing.expectEqual(@as(u32, 1), page.page_index);
     try std.testing.expectEqual(@as(usize, 1), page.system_count);
     try std.testing.expectEqual(@as(f32, 16), page.startBeat());
@@ -732,12 +846,66 @@ test "paged score reports a finite page count and exposes edge controls" {
             .beat_unit = 4,
         };
     }
-    try std.testing.expectEqual(@as(u32, 3), scorePageCount(&measures, &.{}));
+    try std.testing.expectEqual(@as(u32, 3), scorePageCount(&measures, &.{}, 1));
     const layout = Layout.calculate(1280, 800, true);
     try std.testing.expect(layout.page_previous.width >= 34);
     try std.testing.expect(layout.page_next.x > layout.page_previous.x);
     try std.testing.expect(layout.stage.contains(layout.page_previous.x + 1, layout.page_previous.y + 1));
     try std.testing.expect(layout.stage.contains(layout.page_next.x + 1, layout.page_next.y + 1));
+}
+
+test "constrained vocal score paginates one complete system without crossing the keyboard" {
+    var measures: [6]model.Measure = undefined;
+    for (&measures, 0..) |*measure, index| {
+        measure.* = .{
+            .start_beat = @as(f32, @floatFromInt(index)) * 4,
+            .duration_beats = 4,
+            .number = @intCast(index + 1),
+            .beats = 4,
+            .beat_unit = 4,
+        };
+    }
+    const layout = Layout.calculate(720, 540, true);
+    const systems_per_page = scoreSystemsPerPage(layout.stage.height, true);
+    try std.testing.expectEqual(@as(usize, 1), systems_per_page);
+    const page = scorePageForBeatLimited(&measures, 0, &.{}, 1, systems_per_page);
+    try std.testing.expectEqual(@as(usize, 1), page.system_count);
+    try std.testing.expectEqual(@as(f32, 8), page.endBeat());
+    try std.testing.expectEqual(@as(u32, 3), scorePageCountLimited(&measures, &.{}, 1, systems_per_page));
+
+    const geometry = ScoreGeometry.calculateWithVocal(layout.stage, true);
+    try std.testing.expect(geometry.page_y + geometry.page_height <= layout.stage.y + layout.stage.height + 0.001);
+    try std.testing.expect(geometry.bass_y[0] + 49 <= geometry.page_y + geometry.page_height + 0.001);
+    try std.testing.expect(geometry.lyric_y[0] + 16 <= geometry.treble_y[0]);
+    try std.testing.expect(layout.keyboard_panel.y >= layout.stage.y + layout.stage.height);
+    try std.testing.expect(layout.tools.y >= layout.keyboard_panel.y + layout.keyboard_panel.height);
+}
+
+test "roomy vocal pages retain two systems with collision-safe vertical spacing" {
+    const stage = Rect{ .x = 0, .y = 0, .width = 1200, .height = 760 };
+    try std.testing.expectEqual(@as(usize, 2), scoreSystemsPerPage(stage.height, true));
+    const geometry = ScoreGeometry.calculateWithVocal(stage, true);
+    try std.testing.expect(geometry.vocal_y[1] >= geometry.bass_y[0] + 96);
+    try std.testing.expect(geometry.bass_y[1] + 49 <= geometry.page_y + geometry.page_height + 0.001);
+}
+
+test "zooming out reflows more complete measures onto each score page" {
+    var measures: [12]model.Measure = undefined;
+    for (&measures, 0..) |*measure, index| {
+        measure.* = .{
+            .start_beat = @as(f32, @floatFromInt(index)) * 4,
+            .duration_beats = 4,
+            .number = @intCast(index + 1),
+            .beats = 4,
+            .beat_unit = 4,
+        };
+    }
+    const normal = scorePageForBeat(&measures, 0, &.{}, 1);
+    const overview = scorePageForBeat(&measures, 0, &.{}, 0.65);
+    try std.testing.expectEqual(@as(usize, 2), normal.systems[0].measure_end);
+    try std.testing.expectEqual(@as(usize, 3), overview.systems[0].measure_end);
+    try std.testing.expect(scorePageCount(&measures, &.{}, 0.65) < scorePageCount(&measures, &.{}, 1));
+    try std.testing.expectEqual(@as(f32, 0), overview.startBeat());
 }
 
 test "time signatures engrave both staves and multi-digit meters" {
@@ -803,7 +971,7 @@ fn drawTopBar(packet: *render.Packet, layout: Layout, state: *const model.UiStat
     packet.text(28, 27, "S", 2.3, palette.cyan);
     if (layout.top.width >= 600) {
         packet.text(70, 22, "SCORE", 3.0, palette.text);
-        packet.text(70, 47, meta.titleSlice(), 1.25, palette.muted);
+        if (layout.top.height >= 65) packet.text(70, 47, meta.titleSlice(), 1.25, palette.muted);
     }
     if (layout.input_quick.width > 0) {
         const input_hovered = layout.input_quick.contains(state.pointer_x, state.pointer_y);
@@ -846,22 +1014,24 @@ pub fn hasVocalGuide(notes: []const model.Note) bool {
 fn drawScore(packet: *render.Packet, stage: Rect, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta, notes: []const model.Note, lyrics: []const model.Lyric, harmonies: []const model.Harmony, pedals: []const model.PedalEvent, measures: []const model.Measure, annotations: *const annotation.Store, time_seconds: f32) void {
     packet.rect(stage.x, stage.y, stage.width, stage.height, .{ 0.045, 0.052, 0.064, 1 });
     const zoom = std.math.clamp(state.zoom, 0.65, 1.05);
-    const page_count = scorePageCount(measures, meta);
+    const vocal_visible = state.vocal_guide_visible != 0 and hasVocalGuide(notes);
+    const systems_per_page = scoreSystemsPerPage(stage.height, vocal_visible);
+    const page_count = scorePageCountLimited(measures, meta, zoom, systems_per_page);
     if (state.score_view_mode == .spread and stage.width >= 760) {
         const gap: f32 = 12;
         const page_stage_width = (stage.width - gap) * 0.5;
         const left_stage = Rect{ .x = stage.x, .y = stage.y, .width = page_stage_width, .height = stage.height };
         const right_stage = Rect{ .x = stage.x + page_stage_width + gap, .y = stage.y, .width = page_stage_width, .height = stage.height };
-        const left_page = scorePageForBeat(measures, state.view_start_beat, meta);
+        const left_page = scorePageForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
         var start = packet.len;
         drawScorePage(packet, left_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, left_page, page_count);
-        drawAnnotationsPage(packet, left_stage, left_page.page_index, annotations);
+        drawAnnotationsPage(packet, left_stage, left_page, vocal_visible, measures, annotations);
         transformScoreItems(packet, start, left_stage, zoom);
-        const right_page = scorePageForBeat(measures, left_page.endBeat(), meta);
+        const right_page = scorePageForBeatLimited(measures, left_page.endBeat(), meta, zoom, systems_per_page);
         if (right_page.page_index != left_page.page_index) {
             start = packet.len;
             drawScorePage(packet, right_stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, right_page, page_count);
-            drawAnnotationsPage(packet, right_stage, right_page.page_index, annotations);
+            drawAnnotationsPage(packet, right_stage, right_page, vocal_visible, measures, annotations);
             transformScoreItems(packet, start, right_stage, zoom);
         }
         drawPageNavigation(packet, Layout.calculateForState(state), state, left_page.page_index + 1, page_count);
@@ -869,13 +1039,13 @@ fn drawScore(packet: *render.Packet, stage: Rect, state: *const model.UiState, t
     }
 
     const page = if (state.score_view_mode == .continuous)
-        scoreContinuousForBeat(measures, state.view_start_beat, meta)
+        scoreContinuousForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page)
     else
-        scorePageForBeat(measures, state.view_start_beat, meta);
-    const displayed_count = if (state.score_view_mode == .continuous) scoreSystemCount(measures) else page_count;
+        scorePageForBeatLimited(measures, state.view_start_beat, meta, zoom, systems_per_page);
+    const displayed_count = if (state.score_view_mode == .continuous) scoreSystemCount(measures, zoom) else page_count;
     const start = packet.len;
     drawScorePage(packet, stage, state, transport, meta, notes, lyrics, harmonies, pedals, measures, time_seconds, page, displayed_count);
-    drawAnnotationsPage(packet, stage, page.page_index, annotations);
+    drawAnnotationsPage(packet, stage, page, vocal_visible, measures, annotations);
     transformScoreItems(packet, start, stage, zoom);
     drawPageNavigation(packet, Layout.calculateForState(state), state, page.page_index + 1, displayed_count);
 }
@@ -905,16 +1075,17 @@ fn transformScoreItems(packet: *render.Packet, start: usize, stage: Rect, scale:
 fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta, notes: []const model.Note, lyrics: []const model.Lyric, harmonies: []const model.Harmony, pedals: []const model.PedalEvent, measures: []const model.Measure, time_seconds: f32, page: ScorePage, page_count: u32) void {
     const vocal_visible = state.vocal_guide_visible != 0 and hasVocalGuide(notes);
     var geometry = ScoreGeometry.calculateWithVocal(stage, vocal_visible);
+    const compact_header = geometry.page_height < 340;
     geometry.beat_width = geometry.music_width / page.systems[0].duration();
     packet.glow(geometry.page_x - 10, geometry.page_y + 8, geometry.page_width + 20, geometry.page_height + 10, 18, .{ 0, 0, 0, 0.34 }, 0);
     packet.rounded(geometry.page_x, geometry.page_y, geometry.page_width, geometry.page_height, 5, palette.paper);
-    packet.text(geometry.page_x + geometry.page_padding - 6, geometry.page_y + 36, meta.titleSlice(), if (geometry.page_width < 500) 1.55 else 2.45, palette.ink);
+    packet.text(geometry.page_x + geometry.page_padding - 6, geometry.page_y + if (compact_header) @as(f32, 30) else 36, meta.titleSlice(), if (compact_header or geometry.page_width < 500) 1.55 else 2.45, palette.ink);
     const source_label: []const u8 = switch (meta.source_kind) {
         1 => "IMPORTED MUSICXML - REVIEW WARNINGS",
         2 => "IMPORTED MIDI - QUANTIZATION REVIEW",
         else => "BUILT-IN PRACTICE SCORE",
     };
-    packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 60, if (geometry.page_width < 500) "SCORE PRACTICE" else source_label, if (geometry.page_width < 500) 0.9 else 1.2, .{ 0.30, 0.31, 0.31, 1 });
+    if (!compact_header) packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 60, if (geometry.page_width < 500) "SCORE PRACTICE" else source_label, if (geometry.page_width < 500) 0.9 else 1.2, .{ 0.30, 0.31, 0.31, 1 });
     var page_buffer: [24]u8 = undefined;
     const page_number = page.page_index + 1;
     const page_label = if (state.score_view_mode == .continuous)
@@ -932,6 +1103,7 @@ fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiStat
         }
         const staves = [_]f32{ geometry.treble_y[system], geometry.bass_y[system] };
         for (staves) |staff_y| for (0..5) |line| packet.rect(geometry.staff_x, staff_y + @as(f32, @floatFromInt(line)) * 12, geometry.staff_width, 0.85, palette.ink);
+        drawGrandStaffBrace(packet, geometry.staff_x, geometry.treble_y[system], geometry.bass_y[system], palette.ink);
         const music_em: f32 = 48;
         if (vocal_visible) packet.musicGlyph(0xe050, geometry.staff_x + 5, geometry.vocal_y[system] + 36, music_em, palette.ink);
         packet.musicGlyph(0xe050, geometry.staff_x + 5, geometry.treble_y[system] + 36, music_em, palette.ink);
@@ -966,7 +1138,10 @@ fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiStat
     for (harmonies) |harmony| {
         const position = scoreBeatPosition(geometry, page, measures, harmony.start_beat) orelse continue;
         var x = position.x;
-        const y = if (vocal_visible) geometry.vocal_y[position.system] - 27 else geometry.treble_y[position.system] - 31;
+        // With an independent vocal staff, the page header owns the space
+        // above it. Chord symbols live in the clear lane below that staff and
+        // above its lyrics, instead of colliding with title/import text.
+        const y = if (vocal_visible) geometry.vocal_y[position.system] + 58 else geometry.treble_y[position.system] - 25;
         x = drawHarmonyPitch(packet, x, y, harmony.root_step, harmony.root_alter, palette.ink);
         if (harmony.text_len != 0) {
             packet.text(x, y, harmony.textSlice(), 0.95, palette.ink);
@@ -1394,7 +1569,8 @@ fn whiteIndexBefore(pitch: u8) u8 {
 
 fn pianoKeysRect(panel: Rect) Rect {
     const side: f32 = if (panel.width < 620) 12 else 24;
-    return .{ .x = panel.x + side, .y = panel.y + 51, .width = panel.width - side * 2, .height = @max(52, panel.height - 62) };
+    const header: f32 = if (panel.height < 110) 30 else 51;
+    return .{ .x = panel.x + side, .y = panel.y + header, .width = panel.width - side * 2, .height = @max(28, panel.height - header - 4) };
 }
 
 fn pianoKeyCenter(panel: Rect, pitch: u8) f32 {
@@ -1428,6 +1604,7 @@ pub fn pianoPitchAt(panel: Rect, x: f32, y: f32) ?u8 {
 
 const HandTargets = struct {
     active: ?u8 = null,
+    active_beat: f32 = -std.math.floatMax(f32),
     next: ?u8 = null,
     next_beat: f32 = std.math.floatMax(f32),
 };
@@ -1441,6 +1618,7 @@ fn findHandTargets(notes: []const model.Note, cursor: f32, left: bool) HandTarge
         if (note_left != left or note.pitch < piano_low or note.pitch > piano_high) continue;
         if (note.start_beat <= cursor + 0.025 and note.start_beat + note.duration_beats > cursor and note.start_beat > active_start) {
             result.active = note.pitch;
+            result.active_beat = note.start_beat;
             active_start = note.start_beat;
         }
         if (note.start_beat > cursor + 0.04 and note.start_beat < result.next_beat) {
@@ -1462,7 +1640,7 @@ fn findHandTargets(notes: []const model.Note, cursor: f32, left: bool) HandTarge
     return result;
 }
 
-fn fingerPair(targets: HandTargets, left: bool) [2]u8 {
+fn intervalFingerPair(targets: HandTargets, left: bool) [2]u8 {
     const current = targets.active orelse targets.next orelse return .{ 3, 3 };
     const next = targets.next orelse return .{ 3, 3 };
     const interval = std.math.clamp(pitchToDiatonic(next) - pitchToDiatonic(current), -4, 4);
@@ -1472,6 +1650,179 @@ fn fingerPair(targets: HandTargets, left: bool) [2]u8 {
     }
     const step: u8 = @intCast(-interval);
     return if (left) .{ 1, 1 + step } else .{ 5, 5 - step };
+}
+
+const HandPhrase = struct {
+    attacks: [fingering.max_phrase_attacks]fingering.Attack = undefined,
+    len: usize = 0,
+
+    fn insert(self: *HandPhrase, attack: fingering.Attack) void {
+        var index: usize = 0;
+        while (index < self.len and self.attacks[index].beat < attack.beat - 0.001) : (index += 1) {}
+        // Phrase motion needs one anchor per attack; simultaneous chord tones
+        // are expanded into distinct fingers after this melodic optimization.
+        // Keep the first score-ordered note here to match findHandTargets.
+        if (index < self.len and @abs(self.attacks[index].beat - attack.beat) <= 0.001) return;
+        if (self.len >= self.attacks.len) return;
+        var move = self.len;
+        while (move > index) : (move -= 1) self.attacks[move] = self.attacks[move - 1];
+        self.attacks[index] = attack;
+        self.len += 1;
+    }
+};
+
+fn handPhrase(notes: []const model.Note, cursor: f32, left: bool, targets: HandTargets) HandPhrase {
+    var result: HandPhrase = .{};
+    const active_start = if (targets.active != null) targets.active_beat else cursor;
+    const window_start = @min(cursor - 8, active_start - 0.01);
+    const window_end = cursor + 16;
+    for (notes) |note| {
+        if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
+        const note_left = (note.staff & 1) != 0 or (note.staff == 0 and note.pitch < 58);
+        if (note_left != left or note.pitch < piano_low or note.pitch > piano_high) continue;
+        if (note.start_beat < window_start or note.start_beat > window_end) continue;
+        result.insert(.{ .beat = note.start_beat, .pitch = note.pitch });
+    }
+    return result;
+}
+
+fn authoredFingerAt(notes: []const model.Note, beat: f32, pitch: u8, left: bool) ?u8 {
+    for (notes) |note| {
+        if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
+        const note_left = (note.staff & 1) != 0 or (note.staff == 0 and note.pitch < 58);
+        if (note_left != left or note.pitch != pitch or @abs(note.start_beat - beat) > 0.001) continue;
+        if (note.fingering >= 1 and note.fingering <= 5) return note.fingering;
+    }
+    return null;
+}
+
+fn phraseFingerPair(notes: []const model.Note, cursor: f32, targets: HandTargets, left: bool) [2]u8 {
+    const fallback = intervalFingerPair(targets, left);
+    const current_pitch = targets.active orelse targets.next orelse return fallback;
+    const current_beat = if (targets.active != null) targets.active_beat else targets.next_beat;
+    const phrase = handPhrase(notes, cursor, left, targets);
+    if (phrase.len == 0) return fallback;
+    var fingers: [fingering.max_phrase_attacks]u8 = undefined;
+    fingering.optimize(phrase.attacks[0..phrase.len], left, fingers[0..phrase.len]);
+
+    var result = fallback;
+    for (phrase.attacks[0..phrase.len], fingers[0..phrase.len]) |attack, finger| {
+        if (@abs(attack.beat - current_beat) <= 0.001 and attack.pitch == current_pitch) result[0] = finger;
+        if (targets.next) |next_pitch| {
+            if (@abs(attack.beat - targets.next_beat) <= 0.001 and attack.pitch == next_pitch) result[1] = finger;
+        }
+    }
+    if (authoredFingerAt(notes, current_beat, current_pitch, left)) |finger| result[0] = finger;
+    if (targets.next) |next_pitch| {
+        if (authoredFingerAt(notes, targets.next_beat, next_pitch, left)) |finger| result[1] = finger;
+    }
+    if (targets.active == null) result[0] = result[1];
+    return result;
+}
+
+pub const ChordFingering = struct {
+    pitches: [fingering.max_chord_tones]u8 = [_]u8{255} ** fingering.max_chord_tones,
+    fingers: [fingering.max_chord_tones]u8 = [_]u8{0} ** fingering.max_chord_tones,
+    len: u8 = 0,
+    overflow: u8 = 0,
+
+    fn contains(self: ChordFingering, pitch: u8) bool {
+        for (self.pitches[0..self.len]) |candidate| if (candidate == pitch) return true;
+        return false;
+    }
+
+    fn insertPitch(self: *ChordFingering, pitch: u8) void {
+        var index: usize = 0;
+        while (index < self.len and self.pitches[index] < pitch) : (index += 1) {}
+        if (index < self.len and self.pitches[index] == pitch) return;
+        if (self.len >= fingering.max_chord_tones) {
+            self.overflow +|= 1;
+            return;
+        }
+        var move: usize = self.len;
+        while (move > index) : (move -= 1) self.pitches[move] = self.pitches[move - 1];
+        self.pitches[index] = pitch;
+        self.len += 1;
+    }
+};
+
+fn chordAt(notes: []const model.Note, beat: f32, left: bool, anchor_pitch: u8, anchor_finger: u8) ChordFingering {
+    var result: ChordFingering = .{};
+    for (notes) |note| {
+        if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
+        const note_left = (note.staff & 1) != 0 or (note.staff == 0 and note.pitch < 58);
+        if (note_left != left or note.pitch < piano_low or note.pitch > piano_high) continue;
+        if (@abs(note.start_beat - beat) > 0.001) continue;
+        result.insertPitch(note.pitch);
+    }
+    if (result.len != 0) {
+        fingering.optimizeChord(result.pitches[0..result.len], left, anchor_pitch, anchor_finger, result.fingers[0..result.len]);
+        for (notes) |note| {
+            if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
+            const note_left = (note.staff & 1) != 0 or (note.staff == 0 and note.pitch < 58);
+            if (note_left != left or @abs(note.start_beat - beat) > 0.001 or note.fingering < 1 or note.fingering > 5) continue;
+            for (result.pitches[0..result.len], 0..) |pitch, index| {
+                if (pitch == note.pitch) result.fingers[index] = note.fingering;
+            }
+        }
+    }
+    return result;
+}
+
+pub const ChordFingeringSnapshot = struct {
+    left_current: ChordFingering = .{},
+    left_next: ChordFingering = .{},
+    right_current: ChordFingering = .{},
+    right_next: ChordFingering = .{},
+};
+
+pub fn chordFingeringSnapshot(notes: []const model.Note, cursor: f32) ChordFingeringSnapshot {
+    const left = findHandTargets(notes, cursor, true);
+    const right = findHandTargets(notes, cursor, false);
+    const left_fingers = phraseFingerPair(notes, cursor, left, true);
+    const right_fingers = phraseFingerPair(notes, cursor, right, false);
+    var result: ChordFingeringSnapshot = .{};
+    if (left.active) |pitch| {
+        result.left_current = chordAt(notes, left.active_beat, true, pitch, left_fingers[0]);
+        if (left.next) |next| result.left_next = chordAt(notes, left.next_beat, true, next, left_fingers[1]);
+    } else if (left.next) |pitch| {
+        result.left_current = chordAt(notes, left.next_beat, true, pitch, left_fingers[0]);
+    }
+    if (right.active) |pitch| {
+        result.right_current = chordAt(notes, right.active_beat, false, pitch, right_fingers[0]);
+        if (right.next) |next| result.right_next = chordAt(notes, right.next_beat, false, next, right_fingers[1]);
+    } else if (right.next) |pitch| {
+        result.right_current = chordAt(notes, right.next_beat, false, pitch, right_fingers[0]);
+    }
+    return result;
+}
+
+pub const FingeringSnapshot = struct {
+    left_current_pitch: u8 = 255,
+    left_current_finger: u8 = 0,
+    left_next_pitch: u8 = 255,
+    left_next_finger: u8 = 0,
+    right_current_pitch: u8 = 255,
+    right_current_finger: u8 = 0,
+    right_next_pitch: u8 = 255,
+    right_next_finger: u8 = 0,
+};
+
+pub fn fingeringSnapshot(notes: []const model.Note, cursor: f32) FingeringSnapshot {
+    const left = findHandTargets(notes, cursor, true);
+    const right = findHandTargets(notes, cursor, false);
+    const left_fingers = phraseFingerPair(notes, cursor, left, true);
+    const right_fingers = phraseFingerPair(notes, cursor, right, false);
+    return .{
+        .left_current_pitch = left.active orelse left.next orelse 255,
+        .left_current_finger = if (left.active != null or left.next != null) left_fingers[0] else 0,
+        .left_next_pitch = left.next orelse 255,
+        .left_next_finger = if (left.next != null) left_fingers[1] else 0,
+        .right_current_pitch = right.active orelse right.next orelse 255,
+        .right_current_finger = if (right.active != null or right.next != null) right_fingers[0] else 0,
+        .right_next_pitch = right.next orelse 255,
+        .right_next_finger = if (right.next != null) right_fingers[1] else 0,
+    };
 }
 
 fn expectedPedalValue(events: []const model.PedalEvent, pedal: u8, cursor_beat: f32) u8 {
@@ -1566,32 +1917,35 @@ fn drawPedalNotation(packet: *render.Packet, events: []const model.PedalEvent, n
     }
 }
 
-fn keyColor(pitch: u8, left: HandTargets, right: HandTargets, hovered: ?u8, black: bool) Color {
-    if (left.active == pitch) return if (black) .{ 0.76, 0.43, 0.14, 1 } else .{ 0.98, 0.75, 0.39, 1 };
-    if (right.active == pitch) return if (black) .{ 0.11, 0.62, 0.61, 1 } else .{ 0.45, 0.92, 0.88, 1 };
-    if (left.next == pitch) return if (black) .{ 0.36, 0.25, 0.15, 1 } else .{ 0.36, 0.30, 0.23, 1 };
-    if (right.next == pitch) return if (black) .{ 0.12, 0.32, 0.34, 1 } else .{ 0.20, 0.38, 0.39, 1 };
+fn keyColor(pitch: u8, guide: ChordFingeringSnapshot, hovered: ?u8, black: bool) Color {
+    if (guide.left_current.contains(pitch)) return if (black) .{ 0.76, 0.43, 0.14, 1 } else .{ 0.98, 0.75, 0.39, 1 };
+    if (guide.right_current.contains(pitch)) return if (black) .{ 0.11, 0.62, 0.61, 1 } else .{ 0.45, 0.92, 0.88, 1 };
+    if (guide.left_next.contains(pitch)) return if (black) .{ 0.36, 0.25, 0.15, 1 } else .{ 0.36, 0.30, 0.23, 1 };
+    if (guide.right_next.contains(pitch)) return if (black) .{ 0.12, 0.32, 0.34, 1 } else .{ 0.20, 0.38, 0.39, 1 };
     if (hovered == pitch) return if (black) palette.rose else .{ 0.96, 0.76, 0.80, 1 };
     return if (black) .{ 0.055, 0.063, 0.077, 1 } else .{ 0.88, 0.88, 0.85, 1 };
 }
 
-fn drawFingeringGuide(packet: *render.Packet, panel: Rect, targets: HandTargets, left: bool) void {
-    const current = targets.active orelse targets.next orelse return;
-    const fingers = fingerPair(targets, left);
+fn drawFingeringGuide(packet: *render.Packet, panel: Rect, current: ChordFingering, next: ChordFingering, left: bool) void {
+    if (current.len == 0) return;
     const accent = if (left) palette.amber else palette.cyan;
     const keys = pianoKeysRect(panel);
-    const current_x = pianoKeyCenter(panel, current);
-    const current_y = keys.y + keys.height * (if (isBlackKey(current)) @as(f32, 0.40) else 0.68);
-    packet.ellipse(current_x - 9, current_y - 9, 18, 18, .{ accent[0], accent[1], accent[2], 0.96 });
     var finger_buffer: [2]u8 = undefined;
-    packet.text(current_x - 3, current_y - 5, std.fmt.bufPrint(&finger_buffer, "{d}", .{fingers[0]}) catch "3", 0.88, palette.background);
-    if (targets.next) |next| {
-        if (next != current) {
-            const next_x = pianoKeyCenter(panel, next);
-            const next_y = keys.y + keys.height * (if (isBlackKey(next)) @as(f32, 0.25) else 0.52);
-            packet.ellipse(next_x - 7, next_y - 7, 14, 14, .{ accent[0], accent[1], accent[2], 0.42 });
-            packet.text(next_x - 3, next_y - 5, std.fmt.bufPrint(&finger_buffer, "{d}", .{fingers[1]}) catch "3", 0.82, palette.text);
-        }
+    for (current.pitches[0..current.len], current.fingers[0..current.len]) |pitch, finger| {
+        const x = pianoKeyCenter(panel, pitch);
+        const y = keys.y + keys.height * (if (isBlackKey(pitch)) @as(f32, 0.40) else 0.68);
+        packet.ellipse(x - 9, y - 9, 18, 18, .{ accent[0], accent[1], accent[2], 0.96 });
+        packet.text(x - 3, y - 5, std.fmt.bufPrint(&finger_buffer, "{d}", .{finger}) catch "3", 0.88, palette.background);
+    }
+    for (next.pitches[0..next.len], next.fingers[0..next.len]) |pitch, finger| {
+        if (current.contains(pitch)) continue;
+        const x = pianoKeyCenter(panel, pitch);
+        const y = keys.y + keys.height * (if (isBlackKey(pitch)) @as(f32, 0.25) else 0.52);
+        packet.ellipse(x - 7, y - 7, 14, 14, .{ accent[0], accent[1], accent[2], 0.42 });
+        packet.text(x - 3, y - 5, std.fmt.bufPrint(&finger_buffer, "{d}", .{finger}) catch "3", 0.82, palette.text);
+    }
+    if (current.overflow != 0 or next.overflow != 0) {
+        packet.text(keys.x + if (left) @as(f32, 0) else keys.width - 132, panel.y + 35, "REDISTRIBUTE >5", 0.68, palette.rose);
     }
 }
 
@@ -1627,19 +1981,19 @@ fn drawPedalStatus(packet: *render.Packet, panel: Rect, state: *const model.UiSt
 }
 
 fn drawKeyboard(packet: *render.Packet, panel: Rect, state: *const model.UiState, transport: *const model.Transport, notes: []const model.Note, pedals: []const model.PedalEvent) void {
+    const compact = panel.height < 110;
     packet.rect(panel.x, panel.y, panel.width, panel.height, .{ 0.055, 0.064, 0.078, 1 });
     packet.rect(panel.x, panel.y, panel.width, 1, palette.border);
-    packet.text(panel.x + 24, panel.y + 14, "Guided piano", 1.55, palette.text);
-    if (panel.width >= 560) packet.text(panel.x + 142, panel.y + 17, "Follow the glow / 1 thumb / 5 little finger", 1.0, palette.muted);
+    packet.text(panel.x + 24, panel.y + if (compact) @as(f32, 9) else 14, "Guided piano", if (compact) 1.05 else 1.55, palette.text);
+    if (!compact and panel.width >= 560) packet.text(panel.x + 142, panel.y + 17, "Follow the glow / 1 thumb / 5 little finger", 1.0, palette.muted);
     if (state.pedal_guide_visible != 0) drawPedalStatus(packet, panel, state, transport, pedals);
-    packet.ellipse(panel.x + panel.width - 146, panel.y + 18, 8, 8, palette.amber);
-    packet.text(panel.x + panel.width - 133, panel.y + 14, "Left", 1.05, palette.muted);
-    packet.ellipse(panel.x + panel.width - 78, panel.y + 18, 8, 8, palette.cyan);
-    packet.text(panel.x + panel.width - 65, panel.y + 14, "Right", 1.05, palette.muted);
+    packet.ellipse(panel.x + panel.width - 146, panel.y + if (compact) @as(f32, 12) else 18, 8, 8, palette.amber);
+    packet.text(panel.x + panel.width - 133, panel.y + if (compact) @as(f32, 8) else 14, "Left", if (compact) 0.82 else 1.05, palette.muted);
+    packet.ellipse(panel.x + panel.width - 78, panel.y + if (compact) @as(f32, 12) else 18, 8, 8, palette.cyan);
+    packet.text(panel.x + panel.width - 65, panel.y + if (compact) @as(f32, 8) else 14, "Right", if (compact) 0.82 else 1.05, palette.muted);
 
     const cursor = @max(0, transport.cursor_beat);
-    const left = findHandTargets(notes, cursor, true);
-    const right = findHandTargets(notes, cursor, false);
+    const guide = chordFingeringSnapshot(notes, cursor);
     const hovered = pianoPitchAt(panel, state.pointer_x, state.pointer_y);
     const keys = pianoKeysRect(panel);
     const white_width = keys.width / piano_white_count;
@@ -1649,7 +2003,7 @@ fn drawKeyboard(packet: *render.Packet, panel: Rect, state: *const model.UiState
         const before: f32 = @floatFromInt(whiteIndexBefore(pitch));
         const x = keys.x + before * white_width;
         packet.rounded(x, keys.y, white_width + 0.25, keys.height, 2.5, .{ 0.13, 0.14, 0.16, 1 });
-        packet.rounded(x + 0.7, keys.y + 0.8, @max(1, white_width - 1.15), keys.height - 1.6, 2, keyColor(pitch, left, right, hovered, false));
+        packet.rounded(x + 0.7, keys.y + 0.8, @max(1, white_width - 1.15), keys.height - 1.6, 2, keyColor(pitch, guide, hovered, false));
         if (pitch % 12 == 0 and panel.width >= 700) {
             var octave_buffer: [4]u8 = undefined;
             packet.text(x + 2, keys.y + keys.height - 16, std.fmt.bufPrint(&octave_buffer, "C{d}", .{pitch / 12 - 1}) catch "C", 0.75, .{ 0.20, 0.21, 0.23, 0.75 });
@@ -1660,22 +2014,32 @@ fn drawKeyboard(packet: *render.Packet, panel: Rect, state: *const model.UiState
     while (pitch <= piano_high) : (pitch += 1) {
         if (!isBlackKey(pitch)) continue;
         const x = pianoKeyCenter(panel, pitch) - black_width * 0.5;
-        packet.rounded(x, keys.y, black_width, keys.height * 0.62, 2.5, keyColor(pitch, left, right, hovered, true));
+        packet.rounded(x, keys.y, black_width, keys.height * 0.62, 2.5, keyColor(pitch, guide, hovered, true));
     }
-    drawFingeringGuide(packet, panel, left, true);
-    drawFingeringGuide(packet, panel, right, false);
+    drawFingeringGuide(packet, panel, guide.left_current, guide.left_next, true);
+    drawFingeringGuide(packet, panel, guide.right_current, guide.right_next, false);
 }
 
-fn drawAnnotationsPage(packet: *render.Packet, stage: Rect, page_index: u32, annotations: *const annotation.Store) void {
+fn drawAnnotationsPage(packet: *render.Packet, stage: Rect, page: ScorePage, vocal_visible: bool, measures: []const model.Measure, annotations: *const annotation.Store) void {
+    const geometry = ScoreGeometry.calculateWithVocal(stage, vocal_visible);
     for (annotations.strokes[0..annotations.stroke_count]) |stroke| {
-        if (stroke.page_index != page_index) continue;
+        if (!annotation.isScoreSpace(stroke) and annotation.pageIndex(stroke) != page.page_index) continue;
         const start: usize = @intCast(stroke.first_point);
         const end = start + stroke.point_count;
         for (annotations.points[start..end]) |point| {
             const pressure_width = stroke.width * (0.6 + point.pressure * 0.8);
+            var x = stage.x + point.u * stage.width;
+            var y = stage.y + point.v * stage.height;
+            if (annotation.isScoreSpace(stroke)) {
+                const beat_position = scoreBeatPosition(geometry, page, measures, point.u) orelse continue;
+                const top = if (vocal_visible) geometry.vocal_y[beat_position.system] else geometry.treble_y[beat_position.system];
+                const bottom = geometry.bass_y[beat_position.system] + 49;
+                x = beat_position.x;
+                y = top + point.v * (bottom - top);
+            }
             packet.ellipse(
-                stage.x + point.u * stage.width - pressure_width * 0.5,
-                stage.y + point.v * stage.height - pressure_width * 0.5,
+                x - pressure_width * 0.5,
+                y - pressure_width * 0.5,
                 pressure_width,
                 pressure_width,
                 stroke.rgba,
@@ -1691,7 +2055,11 @@ test "score ink follows its page through zoom transforms" {
     var packet: render.Packet = undefined;
     packet.reset();
     const stage = Rect{ .x = 100, .y = 50, .width = 800, .height = 600 };
-    drawAnnotationsPage(&packet, stage, 3, &annotations);
+    const page = ScorePage{ .systems = .{
+        .{ .start_beat = 0, .end_beat = 8 },
+        .{ .start_beat = 8, .end_beat = 16 },
+    }, .page_index = 3 };
+    drawAnnotationsPage(&packet, stage, page, false, &.{}, &annotations);
     try std.testing.expectEqual(@as(usize, 1), packet.len);
     transformScoreItems(&packet, 0, stage, 0.75);
     const item = packet.slice()[0];
@@ -1699,6 +2067,42 @@ test "score ink follows its page through zoom transforms" {
     try std.testing.expectApproxEqAbs(@as(f32, 303.5), item.rect[1], 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), item.rect[2], 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), item.rect[3], 0.01);
+}
+
+test "score-space ink follows its beat when responsive pagination reflows systems" {
+    const measures = [_]model.Measure{
+        .{ .start_beat = 0, .duration_beats = 4, .number = 1 },
+        .{ .start_beat = 4, .duration_beats = 4, .number = 2 },
+        .{ .start_beat = 8, .duration_beats = 4, .number = 3 },
+        .{ .start_beat = 12, .duration_beats = 4, .number = 4 },
+    };
+    var annotations: annotation.Store = .{};
+    annotations.beginScore(.{ .u = 10, .v = 0.5, .pressure = 0.5, .time_ms = 0 }, 0);
+    annotations.end();
+
+    const roomy_stage = Rect{ .x = 0, .y = 0, .width = 900, .height = 760 };
+    const roomy_page = scorePageForBeatLimited(&measures, 10, &.{}, 1, 2);
+    var roomy_packet: render.Packet = undefined;
+    roomy_packet.reset();
+    drawAnnotationsPage(&roomy_packet, roomy_stage, roomy_page, true, &measures, &annotations);
+    try std.testing.expectEqual(@as(usize, 1), roomy_packet.len);
+    const roomy_geometry = ScoreGeometry.calculateWithVocal(roomy_stage, true);
+    const roomy_position = scoreBeatPosition(roomy_geometry, roomy_page, &measures, 10) orelse return error.TestUnexpectedResult;
+    const roomy_center_y = roomy_packet.slice()[0].rect[1] + roomy_packet.slice()[0].rect[3] * 0.5;
+    try std.testing.expectEqual(@as(usize, 1), roomy_position.system);
+    try std.testing.expectApproxEqAbs((roomy_geometry.vocal_y[1] + roomy_geometry.bass_y[1] + 49) * 0.5, roomy_center_y, 0.01);
+
+    const narrow_stage = Rect{ .x = 0, .y = 0, .width = 720, .height = 302 };
+    const narrow_page = scorePageForBeatLimited(&measures, 10, &.{}, 1, 1);
+    var narrow_packet: render.Packet = undefined;
+    narrow_packet.reset();
+    drawAnnotationsPage(&narrow_packet, narrow_stage, narrow_page, true, &measures, &annotations);
+    try std.testing.expectEqual(@as(usize, 1), narrow_packet.len);
+    const narrow_geometry = ScoreGeometry.calculateWithVocal(narrow_stage, true);
+    const narrow_position = scoreBeatPosition(narrow_geometry, narrow_page, &measures, 10) orelse return error.TestUnexpectedResult;
+    const narrow_center_y = narrow_packet.slice()[0].rect[1] + narrow_packet.slice()[0].rect[3] * 0.5;
+    try std.testing.expectEqual(@as(usize, 0), narrow_position.system);
+    try std.testing.expectApproxEqAbs((narrow_geometry.vocal_y[0] + narrow_geometry.bass_y[0] + 49) * 0.5, narrow_center_y, 0.01);
 }
 
 fn drawCoach(packet: *render.Packet, coach: Rect, state: *const model.UiState, practice: *const model.PracticeState) void {
@@ -1851,11 +2255,11 @@ fn drawTransport(packet: *render.Packet, layout: Layout, state: *const model.UiS
     if (state.tempo_editing != 0 or tempo_hovered) {
         packet.rounded(layout.tempo_value.x, layout.tempo_value.y, layout.tempo_value.width, layout.tempo_value.height, 10, if (state.tempo_editing != 0) palette.cyan_dim else palette.panel_raised);
     }
-    packet.text(layout.transport.width - 134, layout.transport.y + 24, if (state.tempo_editing != 0) "TYPE BPM" else "TEMPO", 1.15, if (state.tempo_editing != 0 and !tempo_valid) palette.rose else palette.muted);
+    packet.text(layout.transport.width - 134, layout.transport.y + 24, if (state.tempo_editing != 0) "TYPE PULSE" else "TEMPO", 1.15, if (state.tempo_editing != 0 and !tempo_valid) palette.rose else palette.muted);
     if (state.tempo_editing != 0) {
-        packet.text(layout.transport.width - 134, layout.transport.y + 45, std.fmt.bufPrint(&tempo_buffer, "{d}| BPM", .{state.tempo_edit_value}) catch "BPM", 1.55, if (tempo_valid) palette.cyan else palette.rose);
+        packet.text(layout.transport.width - 134, layout.transport.y + 45, std.fmt.bufPrint(&tempo_buffer, "1/{d} = {d}|", .{ meta.tempo_beat_unit, state.tempo_edit_value }) catch "BPM", 1.35, if (tempo_valid) palette.cyan else palette.rose);
     } else {
-        packet.text(layout.transport.width - 134, layout.transport.y + 45, std.fmt.bufPrint(&tempo_buffer, "{d:.0} BPM", .{transport.tempo_bpm}) catch "BPM", 1.55, if (tempo_hovered) palette.cyan else palette.text);
+        packet.text(layout.transport.width - 134, layout.transport.y + 45, std.fmt.bufPrint(&tempo_buffer, "1/{d} = {d:.0} BPM", .{ meta.tempo_beat_unit, transport.tempo_bpm }) catch "BPM", 1.25, if (tempo_hovered) palette.cyan else palette.text);
     }
 }
 
@@ -1900,7 +2304,7 @@ test "vocal guide occupies an independent labeled staff" {
         .{ .start_beat = 0, .duration_beats = 4, .number = 1 },
         .{ .start_beat = 4, .duration_beats = 4, .number = 2 },
     };
-    const page = scorePageForBeat(&measures, 0, &.{});
+    const page = scorePageForBeat(&measures, 0, &.{}, 1);
     const piano = model.Note{ .stable_id = 1, .start_beat = 1, .duration_beats = 1, .pitch = 64, .velocity = 88, .staff = 0, .voice = 0 };
     const vocal = model.Note{ .stable_id = 2, .start_beat = 1, .duration_beats = 1, .pitch = 64, .velocity = 0, .staff = 0, .voice = 0, .flags = model.note_flag_vocal_guide };
     const piano_position = scoreNotePosition(piano, geometry, page, &measures) orelse return error.TestUnexpectedResult;
@@ -1938,7 +2342,7 @@ test "score pedal guide tracks expected controller state and emits analytic mark
         .{ .start_beat = 0, .duration_beats = 4, .number = 1 },
         .{ .start_beat = 4, .duration_beats = 4, .number = 2 },
     };
-    const page = scorePageForBeat(&measures, 0, &.{});
+    const page = scorePageForBeat(&measures, 0, &.{}, 1);
     drawPedalNotation(&packet, &opening_events, &.{}, geometry, page, &measures, &transport);
     var line_count: usize = 0;
     for (packet.slice()) |item| if (@as(u32, @intFromFloat(item.params[0] + 0.5)) == @intFromEnum(render.Kind.line)) {
@@ -1947,4 +2351,85 @@ test "score pedal guide tracks expected controller state and emits analytic mark
     };
     try std.testing.expect(line_count >= 3);
     try std.testing.expect(!packet.clipped);
+}
+
+test "virtual piano fingering uses the surrounding phrase and excludes vocal cues" {
+    const right_notes = [_]model.Note{
+        .{ .stable_id = 90, .start_beat = 0, .duration_beats = 1, .pitch = 84, .velocity = 0, .staff = 0, .voice = 0, .flags = model.note_flag_vocal_guide },
+        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 2, .start_beat = 1, .duration_beats = 1, .pitch = 62, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 3, .start_beat = 2, .duration_beats = 1, .pitch = 64, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 4, .start_beat = 3, .duration_beats = 1, .pitch = 65, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 5, .start_beat = 4, .duration_beats = 1, .pitch = 67, .velocity = 90, .staff = 0, .voice = 0 },
+    };
+    const right_targets = findHandTargets(&right_notes, 0, false);
+    try std.testing.expectEqual(@as(?u8, 60), right_targets.active);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, &phraseFingerPair(&right_notes, 0, right_targets, false));
+    try std.testing.expectEqual(@as(usize, 5), handPhrase(&right_notes, 0, false, right_targets).len);
+
+    const left_notes = [_]model.Note{
+        .{ .stable_id = 6, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 7, .start_beat = 1, .duration_beats = 1, .pitch = 50, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 8, .start_beat = 2, .duration_beats = 1, .pitch = 52, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 9, .start_beat = 3, .duration_beats = 1, .pitch = 53, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 10, .start_beat = 4, .duration_beats = 1, .pitch = 55, .velocity = 90, .staff = 1, .voice = 0 },
+    };
+    const left_targets = findHandTargets(&left_notes, 0, true);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 4 }, &phraseFingerPair(&left_notes, 0, left_targets, true));
+}
+
+test "authored MusicXML fingering overrides phrase and chord suggestions" {
+    const notes = [_]model.Note{
+        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 90, .staff = 0, .voice = 0, .fingering = 2 },
+        .{ .stable_id = 2, .start_beat = 0, .duration_beats = 1, .pitch = 64, .velocity = 90, .staff = 0, .voice = 0, .fingering = 4 },
+        .{ .stable_id = 3, .start_beat = 1, .duration_beats = 1, .pitch = 62, .velocity = 90, .staff = 0, .voice = 0, .fingering = 3 },
+    };
+    const guide = fingeringSnapshot(&notes, 0);
+    try std.testing.expectEqual(@as(u8, 2), guide.right_current_finger);
+    try std.testing.expectEqual(@as(u8, 3), guide.right_next_finger);
+    const chords = chordFingeringSnapshot(&notes, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 4 }, chords.right_current.fingers[0..2]);
+}
+
+test "virtual piano assigns every tone of simultaneous hand chords" {
+    const notes = [_]model.Note{
+        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 48, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 2, .start_beat = 0, .duration_beats = 1, .pitch = 52, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 3, .start_beat = 0, .duration_beats = 1, .pitch = 55, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 4, .start_beat = 1, .duration_beats = 1, .pitch = 50, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 5, .start_beat = 1, .duration_beats = 1, .pitch = 53, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 6, .start_beat = 1, .duration_beats = 1, .pitch = 57, .velocity = 90, .staff = 1, .voice = 0 },
+        .{ .stable_id = 7, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 8, .start_beat = 0, .duration_beats = 1, .pitch = 64, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 9, .start_beat = 0, .duration_beats = 1, .pitch = 67, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 10, .start_beat = 1, .duration_beats = 1, .pitch = 62, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 11, .start_beat = 1, .duration_beats = 1, .pitch = 65, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 12, .start_beat = 1, .duration_beats = 1, .pitch = 69, .velocity = 90, .staff = 0, .voice = 0 },
+        .{ .stable_id = 99, .start_beat = 0, .duration_beats = 1, .pitch = 84, .velocity = 0, .staff = 0, .voice = 0, .flags = model.note_flag_vocal_guide },
+    };
+    const guide = chordFingeringSnapshot(&notes, 0);
+    try std.testing.expectEqual(@as(u8, 3), guide.left_current.len);
+    try std.testing.expectEqualSlices(u8, &.{ 48, 52, 55 }, guide.left_current.pitches[0..guide.left_current.len]);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 3, 1 }, guide.left_current.fingers[0..guide.left_current.len]);
+    try std.testing.expectEqual(@as(u8, 3), guide.right_current.len);
+    try std.testing.expectEqualSlices(u8, &.{ 60, 64, 67 }, guide.right_current.pitches[0..guide.right_current.len]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 3, 5 }, guide.right_current.fingers[0..guide.right_current.len]);
+    try std.testing.expectEqual(@as(u8, 3), guide.left_next.len);
+    try std.testing.expectEqual(@as(u8, 3), guide.right_next.len);
+}
+
+test "unplayable six-tone single-hand chord is explicit" {
+    var notes: [6]model.Note = undefined;
+    for (&notes, 0..) |*note, index| note.* = .{
+        .stable_id = index + 1,
+        .start_beat = 0,
+        .duration_beats = 1,
+        .pitch = @intCast(60 + index),
+        .velocity = 90,
+        .staff = 0,
+        .voice = 0,
+    };
+    const chord = chordAt(&notes, 0, false, 60, 1);
+    try std.testing.expectEqual(@as(u8, 5), chord.len);
+    try std.testing.expectEqual(@as(u8, 1), chord.overflow);
 }

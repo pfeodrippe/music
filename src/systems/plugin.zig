@@ -15,7 +15,7 @@ const development_plugin = hot.PluginDescriptor{
     // Bump whenever the reloadable systems/screen-composition module changes;
     // the host logs and validates the newly loaded descriptor without moving
     // the Flecs world or GPU resources out of the long-lived executable.
-    .generation = 11,
+    .generation = 13,
     .glyph_atlas_hash = glyph_atlas.content_hash,
     .systems = &all_systems,
     .system_count = all_systems.len,
@@ -51,6 +51,12 @@ fn devCommand(context: *hot.DevCommandContext) callconv(.c) void {
         const practice_state: *model.PracticeState = @ptrCast(@alignCast(context.practice));
         practice_state.* = .{};
         pluginResponse(context, "ok practice reset", .{});
+        return;
+    }
+    if (std.mem.eql(u8, command, "library-close")) {
+        const ui_state: *model.UiState = @ptrCast(@alignCast(context.ui_state));
+        ui_state.library_open = 0;
+        pluginResponse(context, "ok score library closed", .{});
         return;
     }
     if (std.mem.startsWith(u8, command, "transpose ")) {

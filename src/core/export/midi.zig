@@ -80,7 +80,7 @@ const Writer = struct {
     }
 };
 
-pub fn write(output: []u8, meta: *const model.DocumentMeta, tempo_bpm: f32, notes: []const model.Note, pedals: []const model.PedalEvent) Error!usize {
+pub fn write(output: []u8, meta: *const model.DocumentMeta, tempo_bpm: f32, playback: *const model.PlaybackBounds, notes: []const model.Note, pedals: []const model.PedalEvent) Error!usize {
     if (!std.math.isFinite(tempo_bpm) or tempo_bpm <= 0) return error.InvalidTempo;
 
     var piano_events: [max_piano_events]Event = undefined;
@@ -135,7 +135,7 @@ pub fn write(output: []u8, meta: *const model.DocumentMeta, tempo_bpm: f32, note
     try writer.u16be(1);
     try writer.u16be(if (vocal_count == 0) 2 else 3);
     try writer.u16be(ticks_per_quarter);
-    try writeConductorTrack(&writer, meta, tempo_bpm);
+    try writeConductorTrack(&writer, meta, tempo_bpm, meta.tempo_beat_unit, playback);
     try writeEventTrack(&writer, "Piano", 0, 0, piano_events[0..piano_count]);
     if (vocal_count != 0) try writeEventTrack(&writer, "Vocal Guide", 1, 53, vocal_events[0..vocal_count]);
     return writer.position;
@@ -179,7 +179,8 @@ pub fn writeTake(output: []u8, meta: *const model.DocumentMeta, take: *const rec
     try writer.u16be(1);
     try writer.u16be(2);
     try writer.u16be(ticks_per_quarter);
-    try writeConductorTrack(&writer, meta, take.tempo_bpm);
+    // Recorded take tempo is already stored in canonical quarter-note units.
+    try writeConductorTrack(&writer, meta, take.tempo_bpm, 4, null);
     try writeEventTrack(&writer, "Recorded MIDI Take", 0, 0, events[0..event_count]);
     return writer.position;
 }
@@ -235,20 +236,47 @@ fn writeMetaText(writer: *Writer, kind: u8, value: []const u8) Error!void {
     try writer.bytes(value);
 }
 
-fn writeConductorTrack(writer: *Writer, meta: *const model.DocumentMeta, tempo_bpm: f32) Error!void {
+fn writeConductorTrack(writer: *Writer, meta: *const model.DocumentMeta, tempo_bpm: f32, tempo_beat_unit: u8, playback: ?*const model.PlaybackBounds) Error!void {
     const track = try beginTrack(writer);
     try writeMetaText(writer, 0x03, meta.titleSlice());
 
-    const micros_float = 60_000_000.0 / @as(f64, tempo_bpm);
-    if (micros_float < 1 or micros_float > 0x00ff_ffff) return error.InvalidTempo;
-    const micros: u32 = @intFromFloat(@round(micros_float));
-    try writer.bytes(&.{ 0, 0xff, 0x51, 3, @truncate(micros >> 16), @truncate(micros >> 8), @truncate(micros) });
+    const editable_quarter = model.quarterTempoFromPulse(tempo_bpm, tempo_beat_unit);
+    var initial_bpm = editable_quarter;
+    if (playback) |map| {
+        const count = @min(@as(usize, map.tempo_count), map.tempos.len);
+        const scale = editable_quarter / @max(1, map.tempo_base_bpm);
+        for (map.tempos[0..count]) |tempo| {
+            if (tempo.start_beat > 0.0001) break;
+            initial_bpm = tempo.bpm * scale;
+        }
+    }
+    try writeTempoMeta(writer, 0, initial_bpm);
 
     const denominator_power = try meterPower(meta.beat_unit);
     try writer.bytes(&.{ 0, 0xff, 0x58, 4, @max(1, meta.beats_per_measure), denominator_power, 24, 8 });
     const key: i8 = std.math.clamp(meta.key_fifths, -7, 7);
     try writer.bytes(&.{ 0, 0xff, 0x59, 2, @bitCast(key), 0 });
+    var previous_tick: u32 = 0;
+    if (playback) |map| {
+        const count = @min(@as(usize, map.tempo_count), map.tempos.len);
+        const scale = editable_quarter / @max(1, map.tempo_base_bpm);
+        for (map.tempos[0..count]) |tempo| {
+            const tick = try beatTick(@max(0, tempo.start_beat));
+            if (tick == 0) continue;
+            try writeTempoMeta(writer, tick - previous_tick, tempo.bpm * scale);
+            previous_tick = tick;
+        }
+    }
     try endTrack(writer, track.length_offset, track.data_start);
+}
+
+fn writeTempoMeta(writer: *Writer, delta: u32, bpm: f32) Error!void {
+    if (!std.math.isFinite(bpm) or bpm <= 0) return error.InvalidTempo;
+    const micros_float = 60_000_000.0 / @as(f64, bpm);
+    if (micros_float < 1 or micros_float > 0x00ff_ffff) return error.InvalidTempo;
+    const micros: u32 = @intFromFloat(@round(micros_float));
+    try writer.variable(delta);
+    try writer.bytes(&.{ 0xff, 0x51, 3, @truncate(micros >> 16), @truncate(micros >> 8), @truncate(micros) });
 }
 
 fn meterPower(denominator: u8) Error!u8 {
@@ -287,8 +315,12 @@ test "writes a deterministic type-1 MIDI score with vocal guide and pedals" {
         .{ .start_beat = 0.5, .pedal = model.pedal_soft, .value = 72, .action = model.pedal_action_start },
         .{ .start_beat = 2, .pedal = model.pedal_sustain, .value = 0, .action = model.pedal_action_stop },
     };
+    var playback: model.PlaybackBounds = .{ .tempo_base_bpm = 132 };
+    playback.tempos[0] = .{ .start_beat = 0, .bpm = 132 };
+    playback.tempos[1] = .{ .start_beat = 2, .bpm = 120 };
+    playback.tempo_count = 2;
     var encoded: [4096]u8 = undefined;
-    const length = try write(&encoded, &meta, 132, &notes, &pedals);
+    const length = try write(&encoded, &meta, 132, &playback, &notes, &pedals);
     try std.testing.expectEqualStrings("MThd", encoded[0..4]);
     const report = try importer.parse(encoded[0..length]);
     try std.testing.expectEqualStrings("Roundtrip", report.titleSlice());
@@ -300,6 +332,21 @@ test "writes a deterministic type-1 MIDI score with vocal guide and pedals" {
     try std.testing.expectEqual(@as(u8, 6), report.beats_per_measure);
     try std.testing.expectEqual(@as(u8, 8), report.beat_unit);
     try std.testing.expectEqual(@as(i8, -5), report.key_fifths);
+    try std.testing.expectEqual(@as(usize, 2), report.tempo_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), report.tempos[1].bpm, 0.01);
+}
+
+test "MIDI conductor normalizes an eighth-note display pulse to quarter tempo" {
+    const importer = @import("../import/midi.zig");
+    var meta: model.DocumentMeta = .{ .tempo_beat_unit = 8 };
+    meta.setTitle("Eighth pulse");
+    const notes = [_]model.Note{.{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 61, .velocity = 90, .staff = 0, .voice = 0 }};
+    var playback: model.PlaybackBounds = .{ .tempo_base_bpm = 73.5, .tempo_beat_unit = 8 };
+    playback.tempos[0] = .{ .start_beat = 0, .bpm = 73.5 };
+    var encoded: [2048]u8 = undefined;
+    const length = try write(&encoded, &meta, 147, &playback, &notes, &.{});
+    const report = try importer.parse(encoded[0..length]);
+    try std.testing.expectApproxEqAbs(@as(f32, 73.5), report.tempo_bpm, 0.01);
 }
 
 test "connected tie segments export as one MIDI attack and release" {
@@ -310,7 +357,8 @@ test "connected tie segments export as one MIDI attack and release" {
         .{ .stable_id = 2, .start_beat = 1, .duration_beats = 1, .pitch = 64, .velocity = 80, .staff = 0, .voice = 0, .flags = model.note_flag_tie_stop },
     };
     var encoded: [2048]u8 = undefined;
-    const length = try write(&encoded, &meta, 120, &notes, &.{});
+    const playback: model.PlaybackBounds = .{ .tempo_base_bpm = 120 };
+    const length = try write(&encoded, &meta, 120, &playback, &notes, &.{});
     const report = try importer.parse(encoded[0..length]);
     try std.testing.expectEqual(@as(usize, 1), report.note_count);
     try std.testing.expectApproxEqAbs(@as(f32, 2), report.notes[0].duration_beats, 0.001);
