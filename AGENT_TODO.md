@@ -3,15 +3,180 @@
 This file is the durable hand-off checklist for the project. Keep it current as
 work lands; do not infer completion from a prototype screenshot.
 
-Current release gate: finish and verify the native macOS build first. Wasm and
-iOS remain later portability targets and must not distract from native quality.
+Current goal and release gate: finish and verify the native macOS application.
+The shared Zig/Flecs core already builds and runs on WebGPU/Wasm and
+iPadOS/Metal, but browser and iPad product acceptance are explicitly deferred
+and do not block this desktop goal. Platform code remains limited to window,
+GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
+
+## Deferred portability evidence (2026-08-24)
+
+- [x] Add one validated, path-free PCM16 `.scorebank` format and an
+  allocation-free 128-layer-voice Zig sampled-piano engine shared by the WebAudio
+  worklet and iOS AVAudio callback. The bundled Accurate Salamander derivative
+  covers every acoustic key with eight recorded velocity layers, sampled
+  key-off, and pedal mechanisms: 353 unique source samples, 931 regions
+  (704 attacks + 68 damped-key releases + 88 hammer releases + 69 pedal
+  resonances + pedal down/up), 135.3 MiB. Pitch/sample-rate conversion, stereo
+  key position, continuous equal-power interpolation between recorded velocity
+  layers, priority-aware de-clicked voice stealing, sustain/half-pedal release, repedaling,
+  sostenuto, una corda, room response, DC blocking, and linked master limiting
+  are in the shared engine. The deterministic portable gate passes finite PCM,
+  clipping, dynamics, attack, sustain, and output-safety checks; it now also
+  reads the packed damper/hammer/resonance PCM directly and proves a 0.08792
+  normalized change between otherwise identical dry and resonant note renders.
+- [x] Replace browser/iPad oscillator playback with that shared sampled bank.
+  WebGPU/WebAudio and Metal/AVAudio now consume identical Zig MIDI/CC events;
+  a host-event ABI regression fixes sustain/sostenuto/soft controllers being
+  misrouted as notes. The WebGPU runtime visibly reports 931 zones / 353
+  samples, plays, pages, reflows zoomed sheets, enters continuous mode, exports
+  MusicXML, and recovers the tutorial/tempo from IndexedDB. No Canvas 2D,
+  WebGL, or software-rendering path exists.
+- [x] Build, install, launch, and visually exercise the arm64 iPad simulator
+  app with the bundled sampled bank. Metal score rendering, keyboard guidance,
+  72-QPM transport, count-in/playback, and adaptive portrait layout pass with
+  no crash or Score-originated diagnostic; the simulator emits only its known
+  libxpc and CoreAudio plug-in-factory warnings. Runtime bank replacement now
+  stops the AVAudio callback, validates before replacing the working bank,
+  drains stale events, and restarts output safely. The WebAudio worklet uses a
+  separate pending allocation and likewise retains the live grand when a user
+  bank fails validation.
+- [ ] Deferred after the desktop release: run the physical-device acceptance
+  pass for browser microphone and
+  hardware-MIDI permission/device input, iPad microphone/CoreMIDI/document
+  panels and VoiceOver on actual hardware, browser/iPad listening, and iPad
+  120-Hz profiling. These require real attached devices and user-granted OS
+  permissions; deterministic core, build, simulator, and GPU runtime gates are
+  complete.
 
 ## Current correction and immediate musical gate (2026-08-23)
 
+- [x] Produce the native-only macOS release candidate. `zig build test`, the
+  ReleaseSafe sampler/pack gate, ad-hoc signing, strict deep code-signature
+  verification, Info.plist validation, launch from outside the repository,
+  persisted 1,704-zone instrument recovery, and duplicate-launch exclusion all
+  pass. A state-preserving systems/WGSL reload retains the tutorial, view,
+  zoom, and annotation; the restored 1440x900 GPU frame is clean. A live
+  four-second continuous-view workload reports 2.894 ms average work,
+  4.515 ms maximum work, zero 120/60 Hz budget misses, and 1,469 peak draw
+  items. Native PDF export produces five valid A4 pages and all five pages pass
+  raster inspection.
+- [x] Ship and verify the original CC0 built-in **Flowing 6/4 Piano Lab** as the
+  first-party tutorial score. Its standard compressed MusicXML contains 24
+  measures in D-flat major and 6/4, quarter-note = 84, 360 piano events plus a
+  separate 24-rest coaching part, 24 chord symbols, 10 pedal events, 28
+  authored velocity levels, and 84 fingerings. Six concise coaching comments
+  cover compound-meter pulse, pattern/bass balance, close voice leading,
+  off-beat independence, clean harmonic pedaling, and four-bar phrase shape.
+  Every repeating and syncopated study phrases each broad three-beat pulse
+  with its own slur, avoiding both the unmusical mid-bar reset collision of a
+  single measure-wide arc and curves that intrude into the bass or voice staff.
+  The native import/export round trip, mechanical playability gate, sampler
+  render, and publication gate pass. Metal screen and native five-page A4 PDF
+  QA also pass after fixing thin-rule raster stability, upward-beam clearance
+  for coaching text, and pedal-lane clearance above the next coaching staff.
+- [x] Keep native windows inside the usable macOS display area. Startup and the
+  Debug `window WIDTH HEIGHT` command now clamp the decorated outer frame to
+  the active monitor's measured AppKit/GLFW work area, including title-bar and
+  resize margins. Limits are recomputed after display moves, explicit requests
+  also repair position overflow, and `window state` exposes the live geometry;
+  oversized QA requests are reported as clamped instead of going off screen.
+- [x] Keep the complete vocal/coaching and piano system collision-free at the
+  supported 720x540 minimum. The compact keyboard now yields 20 px to the score
+  and coaching text clears the complete upward-beam ink bound; a geometry
+  regression and real Dawn/Metal framebuffer capture verify the layout.
+- [x] Make native Score strictly single-instance with a process-lifetime kernel
+  file lock acquired before GLFW, Metal, audio, MIDI, or sampler startup. The
+  former socket-only guard could mistake a live but stalled host with a full
+  accept backlog for a stale socket and create another window. A duplicate now
+  exits cleanly and asks a responsive Debug owner to focus its existing window;
+  a regression test covers lock exclusion and a live second-launch probe exits
+  with `another Score host owns the native session`.
+- [x] Separate native GPU display pacing from real frame work in Debug
+  telemetry. A live 120 Hz tutorial pass now reports 1.466 ms average
+  CPU/command work, 6.782 ms average Metal drawable-acquisition wait, one
+  120 Hz outlier across 363 frames, zero 60 Hz misses, and 894 peak GPU draw
+  items. A sampled call graph confirms the separated wait is
+  `CAMetalLayer::nextDrawable`, not notation or practice work.
 - [x] Correct the private score and live transport to **quarter-note = 147**.
   The earlier eighth=147 / 73.5-quarter-QPM interpretation was wrong and made
   playback half-speed. A Zig regression prevents this private-score failure
   mode from returning.
+- [x] Replace the stale 193-measure files labelled `current` with a consolidated
+  Zig `audit-measures` path for the actual 195-measure private score. It derives
+  missing 250 ms frame metadata from evidence timestamps, excludes the optional
+  singer guide, locks every comparison to the 195 explicit recording windows,
+  and reports pitch class, strict bass, alternate low-register, RMS, hand-count,
+  and review-priority evidence without Python or another tool source. Both
+  current full-mix and vocal-reduced reports now cover all 790 quarter beats;
+  focused tests cover a correct two-hand bar and a missing-left-hand failure.
+- [x] Correct measure 134's first sustained bass from G-flat2 to A-flat2 while
+  retaining the later G-flat3, all six upper attacks, rhythm, voices, dynamics,
+  lyrics, vocal guide, and pedal. The separated guitar carries A-flat2/A-flat3
+  during the first half, while F/E-flat activity is predominantly in the vocal
+  stem and is therefore not copied onto the piano staff. The single-note
+  candidate improves locked full-mix cost `0.316141 -> 0.316046` and
+  vocal-reduced cost `0.271681 -> 0.271288`, removing the bar from both HIGH
+  queues; the two-note and second-half-only controls are rejected. Mechanical
+  playability, semantic MXL inspection, sampled-grand rendering, native Metal
+  hot-load/capture at bar 134, q=147 transport, and 1,704-region sampler
+  telemetry pass with zero drops/overloads. Keep the bar `REVIEW_REQUIRED` for
+  professional voicing, interpretation, and ear confirmation.
+- [x] Correct measure 142's two unsupported B-flat3 half notes to an
+  A-flat2-to-A-flat3 octave movement without changing either attack, duration,
+  voice, staff, velocity, articulation, or the separate vocal guide. Both
+  accepted recordings and the time-local guitar stem carry A-flat2/A-flat3 in
+  the 232.0--234.0 second window. The locked full-mix cost improves
+  `0.316046 -> 0.314931` and HIGH `44 -> 43`, with target pitch-class agreement
+  `50.91% -> 85.48%`; vocal-reduced cost improves `0.271288 -> 0.270091` and
+  HIGH `39 -> 38`, with target pitch-class agreement `52.78% -> 89.87%` and
+  strict bass `0% -> 100%`. Four single-line register controls were tested;
+  the A-flat2-to-A-flat3 motion best matches both sampled envelopes. A literal
+  four-note A-flat octave-shell control is rejected because the added density
+  worsens both global costs and removes neither HIGH result. Technical
+  playability and sampled-grand rendering pass with zero overloads. The
+  sampled onset detector is slightly less permissive after the retune, so the
+  bar remains `REVIEW_REQUIRED` for a musician's voicing, articulation,
+  dynamics, pedal, and final ear confirmation. Current private SHA-256:
+  `40b9282340ae4ff7bc4a494607cdd09163b16f6520345a3dcb62a8dcf977a49d`.
+- [x] Leave adjacent measure 141 unchanged after a bounded five-contour bass
+  review. A-flat2-to-F3 is the only tested line that lowers both locked costs
+  and removes the bar from both HIGH queues, but it fails the independent
+  sampled-performance gate in both references: full/accompaniment envelope
+  correlation falls `0.3732/0.4031 -> 0.2493/0.2484`, attack correlation falls
+  `0.4151/0.4615 -> 0.1202/0.1062`, normalized envelope error rises, and onset
+  precision falls `71.43% -> 62.50%`. The small sustain-correlation gain cannot
+  outweigh those regressions. F-only remains HIGH in accompaniment,
+  A-flat-only remains HIGH in the full mix, and E-flat/A-flat chases an
+  unsupported detector summary. Preserve the authored B-flat3 half notes and
+  keep measure 141 `REVIEW_REQUIRED` for an ear-and-piano decision; the
+  canonical private score and its SHA-256 remain unchanged.
+- [x] Leave measure 113 unchanged after a staged seven-node voicing review.
+  The time-local guitar suggests repeated A-flat2/E-flat3 foundations and
+  supports A-flat4, F4, D-flat5, and one possible C4 inner tone. Bass-only,
+  bass-plus-upper, and bass-plus-upper-plus-C4 candidates all improve both
+  locked costs and remove the bar from both HIGH queues; the fullest candidate
+  reaches `78.37%` full / `77.39%` accompaniment pitch agreement. It still
+  reaches only `25%` strict accompaniment bass agreement, below the unchanged
+  `45%` promotion gate, while the apparent repeated A-natural2 is a
+  semitone-unstable detector result rather than corroborated notation. The
+  sampled candidate improves attack correlation and normalized envelope error
+  but drops reference onset coverage and collapses sustain correlation from
+  `1.0` to `0.23/0.30`. Do not chase the overlapping 2.25-second window with a
+  chromatic rewrite. Keep m113 `HIGH` / `REVIEW_REQUIRED` pending tighter
+  alignment and an ear-and-piano adjudication; the canonical score remains
+  unchanged.
+- [x] Reject an apparent measure-195 G-octave correction after proving the
+  ending is a release-only continuation of measure 194's tied F2. Seven of its
+  eight locked 250 ms frames are silent or below the audibility threshold; the
+  late G3/G4/G5 transient occupies only 25% of the window and is isolated in
+  the `other` stem rather than corroborated as the sustained bass. Extend the
+  consolidated Zig audit with `instrument_attack_notes` and
+  `audible_frame_ratio`; a release-only bar with less than 50% audible coverage
+  now remains `MANUAL` instead of becoming a false `HIGH`. Both current queues
+  fall by one without changing any score note, cost, or threshold. A focused
+  regression recreates the tied F2 plus one late G transient. Measure 195
+  remains `REVIEW_REQUIRED` for a musician's ending/release decision.
 - [x] Reject the first synthetic 6/4 piano-opening candidate after native
   sampler audition. Although it was denser, it overused B-flat and introduced
   droning bass octaves from bar one; its 66.7% recording pitch-class gate and
@@ -36,6 +201,21 @@ iOS remain later portability targets and must not distract from native quality.
   attacks / 32.653 seconds through the 1,704-region grand at -17.66 dBFS with
   zero overloads. Debug `load` now writes the atomic autosave immediately,
   closing the rebuild race.
+- [x] Prevent the release host from silently restoring that obsolete score
+  again. The root cause was a blind `autosave.score` recovery with no identity
+  for the ignored external MXL: the recovered document matched the retained
+  pre-final snapshot exactly at 193 measures / 2,564 events / one velocity / no
+  harmonies / no pedal events, while the accepted score is 195 measures / 2,759
+  events / 41 velocity levels / 75 harmonies / 15 pedal events. Explicit launch
+  documents are now authoritative and checkpoint immediately; native release
+  and Debug persist separate absolute source paths plus CRC32 fingerprints and
+  reload a changed source instead of trusting a stale journal. A rebuilt signed
+  release was launched explicitly, quit, and relaunched normally; recovery
+  retained all 195 measures, 2,759 events, 75 harmonies, and 15 pedal events.
+  The user's 2026-08-23 16:03 A4 export was independently raster-inspected at
+  pages 1, 9, and 18 and shows the later dense two-hand score, dynamics,
+  harmonies, separate vocal guide, and pedal lanes—not the obsolete recovery
+  document.
 - [x] Add `compare-performance` to the consolidated Zig workbench and gate the
   expressive candidate against the retained audio, not against subjective
   loudness alone. Relative to the former flat-velocity v8 render, v10 improves
@@ -118,11 +298,17 @@ iOS remain later portability targets and must not distract from native quality.
   keep them only as ignored negative provenance.
 - [x] Prevent stale development windows from restoring an older score after a
   host rebuild. Only the Debug process that owns `/tmp/score-dev-<uid>.sock`
-  may write `autosave-dev.score`; duplicate comparison windows are read-only
-  for that journal. After closing the two stale 193-measure hosts, cold-start
+  may write `autosave-dev.score`; a duplicate launch now exits before creating
+  a window. After closing the two stale 193-measure hosts, cold-start
   QA without an explicit score recovered v15 at exactly 195 measures / 2,760
   events / 75 harmonies / 15 pedals, followed by a clean Dawn/Metal capture
   and zero sampler drops or overloads.
+- [x] Claim the process-lifetime native instance lock and then the Debug control
+  socket before GLFW/AppKit window creation and sampler/audio startup. A
+  duplicate launch now exits without a visible window even if an obsolete host
+  stopped servicing its socket. The authoritative window still clamps its
+  decorated outer frame to the active monitor work area after startup, resize,
+  and display moves.
 - [x] Extend the per-measure Zig audit with source-by-source active pitch lists
   and investigate the next two weakest bars without guessing. Measure 64 is
   deferred because the supplied page marks the corresponding harp bar empty
@@ -208,16 +394,36 @@ iOS remain later portability targets and must not distract from native quality.
   0.185055 -> 0.188025, and matches 837 -> 801. Keep v21 ignored and v19
   canonical. Build a recording/page-supported complete harmony map before the
   next phrase-aware pedaling attempt.
+- [x] Promote one narrowly isolated, recording-backed texture correction as
+  private v24b instead of accepting the eight-note bulk enrichment. The bulk
+  measures-112..117 candidate regressed the complete render's envelope,
+  attack, and normalized-error gates, so it remains ignored provenance. Eight
+  single-note variants were then compared independently against the same
+  retained recording window. Adding E-flat4 at target beat 460.5 is the only
+  variant that improves all four bounded measurements: envelope correlation
+  0.039875 -> 0.048055, attack correlation 0.128263 -> 0.138092, sustain
+  correlation -0.289609 -> -0.287194, and normalized error 0.377989 ->
+  0.377382. At the exact onset, both separated guitar and other stems detect
+  E-flat4; the piano stem is empty, so this is an instrumental-reduction
+  texture rather than a claimed literal piano transcription. The full render
+  also improves envelope/attack/sustain correlation by
+  +0.001793/+0.000499/+0.003764 with unchanged onset matches; normalized error
+  changes by only +0.000024 and is retained as an explicit caveat. Mechanical
+  playability, live 147-QPM sampled playback, Dawn/Metal engraving, zero-fault
+  sampler telemetry, and byte-identical MXL export/re-import pass at 195
+  measures, 2,759 events, 1,664 instrumental notes, 485 separate voice-guide
+  notes, 75 harmonies, and 15 pedal events. The ignored canonical SHA-256 is
+  `40d28cbdc04c6780cb020f3f811ae35c9082e8d8a64faeab8a8afde4b5b281e2`;
+  publication still requires the ear/pianist and complete pedal/dynamics gates.
 - [x] Clarify the live count-in readout as `N BEATS LEFT` (with a singular
   one-beat form). The transport already used the real current meter—one 6/4
   bar in the private score—but the former transient `2 BEATS` screenshot could
   be mistaken for the configured count-in length. A focused Zig test and live
   Dawn/Metal capture verify the new wording during the same stateful hot reload.
-- [ ] Complete the ear-and-pianist gate for the second opening candidate before
-  promotion. Refine its attack contour, voicing, hand assignment, velocity,
-  articulation, and pedal against the retained recording. Keep the canonical
-  private MXL unchanged until the musical result—not only a detector metric—is
-  accepted.
+- [x] Close the ear-and-pianist score-refinement gate by explicit user direction:
+  the current private Holocene MXL is the accepted application baseline. Freeze
+  its notes, timing, voicing, dynamics, articulation, and pedal data; do not
+  reopen transcription work unless the user explicitly asks to revise it.
 - [x] Replace the sparse opening treble with the user's richer 42-quarter-beat
   D-flat fragment while preserving the recording-reviewed bass, independent
   vocal guide, lyrics, all 193 authored measures, and quarter=147 timing. Direct
@@ -274,18 +480,37 @@ iOS remain later portability targets and must not distract from native quality.
   successor regressed independent exact/pitch-class ratios. The measures
   187-end variant improved exact matches but reduced independent pitch-class
   precision. None was promoted.
-- [ ] Extend recording-backed professional piano reduction work beyond the
-  opening. The remaining measures are not yet certified as a concert-quality
-  reduction; preserve candidate/rejection evidence and require a musician pass.
-- [ ] Author recording-faithful dynamics, articulation, and sustain-pedal
-  transitions across the complete canonical score. The opening v10 candidate
-  now has audio-shaped continuous velocities and 14 pedal events, but the
-  canonical score and later sections still lack a complete musician-approved
-  interpretation; mechanical playability must not be confused with publication
-  readiness or professional interpretive completion.
-- [ ] Rerun every historical musical playback/recording QA item below that says
-  eighth=147 or 73.5 QPM. Those timing claims are superseded and do **not** count
-  as current completion evidence.
+- [x] Reject two further whole-score interpretation shortcuts instead of
+  silently replacing the canonical private score. A 10/15/20/25/40/55/72%
+  recording-strength sweep found no opening candidate that improved every
+  anchored envelope and onset gate; the strongest review variant (25%) raised
+  attack correlation 0.443652 -> 0.502459 and lowered normalized envelope MAE
+  0.053836 -> 0.053459, but reduced onset precision 0.875000 -> 0.842105 and
+  candidate dynamic range 52.404 -> 51.562 dB. A separate 12-beat pedal-refresh
+  candidate removed the 714-beat authored gap, but regressed full-score
+  envelope/sustain correlation and onset coverage, so it was also rejected.
+  Preserve both as ignored A/B evidence and keep the canonical SHA-256
+  `40d28cbdc04c6780cb020f3f811ae35c9082e8d8a64faeab8a8afde4b5b281e2`.
+  Anchored JSON reports now state their actual `phase_bins` explicitly instead
+  of leaving an ambiguous zero-second frame field as the only resolution.
+- [x] Stop further recording-backed reduction work by explicit user direction.
+  Treat the current private score as accepted content for completing the app;
+  retain the historical candidate/rejection evidence without scheduling more
+  score changes.
+- [x] Accept the current score's dynamics, articulation, and sustain-pedal data
+  as the frozen practice baseline by explicit user direction. Remaining sampler
+  and playback work must preserve this data exactly rather than rewriting it.
+  - [x] Add a conservative Zig-only review path that materializes performed
+    velocity contours as sparse standard dynamic marks without altering notes,
+    timing, velocity, harmony, or pedals. Private v26 adds 16 marks around the
+    two authored marks with a four-measure minimum and remains unpromoted. Its
+    opening sample render is byte-identical to the canonical render, its MXL
+    technical-playability gate passes, and live Dawn/Metal QA shows the new
+    `f` marking clear of staff, harmony, and pedal ink. Publication still needs
+    a pianist to accept or adjust those machine-derived expression markings.
+- [x] Retire the superseded historical eighth=147 / 73.5-QPM score-audit queue.
+  The accepted private score uses quarter=147; no further Holocene musical audit
+  is part of the active app-completion work.
 - [x] Consolidate the former script sprawl into exactly three Zig tool sources:
   `score_workbench.zig` for inspect/enrich/repeat/CSV/audio evidence,
   `sampler_workbench.zig` for render/quality gates, and `dev_control.zig` for
@@ -350,6 +575,33 @@ iOS remain later portability targets and must not distract from native quality.
 - [x] UTF-8 decoding and Latin-1 UI glyphs.
 - [x] Real SMuFL clefs, time-signature digits, noteheads, stems, flags, and
   ledger lines.
+- [x] Preserve common MusicXML ornaments and chord arpeggiation as dedicated
+  note semantics instead of discarding them behind an approximation warning.
+  Trills, turns, inverted turns, mordents, inverted mordents, and directional
+  arpeggiation migrate in `.score` v19, round-trip through MusicXML/MXL, and
+  use Bravura's official SMuFL glyphs in the shared GPU atlas. Ornament lanes
+  clear chord/stem/articulation ink; one arpeggiation spans and clears each
+  chord plus its accidental columns. The atlas is reproducibly compiled by
+  the consolidated Zig score workbench, not a Python generator.
+- [x] Preserve simple MusicXML repeat barlines and authored repeat counts in
+  the versioned measure ABI and backward-readable `.score` data. GPU
+  engraving draws conventional double bars and dots on every visible staff;
+  MusicXML/MXL export round-trips forward/backward directions and `times`.
+  Native playback performs the requested pass count, restores pedal state at
+  the entrance, and retains sub-frame timing through a repeat on the final
+  barline. Standard MIDI export unfolds the same route, including repeated
+  tempo-map and three-pedal events. Focused exchange, persistence, packet,
+  boundary-safety, MIDI re-import, and live Dawn/Metal transport tests pass.
+- [x] Preserve MusicXML alternate endings as a 16-pass volta mask with explicit
+  start/stop/discontinue bracket endpoints in `.score` v20. Valid numbered and
+  ranged endings import without approximation, round-trip through MusicXML/MXL,
+  and engrave as labeled GPU brackets across responsive systems. Native
+  playback skips ineligible endings on later passes; Standard MIDI unfolds the
+  identical route with its tempo/pedal mapping. Focused Debug/ReleaseSafe tests
+  and a live Dawn/Metal four-measure fixture verify first-ending return,
+  second-pass skip, bar-4 landing, MXL re-import, and 12 two-hand MIDI attacks
+  across the expected six performed measures. Nested repeat graphs remain in
+  the broader professional playback gate.
 - [x] Add the Bravura/SMuFL piano brace to the shared MTSDF atlas and size it
   from its generated plane bounds so every GPU-rendered grand staff is joined
   cleanly at desktop and overview zoom. Real Dawn/Metal readback confirms both
@@ -369,9 +621,103 @@ iOS remain later portability targets and must not distract from native quality.
   regression test pass.
 - [x] Import, render, export, and re-import beams, explicit rests, dots, note
   accidentals/naturals, ties, basic slurs, articulations, dynamics, and tuplets.
-- [ ] Finish professional optical engraving: multi-voice collision resolution,
-  numbered/overlapping and cross-system slurs, expression collision avoidance,
-  beam/tuplet edge cases, and complete SMuFL coverage.
+- [x] Continue ties and slurs across responsive system and page boundaries.
+  The GPU engraver now emits an outgoing arc, optional intermediate-system
+  continuations, and an incoming arc instead of silently dropping the marking;
+  focused Zig tests cover two-system, outgoing-page, and incoming-page cases.
+- [x] Preserve MusicXML crescendo/diminuendo wedges as semantic hairpins.
+  Numbered overlapping spans, staff/part ownership, placement, spread, niente,
+  dashed/dotted line styles, persistence in backward-readable `.score` v18,
+  MusicXML/MXL export, and responsive GPU continuation geometry all round trip.
+  The continuation keeps its global opening instead of restarting closed on
+  each system. Two restart cycles, a compressed-MXL re-import, systems/WGSL
+  hot reload, and a live Dawn/Metal readback retained one authored hairpin;
+  all 204 native tests pass.
+- [x] Preserve MusicXML grace notes as non-time-consuming exchange events.
+  Export orders every grace attack before the principal note at the shared
+  metric onset, omits the forbidden duration, emits an explicit eighth-note
+  type, and never converts a grace sequence into a chord. The analytic GPU
+  engraver separates source-ordered grace attacks to the left at a 34 px music
+  em while the principal remains at 48 px. Focused round-trip/layout tests,
+  native Dawn/Metal visual QA, valid MXL export/re-import, `.score` autosave
+  recovery, systems/WGSL hot reload, and the 1,704-region sampler's zero-fault
+  telemetry pass.
+- [x] Preserve and perform MusicXML grace `slash`, `steal-time-following`,
+  `steal-time-previous`, and `make-time` attributes. The compact semantic field
+  round-trips all four through `.score`, MusicXML, and MXL. Native playback and
+  Standard MIDI share one allocation-free performed-range resolver: following
+  appoggiaturas delay and shorten the principal, previous-time/ordinary
+  mid-score graces shorten the prior note and land on the principal beat, and
+  multi-note grace groups retain source order. The GPU engraves an analytic
+  slash across cue-size stems. Debug/ReleaseSafe timing, MIDI re-import,
+  exchange, and packet tests pass; live Dawn/Metal QA visibly retains the slash
+  and MXL re-export retains 25% following plus 20% previous timing. Authored
+  grace groups now retain separate stable-id anchors at their shared metric
+  onset and engrave connected cue-size primary/secondary/tertiary beams without
+  duplicate standalone flags; the slash remains attached to the beamed stem.
+  Debug/ReleaseSafe regressions and a live Dawn/Metal two-note grace capture
+  pass after a stateful systems/WGSL reload.
+- [x] Preserve independently numbered MusicXML slurs through the complete
+  semantic path. Numbers 1...8 use two former reserve bytes without expanding
+  the then-32-byte Flecs note component, persist in backward-readable `.score` v17,
+  export with their original identity, pair only with the matching stop, and
+  occupy separated optical lanes even when nested or crossing a system/page.
+  Flag-only legacy notes retain their implicit number-1 behavior.
+- [x] Replace slur-number-based vertical offsets with span-aware optical lanes.
+  A containing phrase now sits outside its nested phrases, coincident spans
+  remain independently visible, and an interleaved later span receives the
+  next lane. Twelve-pixel lane clearance exceeds a diatonic pitch step at the
+  current staff scale, so responsive system edges cannot force lower outer
+  endpoints through higher inner endpoints. The renderer collects visible
+  spans once per page instead of rescanning every score note per competing
+  curve; focused nesting/crossing tests and native Dawn/Metal before/after QA
+  verify the correction.
+- [x] Give dynamics collision-aware optical placement. Identical marks attached
+  to simultaneous chord voices coalesce into one expression; distinct marks
+  retain deterministic horizontal slots. The engraver tests the normal
+  inter-staff lane, outside-staff alternatives, noteheads, stems, beams, and
+  articulations before choosing a position. Focused packet regressions and a
+  live Dawn/Metal cross-staff fixture verify that a blocked `f` moves entirely
+  clear of both hands instead of painting through the bass staff.
+- [x] Resolve simultaneous multi-voice ink without changing score timing or
+  playback. Mixed-duration unisons and seconds use horizontally separated
+  noteheads with conventional opposing stems; exact compatible unisons share
+  a head; independent rests occupy non-overlapping upper/lower lanes; and
+  dense accidental groups use deterministic columns. Beam, tie, slur, tuplet,
+  glow, and dynamic anchors consume the same resolved positions. Focused Zig
+  glyph-bound/packet tests and a live Dawn/Metal two-voice fixture verify the
+  noteheads, accidentals, rests, and opposing beam groups.
+- [x] Make tuplet engraving voice-, rest-, beam-, system-, and page-aware.
+  Tuplet groups now retain rhythmic rests, place the first/upper voice above
+  and second/lower voice below, clear their corresponding beam or note ink,
+  suppress brackets only for fully beamed single-system groups, and emit
+  bracketed continuation segments across responsive system/page boundaries.
+  Focused Zig tests cover rest membership, opposing polyphonic lanes, and a
+  two-system group; live Dawn/Metal QA verifies an upper rest-containing
+  bracket and a lower beamed triplet number remain independently readable.
+- [x] Reconstruct higher-order beam levels and isolated hooks from semantic
+  duration. Eighth through sixty-fourth values share every level common to
+  adjacent notes; unshared secondary/tertiary/quaternary levels become one
+  inward hook, using the already resolved polyphonic stem side and beam slope.
+  A focused packet regression proves nine expected beam segments and three
+  short hooks across mixed eighth/sixteenth and 32nd/sixteenth groups; live
+  Dawn/Metal MusicXML QA confirms the visual result. Responsive system breaks
+  through an authored group now engrave duration-correct flags on both exposed
+  edge notes; a two-system packet regression prevents stemless reflow output.
+- [x] Preserve MusicXML single-note tremolo marks independently from ordinary
+  note beams. Counts 1...8 use the remaining compact notation bits without an
+  ABI or persistence-size change, round-trip through MusicXML/MXL and `.score`,
+  and engrave as the authored number of analytic GPU strokes across the chord
+  stem. Native playback and Standard MIDI export subdivide the performed range
+  into gated eighth through 512th-note attacks according to the mark count;
+  a live half-note/quarter-note fixture exported and re-imported as the exact
+  expected 22 performed notes. Double-note, unmeasured, and invalid tremolos remain explicit import
+  approximations instead of being silently drawn as single-note tremolos.
+  Debug/ReleaseSafe tests, compressed-MXL re-import, a live Dawn/Metal capture,
+  controlled core restart, zero-fault 1,704-region sampler telemetry, tutorial
+  restoration, and signed-bundle verification pass.
+- [ ] Finish professional optical engraving: per-spanner placement for
+  unusually complex concurrent curves and complete SMuFL coverage.
 - [x] Replace the fixed two-system demo with measure-aware horizontal spacing
   and complete-measure system breaks. Short final pages render only populated
   systems instead of a phantom empty grand staff.
@@ -392,13 +738,14 @@ iOS remain later portability targets and must not distract from native quality.
   passes with four piano systems and three independent voice-plus-piano systems
   in a 1400x1100 window; next/previous preserve authored measure boundaries.
 - [x] Add GPU controls, hot keys, accessibility actions, and Debug socket
-  commands for paged, continuous-system, two-page spread, score zoom, and
-  distraction-free focus modes. Navigation advances one system in continuous
-  mode, one page in paged mode, and one spread in two-page mode.
+  commands for paged and continuous-system views, score zoom, and
+  distraction-free focus mode. Remove the separate two-page thumbnail mode:
+  navigation advances one system in continuous mode and one responsive page in
+  paged mode, exactly matching the two reading models exposed to the player.
 - [x] Make score zoom control actual reading density. In paged mode, reflow
   complete authored measures and successively merge additional complete score
-  systems onto the same paper sheet; never reveal a second sheet below or turn
-  paged mode into a spread. Use the same zoom-aware page map for GPU drawing,
+  systems onto the same paper sheet; never reveal a second sheet below. Use the
+  same zoom-aware page map for GPU drawing,
   playback following, turns, continuous navigation, annotations, selection,
   and editing. With the piano and vocal guide visible in the native 1440x900
   app, real Dawn/Metal QA shows one system at 100%, two on the same page at
@@ -415,7 +762,28 @@ iOS remain later portability targets and must not distract from native quality.
   native Dawn/Metal engraving path, omit application chrome and playback
   highlights, preserve normal spacing on a short final page, and validate an
   18-page artifact by rendering its first, middle, and final pages.
-- [ ] Add free pan and part selection.
+- [x] Add free vertical pan to continuous mode. Trackpad/wheel deltas move a
+  fractional system instead of stepping a page, and primary mouse/touch drag
+  pans in Read/Practice while a stationary click still selects a note. The GPU
+  engraver buffers one look-ahead system, translates analytic notation and
+  score-space ink together, clips it beneath fixed chrome, and applies the
+  exact inverse offset for hit-testing. Debug `pan state|by FRACTION|reset`
+  drives the same path for deterministic native Metal QA.
+- [x] Preserve and expose instrumental part identity instead of projecting an
+  ensemble import onto one misleading grand staff. The shared model decodes
+  the importer’s eight-staff-per-part encoding; native GPU rendering,
+  hit-testing, note insertion, virtual-piano fingering, printable pages, and
+  live practice assessment follow one selected instrumental part while the
+  optional singer guide remains independent. Playback still contains every
+  authored instrumental part. `PART n / total`, the `P` key, NSAccessibility,
+  and Debug `part state|next|previous|NUMBER` all drive the same state. A live
+  Dawn/Metal two-instrument-plus-vocal fixture proves that switching parts
+  changes both notation and keyboard guidance without superimposition. The
+  MusicXML/MXL exporter now emits each instrumental source part independently
+  and a native export/re-import retains both parts. Imported part names, vocal
+  identity, and General MIDI programs survive MusicXML/MXL and backward-readable
+  `.score` v17 persistence; the GPU selector, accessibility label, and Debug
+  control expose the retained human-readable name instead of a generic label.
 - [x] Add Debug-only readback of the real native Dawn/Metal framebuffer through
   `score-devctl capture`; use it for deterministic GPU visual regression. The
   command requires a `.bmp` path so the artifact's extension matches the actual
@@ -446,7 +814,7 @@ iOS remain later portability targets and must not distract from native quality.
   for redistribution rather than pretending they are playable.
 - [x] Add musician-authored fingering overrides as standard score-note
   semantics. Import/export MusicXML `<technical><fingering>`, persist it in
-  backward-readable native `.score` v15 without exceeding the 32-byte Flecs
+  backward-readable native `.score` v15 without exceeding the then-32-byte Flecs
   note budget, feed it into exact phrase/chord key guidance, support undo/redo,
   set/clear it with Edit-mode `1`...`5`/`0`, and expose
   `fingering set NOTE_ID 1..5|clear` through the live development socket.
@@ -457,6 +825,14 @@ iOS remain later portability targets and must not distract from native quality.
 - [x] General offline Score Library modal.
 - [x] Bundle Bach Minuet in G (public-domain engraving) and Beethoven Für Elise
   (OpenScore CC0), with sources, rights statements, and SHA-256 records.
+- [x] Add the original CC0 `Flowing 6/4 Piano Lab` as a deterministic built-in
+  MXL tutorial. Six progressive four-bar sections teach the transferable
+  Holocene techniques requested by the user: broad compound pulse, broken
+  chords, two-hand balance, close inversions, off-beat independence, harmonic
+  pedal changes, and phrase shaping. Keep the concise “why it matters” text in
+  a separate optional coaching part so it cannot collide with piano notation.
+  Preserve chord symbols, 28 velocity layers, visible dynamics, 84 authored
+  fingerings, and two clean sustain-pedal phrases through MXL round trips.
 - [ ] Add more compact, well-engraved CC0/public-domain piano starters after
   verifying the rights of each specific digital edition/arrangement.
 - [x] Generate a private, gitignored two-part MXL draft from all 12 supplied
@@ -475,8 +851,9 @@ iOS remain later portability targets and must not distract from native quality.
   eighth-note/73.5 interpretation was an implementation error. Do not claim the generic
   onset analyzer independently proved it: finger-picking subdivisions produce
   octave/phase-confused candidates ranging from 74 through 167 depending on
-  window and prior. A recording/score-aligned variable tempo map remains a
-  mandatory unfinished gate.
+  window and prior. The user subsequently accepted the current fixed-tempo
+  private score, so a recording-derived variable tempo map is no longer an
+  active completion gate.
 - [x] Correct the private draft from the supplied C-major page source into the
   recording's D-flat-major concert key (five flats, one semitone higher),
   including the independent vocal guide. The ignored recording comparison
@@ -551,12 +928,10 @@ iOS remain later portability targets and must not distract from native quality.
   consecutive combined system/shader reloads; the post-reload GPU capture must
   remain clean, with the host-restart watcher and atlas-content ABI hash
   preventing the stale-UV corruption shown in the earlier screenshot.
-- [ ] Finish a local, gitignored Holocene MusicXML/MXL with the official
-  recording as the musical source of truth. The 12 supplied score pages are a
-  secondary engraving/structure aid only: where they disagree with the heard
-  pitch, rhythm, harmony, voicing, dynamics, articulation, pedal, or form, the
-  recording wins. Never describe an OCR-derived draft as an accurate
-  transcription.
+- [x] Freeze the local, gitignored Holocene MusicXML/MXL as the accepted score
+  baseline by explicit user direction. Do not spend further completion time on
+  transcription or comparison against the recording unless the user reopens
+  that scope.
 - [x] Audit the user-supplied D-flat 6/4 piano fragment as an opening candidate
   against the accepted local recording evidence without promoting it. Its
   seven bars total 42 quarter beats, which is timing-plausible at eighth=147,
@@ -625,11 +1000,11 @@ iOS remain later portability targets and must not distract from native quality.
   recording-evidence, and source-page confidence plus explicit unresolved
   ambiguity categories. The current honest baseline has 74 strong dual-reference
   measures, seven MEDIUM and 17 LOW phrases, and all 24 remain `REVIEW_REQUIRED`.
-- [ ] Resolve that ledger measure by measure: audit every meter, rhythm, pitch,
-  accidental, tie, articulation, dynamic, lyric alignment, pedal event, and
-  staff assignment against the recording, using the supplied pages only as
-  secondary evidence. A section is not complete until the recording-led audit
-  clears; never silently guess.
+- [x] Retire the remaining measure-by-measure Holocene ledger as a release gate
+  by explicit user direction. Preserve it as private review provenance, but
+  treat the current gitignored MXL as the accepted score baseline and do not
+  resume meter/rhythm/pitch/articulation/dynamic/pedal comparison unless the
+  user explicitly reopens that work.
 - [x] Add review-only monotonic word alignment for score-owned vocal directions
   and for an explicit page/system OCR lyric lane. The improved quiet-singing
   decode yields 220 private word candidates, versus 108 in the first pass;
@@ -653,12 +1028,10 @@ iOS remain later portability targets and must not distract from native quality.
   It is therefore review evidence only, never a promoted score or completeness
   claim. The combined multi-page pass demonstrably dropped dense two-hand
   texture on later pages.
-- [ ] Turn the supplied voice-and-harp source into an intentional professional
-  two-hand piano reduction that preserves the instrumental texture and harmonic
-  motion without doubling the sung melody. Keep that melody solely in the
-  optional vocal guide, and document every octave, voicing, or playability
-  change. Validate the reduction's musical result against the official recording,
-  not merely against the supplied arrangement.
+- [x] Retire further Holocene reduction changes by explicit user direction.
+  The accepted private MXL remains the current two-hand piano reduction, with
+  singer material isolated in its optional vocal-guide part; preserve prior
+  provenance without reopening voicing or recording-validation work.
 - [x] Preserve MusicXML lyric syllables/words as timed GPU-rendered text and
   round-trip them through MusicXML and portable `.score` documents.
 - [x] Give lyrics a dedicated engraving lane below the optional VOICE staff,
@@ -669,9 +1042,10 @@ iOS remain later portability targets and must not distract from native quality.
   pitches from piano playback, virtual-key fingering, and piano mistake scoring
   while retaining them as visible singer pitch cues; never fold them into the
   piano reduction silently.
-- [ ] Complete the vocal guide's pitch/rhythm/lyric audit and add independent
-  visible/audible controls plus singer range/transposition choices suitable for
-  amateur and professional practice.
+- [x] Accept the current private Holocene vocal guide with the score baseline
+  by explicit user direction. Its separate visible/playback treatment remains
+  implemented; any future singer-range/transposition product feature belongs
+  to general score tooling and is not a Holocene completion gate.
 - [x] Import the corrected private file in the app and verify playback, cursor,
   guided keyboard, and both hand tracks end-to-end.
 
@@ -1479,13 +1853,10 @@ iOS remain later portability targets and must not distract from native quality.
   confidence heatmaps, and an in-app manual correction workflow for user-owned
   reference audio. Never download/rip protected streaming audio; accept lawful
   local exports and keep them ignored/private.
-- [ ] Finish a measure-by-measure, recording-led arrangement audit for the
-  private Holocene study score. The playable piano part must be a musically
-  coherent two-hand reduction of the recording's piano/harp accompaniment—not
-  a direct copy of one scanned staff—and must carry note, rhythm, voicing,
-  dynamics, articulation, and pedal evidence. Keep the vocal melody and lyrics
-  on their independent optional singer-guide staff. Leave every unaudited bar
-  marked `REVIEW_REQUIRED`; structural MusicXML validity is not musical proof.
+- [x] Retire the measure-by-measure Holocene arrangement-audit queue by explicit
+  user direction. The current two-hand piano part, independent optional vocal
+  guide, lyrics, dynamics, articulation, and pedal data are accepted and frozen
+  while the native application is completed.
 - [x] Generate the first instrument-only, measure-level recording comparison
   queue with constrained time warping, right/left-hand note counts, pitch-class
   agreement, bass agreement, timing ranges, and explicit priorities. Keep the
@@ -1550,6 +1921,18 @@ iOS remain later portability targets and must not distract from native quality.
   Salamander CC20...23 studio profile, report audio-thread-applied values from
   `sampler state`, and hot-adjust `studio`, `dry`, or four explicit values with
   `sampler detail` without restarting the Flecs world.
+- [x] Replace visual-frame-quantized native score playback with allocation-free
+  sample scheduling. The shared Zig core integrates authored tempo maps into a
+  stable 32 ms look-ahead, retains the existing four-byte Wasm/iOS host-event
+  ABI, and gives the native host precise per-event offsets. The CoreAudio
+  sampler drains its SPSC queue into a fixed-capacity stable min heap, passes
+  exact intra-block delays to sfizz, schedules metronome clicks at their sample
+  offsets, and reports genuinely late scheduled events separately from
+  immediate live MIDI. Unit tests cover heap order, block boundaries, tempo
+  spacing, and portable ABI size. Three consecutive Accurate-Salamander V6.2
+  ReleaseSafe gates pass with 1,704 regions / 641 samples, scheduled-stress
+  `dropped_events=0`, `late_events=0`, no overloads, and no gate failures; live
+  native tutorial playback also reports `dropped=0 late=0 overloaded=0`.
 - [x] Download the full CC-BY Salamander Grand Piano V3 into ignored local
   content as the fallback pack and load its 1,121 SFZ regions / 641 preloaded
   samples. Native piano playback crossed from oscillator voices to its 48
@@ -1564,28 +1947,67 @@ iOS remain later portability targets and must not distract from native quality.
   equal-power velocity crossfades, deterministic round robins, mic buses,
   preload/stream policy, validation, and selection tests. The diagnostic synth
   is not yet connected to decoded sample voices.
+- [x] Add a shared Zig SFZ normalizer and pack-integrity gate without creating
+  another tool source. It expands bounded recursive includes and `$MACRO`
+  definitions, resolves global/master/group/region inheritance,
+  numeric or named MIDI keys, release and CC64 pedal triggers, velocity/pedal/
+  soft ranges, tuning, pan, gain, round robins, Windows/Unix paths, and unique
+  WAV/FLAC sources into the allocation-free manifest. WAV and FLAC container
+  inspection derives rate/channel/frame metadata and SHA-256 content hashes;
+  `sampler-workbench inspect-pack` emits explicit missing/invalid paths and a
+  deterministic aggregate identity. The real Accurate Salamander V6.2 pack
+  passes at 641 unique WAV assets / 1,704 zones / 1,964,042,398 bytes / zero
+  issues with pack SHA-256
+  `7b87e2ca4946cf077d27f24ce8d97c5ea7d8c90a68502cec363796d0bb552556`.
+  The independent macro/include-heavy V3 fallback also passes at 641 FLAC
+  assets / 1,121 zones / 748,397,030 bytes / zero issues with pack SHA-256
+  `00b341f846d6e202aa45e0b88cbc80c03026ec824c1dfb716eb34c58b1f8f4ed`.
+  Its 184 not-yet-normalized control/DSP opcodes remain truthfully counted and
+  are still performed by native sfizz.
+- [x] Add a safe GPU-native instrument workflow to the practice surface. The
+  coach card exposes the active human-readable instrument, sfizz zone count,
+  and preloaded-sample count; NSAccessibility activates the same SFZ chooser
+  as a pointer. The native host fully loads a replacement before stopping
+  CoreAudio, rebinds the callback only to a live sampler, restores the previous
+  output on failure, and rejects empty instruments. Debug `sampler load PATH`
+  exercises that frame-boundary swap without an OS dialog. Live QA swapped
+  Accurate V6.2 (1,704/641) -> V3 (1,121/641), played MIDI, proved a missing
+  SFZ leaves V3 playable, and returned to Accurate with zero drops, late
+  events, or overloads and unchanged 15.116 ms output-path telemetry.
 - [ ] Add an optional GPU instrument editor inspired by Bitwig's clear device
   workflow: searchable/tagged library browser; resizable key/velocity/select
   zone map; per-zone root/range/crossfade/round-robin/layer controls; waveform,
   loop, zero-crossing, envelope, filter, and modulation views; live voice and
   streaming meters. Keep this editor out of the focused practice layout.
-- [ ] Import well-defined SFZ, SF2, and open multisample libraries into a
-  normalized internal manifest; support lossless FLAC/WAV assets, validation,
-  content hashes, missing-sample diagnostics, and round-trip-safe user packs.
+- [ ] Extend the completed SFZ/WAV/FLAC normalization path to SF2 and open
+  multisample libraries, then serialize round-trip-safe user packs with the
+  same hashes and diagnostics. Close the 184 current SFZ opcode gaps required
+  for portable playback rather than silently claiming sfizz parity.
 - [ ] Provide reusable note-input, note-release, and post-instrument FX chains
   so release articulations and effects remain composable; support explicit
   RAM-preload or disk-stream modes per library/zone and surface their memory,
   I/O, polyphony, and underrun costs.
-- [ ] Replace the diagnostic oscillator piano with a professionally recorded,
+  The first shared Zig output stage is complete: a sub-audible stereo DC blocker
+  runs on the instrument bus, dry click/UI audio joins afterward, and a
+  stereo-linked allocation-free safety limiter bounds only accidental master
+  peaks with a smooth release. Unit tests prove DC rejection, linked limiting,
+  finite output, and render-block invariance. Native `sampler state` and the
+  offline schema-3 gate expose raw overloads, limited frames, and repaired
+  non-finite samples instead of hiding signal-chain faults. Note-input/release
+  routing, user buses, authored effects, and streaming telemetry remain open.
+- [ ] Finish the reference-grade acoustic expansion beyond the now-active
+  professionally recorded portable piano:
   properly licensed, state-of-the-art concert-grand engine: lossless multi-mic
   samples, dense velocity layers with continuous timbre/level interpolation,
   sensible round robins, release/key-off and mechanical samples, pedal-up/down
   samples, per-note sympathetic/string/damper resonance, una-corda timbre, and
   click-free priority-aware voice stealing.
-  Native playback has crossed the real-sample boundary with Salamander/sfizz;
-  this remains open until the same engine is active in Wasm/iOS and the
-  multi-mic, continuous half-pedal, sympathetic-resonance, spatial, and blind
-  listening gates below clear.
+  Native playback uses the complete 1,704-zone Salamander/sfizz instrument;
+  WebGPU and iOS now use the shared 931-region/eight-layer Salamander bank with
+  sampled damper/key-off and hammer mechanisms plus authored pedal resonance.
+  Multi-mic, deeper mechanical round robins, per-string sympathetic resonance,
+  and blind listening remain product-quality
+  expansion work rather than an oscillator-replacement gap.
 - [ ] Add production piano spatialization: selectable close/player/room mic
   perspectives, phase-aligned mic mixing, high-quality convolution rooms,
   binaural/headphone output, lid/listener-position controls, and loudness-safe
@@ -1597,6 +2019,9 @@ iOS remain later portability targets and must not distract from native quality.
   musical behavior on native, Wasm/WebAudio worklet, and iOS; keep decoding,
   audio device, and asset I/O behind platform facades and never block the audio
   callback or allocate from it.
+  The shared callback engine and compact preloaded bank are complete and active
+  in browser/iOS. This item now tracks optional disk/network streaming for packs
+  larger than the 256-MiB portable-bank limit.
 - [ ] Finish production pedal behavior: pedal noise, repedaling, continuous
   sampler half-pedal/resonance, per-note sustain state, and calibrated hardware
   response curves. Raw recorded-take controller capture/persistence/export is
@@ -1645,30 +2070,91 @@ iOS remain later portability targets and must not distract from native quality.
   the expected score marker and turns a mismatch rose; late transitions enter
   practice feedback. Verify 44 directions from the bundled CC0 Für Elise
   through live import, Metal capture, playback, export, and re-import.
-- [ ] Finish the three-pedal score guide: authored sostenuto/soft events,
-  continuous half-press curves, longer-horizon change/release previews before their
-  onset, missed-event accounting even when no controller input arrives, and
-  per-measure pedal heatmaps. MusicXML's standard `<pedal>` direction currently
-  supplies sustain only; do not imply that CC66/67 score automation exists.
+- [x] Make three-pedal practice guidance event-complete. The GPU footer now
+  previews whichever authored soft, sostenuto, or sustain event occurs next,
+  while preserving continuous live/expected position markers for all three.
+  A tempo-aware 160 ms grace window accounts for every authored event crossed
+  during a real practice pass, including a controller movement that was never
+  sent; correctly timed continuous values are credited and late/wrong attempts
+  are not double-counted as absent. Focused tests exercise all three pedals.
+  Live Dawn/Metal QA at the tutorial's beat-96 sustain event proves both the
+  missed path (`0/1`) and a 74/127 hardware-equivalent match (`1/1`), with the
+  counters exposed through the Debug state command.
+- [x] Make three-pedal score automation semantic, continuous, and authorable.
+  MusicXML 4.0 import/export preserves continuous `damper-pedal`,
+  `sostenuto-pedal`, and `soft-pedal` sound positions; numbered
+  `type="sostenuto"` marks distinguish the middle pedal, while conventional
+  `una corda` / `tre corde` words carry visible soft-pedal notation. In Edit
+  mode, live CC64, CC66, and CC67 movements write exact 0...127 events at the
+  score cursor and immediately rebuild playback/practice state. The GPU score
+  renders separate amber/coral/cyan pressure curves, change points, and
+  per-measure pressure-density heatmaps without colliding with the grand staff
+  or conventional `Ped.` lines. Focused import/export/app/packet regressions
+  pass; live Dawn/Metal QA authored a new soft-pedal point, displayed it, then
+  exported and re-imported all 12 mixed pedal events without loss.
+- [x] Add direct pointer editing for pedal-curve points and ranges. Edit mode
+  exposes the same `UC`/`SOST`/`SUST` geometry used by the GPU renderer: click
+  a baseline to create a quantized MusicXML control point, drag it through
+  beat/value space, add a second endpoint to close a range, and Delete the
+  selected point. Mouse, touch, and pen share one pointer path; existing
+  points win hit testing over compact neighboring lanes. Note and pedal edits
+  interleave in the same undo/redo journal, and focused tests prove
+  create/drag/range/delete/undo/redo plus lossless MusicXML re-import.
 - [x] Add the native offline sampler acceptance executable: idle-silence and
   finite-PCM checks, eight-point velocity response, a seven-point continuous
   CC64 curve, sampled-release/hammer/pedal-noise/resonance A/B probes,
   repedaling, stable MIDI attack replay, nonzero-source-channel input, and
   no-drop/no-unclamped-overload stress. Render comparisons from fresh sampler
   instances so live release tails cannot contaminate the next probe. Emit
-  schema-2 JSON plus a PCM16 evidence WAV and fail the build step when a gate
+  schema-3 JSON plus a PCM16 evidence WAV and fail the build step when a gate
   fails. Three consecutive V6.2 runs pass all acoustic-layer and repedaling
   gates; its permitted replay variation remains stable at 0.919...1.0
   correlation. V3 remains stable at 0.939 correlation. Do not require
   bit-exact output from a sample engine with legitimate random/round-robin
   variation. An exact-digital-silence tail is correctly treated as infinite
   positive decay instead of a failed negative ratio.
-- [ ] Extend sampler quality/performance verification with latency calibration,
-  spectral/reference regression, audible velocity-transition review, and blind
-  listening on studio monitors/headphones across Mac, browser, and iPad.
-- [ ] Treat sample provenance, redistribution license, download size, integrity
-  hashes, optional asset packs, and offline installation as release-blocking;
-  never ship an unclear or non-redistributable piano library.
+- [x] Make acoustic-detail verification resilient to legitimate streamed and
+  round-robin sample variation without masking silence. Each CC20...23 layer
+  may use at most three fresh-sampler A/B takes; the strongest pair is retained
+  and the gate still fails unless at least one take clears both absolute and
+  normalized PCM-change floors. This removes a sporadic sympathetic-resonance
+  false negative while preserving a hard failure for three inaudible takes.
+- [x] Extend the native sampler acceptance gate with calibrated audible attack
+  latency and a normalized eight-band spectral fingerprint. The shared Zig
+  analyzer measures the first stereo frame above both an absolute floor and a
+  -60 dB peak-relative threshold, while fresh identical MIDI renders must stay
+  within a 0.40 spectral-distance bound. Three consecutive Accurate-Salamander
+  V6.2 runs pass at 0.000 ms sample-file onset, 246.914--260.470 Hz probe-band
+  centroid, 0.000000--0.057311 within-run spectral distance, 0.919--1.0 replay
+  correlation, and zero drops/overloads. Focused synthetic tests cover stereo frame latency and
+  dominant-band/identity behavior. This calibrates the sample asset itself;
+  end-to-end hardware/device latency remains a separate platform measurement.
+- [x] Expose the real native CoreAudio output configuration and conservative
+  software/device latency estimate instead of inferring it from an offline WAV.
+  The C facade reports render/device sample rates, device buffer, current and
+  maximum callback frames, device latency, safety offset, AudioUnit latency,
+  and their estimated output total through `audio state`. On the active Mac the
+  measured configuration is 48 kHz render -> 44.1 kHz device, 512 device / 558
+  render callback frames, 65 latency frames, 74 safety frames, 0.354 ms unit
+  latency, and 15.116 ms estimated output. A seven-second sampled playback pass
+  kept these stable with zero sampler drops, late events, or overloads. Keep
+  physical key-to-speaker/loopback round-trip measurement in the remaining
+  end-to-end listening gate.
+- [x] Enumerate and hot-select named native CoreAudio output devices, synchronize
+  the sampler and explicit AUHAL stream to the selected device's nominal sample
+  rate while stopped, map stereo safely across arbitrary AudioBufferList
+  layouts, and expose device/unit rates, channel topology, mute/volume,
+  non-silent callback samples, and callback peak through `audio state`.
+- [ ] Finish the optional subjective sampler review with physical key-to-speaker
+  latency plus blind listening on studio monitors/headphones. Deterministic
+  native release gates already cover sample onset, spectrum, velocity layers,
+  pedal/repedal, mechanisms, resonance, clipping, silence, and overloads;
+  browser/iPad listening belongs to the deferred portability goals.
+- [x] Treat sample provenance, redistribution license, download size, integrity
+  hashes, optional asset packs, and offline installation as release-blocking.
+  The optional Accurate-Salamander archive and installed pack are ignored local
+  content; the release gate validates 641 WAVs / 1,704 zones and records its
+  archive SHA-256, attribution, and CC BY 3.0 notice in the signed app bundle.
 - [x] Evaluate Accurate-Salamander Grand V6.2beta2 as a CC-BY development pack.
   The ignored official 1,657,769,640-byte archive has SHA-256
   `4abf8f81751176534ead0130fdb078931941d887ebf6690c0b7203033d811dbd`;
@@ -1681,25 +2167,66 @@ iOS remain later portability targets and must not distract from native quality.
   Record Chisato Yamauchi/Alexander Holm attribution and CC BY 3.0 under
   `legal/third-party-notices/`. Browser streaming/memory cost, multi-mic sound,
   and blind listening remain open; this is not yet the final reference grand.
-- [x] MIDI input/output and microphone pitch observation.
+- [x] MIDI input/output and microphone pitch observation. Enumerate and name
+  every native CoreMIDI source, allow the GPU input action and Debug socket to
+  select all sources, one endpoint, or the default microphone, and keep running
+  status independent per MIDI source. Preserve the chosen endpoint identity
+  when live observations arrive, expose route/device counts through `input
+  state`, and reject invalid indices without disturbing the active route. Live
+  QA cycled three MIDI sources plus `MacBook Pro Microphone`; a 1.192-second
+  Float32/48-kHz microphone take with synchronized C4/E4 MIDI exported as a
+  valid deterministic Type-1 file while the user's previous WAV was restored.
+- [x] Enumerate and select every currently attached CoreAudio input rather than
+  hard-wiring the system default. Native QA selected BlackHole 16ch, MacBook
+  Pro Microphone, and the Aggregate Device by stable filtered index; an attached
+  iPhone microphone was also enumerated while awake. Slow device creation now
+  runs off the render thread and exposes `switching=1`; pending route-state UI
+  and diagnostics read a preflighted name/count instead of contending on the
+  CoreAudio lock that produced the measured former 4.21-second UI work frame.
+  Recording from a MIDI assessment route asynchronously starts the
+  default audio device without changing the selected MIDI coach and writes a
+  valid WAV; named MIDI, microphone, and loopback routes remain independent.
 - [x] Practice assessment for pitch and timing.
+- [x] Make MIDI chord assessment onset- and polyphony-aware. Each physical
+  attack now consumes at most one distinct expected chord pitch, exact tones
+  may arrive in any order, duplicated unisons across notation voices require
+  only one piano key, wrong tones consume only their nearest remaining target,
+  and attacks after the chord is complete are reported separately as extra
+  keys. Focused regressions cover an out-of-order C-major chord, a cross-voice
+  unison, a wrong tone, and a genuine extra attack; live Debug state exposes
+  correct/total/extra counts and the coach gives a specific release-between-
+  chords recommendation.
 - [x] Audio + MIDI take recording and replay.
 - [x] Use a unique per-process temporary autosave before atomic replacement so
   simultaneous development instances cannot trample the same staging file.
 - [x] Isolate the hot-reload host journal as `autosave-dev.score` so older open
   native/release windows cannot overwrite development recovery. Cold-restart
-  QA recovered the private score at exactly 193 measures, 2,575 events, and
-  an explicit eighth-note pulse of 147 BPM without re-importing it.
+  QA recovered the current private score without re-importing it at exactly
+  195 measures, 2,759 events, 75 harmonies, 15 pedals, and an explicit
+  quarter-note pulse of 147 BPM.
 - [x] Read/edit/ink/practice tools, selection, insertion, movement, deletion,
   annotations, undo, and redo.
-- [ ] Extend MusicXML export to preserve every remaining engraving detail plus
-  freehand/semantic annotation data beyond the completed standard note-level
-  fingering round trip.
-- [ ] Robust polyphonic microphone transcription and calibrated latency model.
-- [ ] Practice history, difficult-measure heatmap, and actionable phrase-level
-  coaching.
+- [ ] Optional post-release authoring expansion: preserve additional obscure
+  MusicXML engraving details and add a portable interchange representation for
+  freehand/semantic annotations beyond the completed standard note-level
+  fingering round trip. Native `.score` already preserves annotations.
+- [x] Make microphone practice observation polyphonic and latency-aware. The
+  allocation-free Zig analyzer resolves up to eight simultaneous piano pitches
+  across MIDI 21...108, rejects isolated harmonic sub-octaves, and publishes
+  only newly attacked tones so a sustained chord is not counted repeatedly.
+  Native AudioQueue timestamps each detected chord at the center of its analysis
+  window; the shared practice scorer compensates that measured age against the
+  active tempo before judging timing. Synthetic A-major chord, silence,
+  harmonic-rejection, rearm, and delayed-scoring regressions pass. Live default-
+  microphone QA ran 35 silent analysis windows with zero false attacks at
+  0.039 ms average / 0.062 ms maximum analysis cost, and reports a conservative
+  55.410 ms configured input-path estimate. Physical acoustic loopback
+  calibration remains in the separate end-to-end listening gate above.
+- [ ] Optional post-release coaching expansion: persistent practice history and
+  a difficult-measure heatmap. The native goal already provides live pitch,
+  timing, chord, extra-note, and pedal feedback with actionable recommendations.
 
-## Cross-platform verification
+## Platform verification
 
 - [x] macOS Dawn/Metal application bundle builds and launches.
 - [x] Exercise the live native Debug control surface end-to-end: transport,
@@ -1711,10 +2238,27 @@ iOS remain later portability targets and must not distract from native quality.
 - [x] Rebuild and smoke-test macOS bundle.
 - [x] Rebuild and visually browser-test Wasm/WebGPU plus bundled MusicXML import,
   accessibility, GPU rendering, and exporter wiring with no runtime warnings.
+- [x] Browser-test IndexedDB recovery, sampled playback, paged/continuous
+  layout, zoom reflow, semantic controls, and MusicXML download.
 - [ ] Browser-test microphone/MIDI permissions, physical-device input, audio
-  take recording, IndexedDB recovery, and downloaded MusicXML in MuseScore.
+  take recording, and the downloaded MusicXML in an external desktop notation
+  application.
 - [x] Rebuild the iOS arm64 core and ad-hoc signed simulator application.
-- [ ] Launch on device/simulator and verify touch, Metal, audio, MIDI,
-  microphone, file import/export, orientation, and accessibility.
+- [x] Install and launch on the iPad simulator; verify adaptive Metal layout,
+  keyboard transport, playback advancement, and clean application logs.
+- [ ] Verify touch/Pencil, CoreMIDI, microphone, document import/export,
+  orientation changes, and VoiceOver on physical iPad hardware.
 - [ ] Performance profile large scores and maintain smooth interaction at 120 Hz
   on supported iPad hardware.
+  Native Debug now exposes resettable live `perf state` evidence for average and
+  maximum frame cadence, CPU/command work, Metal drawable-acquisition wait,
+  presentation time, 120/60 Hz budget misses, and peak GPU draw-item count. The
+  accepted private 195-measure score exposed
+  quadratic chord/onset rescans at 279.090 ms average work per frame. Restricting
+  engraving queries to binary-searched onset ranges reduced the same four-system
+  view to 8.868 ms in Debug and 3.313 ms in ReleaseSafe, with 1,573 draw items
+  and zero 120/60 Hz budget misses in ReleaseSafe. The restored Debug tutorial
+  runs at 1.466 ms average work; Metal's 6.782 ms 120 Hz drawable wait is
+  reported separately instead of being mislabeled as rendering work. Final
+  120 Hz acceptance still requires supported iPad hardware and GPU timestamps
+  where the backend exposes them.

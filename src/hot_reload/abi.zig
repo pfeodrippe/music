@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const abi_version: u32 = 15;
+pub const abi_version: u32 = 24;
 pub const max_query_terms = 8;
 
 pub const ComponentKey = enum(u32) {
@@ -46,6 +46,8 @@ pub const FrameContext = extern struct {
     lyric_count: u32,
     harmonies: *const anyopaque,
     harmony_count: u32,
+    hairpins: *const anyopaque,
+    hairpin_count: u32,
     pedals: *const anyopaque,
     pedal_count: u32,
     measures: *const anyopaque,

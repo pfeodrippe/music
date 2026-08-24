@@ -44,7 +44,7 @@ final class ScoreMetalView: UIView {
     private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
     override init(frame: CGRect) {
-        guard score_ios_api_version() == 2 else { fatalError("Unsupported Score core ABI") }
+        guard score_ios_api_version() == 3 else { fatalError("Unsupported Score core ABI") }
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             fatalError("Metal is unavailable on this device")
         }

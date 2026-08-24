@@ -1,4 +1,4 @@
-const cacheName = "score-webgpu-v10";
+const cacheName = "score-webgpu-v13";
 const applicationFiles = [
   "./score.html",
   "./index.html",
@@ -6,6 +6,8 @@ const applicationFiles = [
   "./score.wasm",
   "./audio_dsp.wasm",
   "./audio-worklet.js",
+  "./portable-grand.scorebank",
+  "./ACCURATE_SALAMANDER_LICENSE.txt",
   "./manifest.webmanifest",
   "./icons/score-icon-192.png",
   "./icons/score-icon-512.png"

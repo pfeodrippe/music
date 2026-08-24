@@ -4,9 +4,11 @@ const model = @import("../model.zig");
 pub const max_import_notes = 4096;
 pub const max_import_lyrics = 1024;
 pub const max_import_harmonies = 1024;
+pub const max_import_hairpins = 1024;
 pub const max_import_pedals = 2048;
 pub const max_import_measures = 2048;
 pub const max_import_tempos = model.max_tempo_events;
+pub const max_import_parts = model.max_score_parts;
 
 pub const ImportReport = struct {
     notes: [max_import_notes]model.Note = undefined,
@@ -15,6 +17,8 @@ pub const ImportReport = struct {
     lyric_count: usize = 0,
     harmonies: [max_import_harmonies]model.Harmony = undefined,
     harmony_count: usize = 0,
+    hairpins: [max_import_hairpins]model.Hairpin = undefined,
+    hairpin_count: usize = 0,
     pedals: [max_import_pedals]model.PedalEvent = undefined,
     pedal_count: usize = 0,
     measures: [max_import_measures]model.Measure = undefined,
@@ -35,6 +39,8 @@ pub const ImportReport = struct {
     beats_per_measure: u8 = 4,
     beat_unit: u8 = 4,
     key_fifths: i8 = 0,
+    parts: [max_import_parts]model.ScorePart = [_]model.ScorePart{.{}} ** max_import_parts,
+    part_count: usize = 0,
 
     pub fn titleSlice(self: *const ImportReport) []const u8 {
         return self.title[0..self.title_len];
@@ -49,9 +55,11 @@ pub const Error = error{
     InvalidMusicXml,
     TooManyNotes,
     TooManyHarmonies,
+    TooManyHairpins,
     TooManyPedals,
     TooManyMeasures,
     TooManyTempos,
+    TooManyParts,
     InvalidNumber,
 };
 
@@ -75,15 +83,25 @@ pub fn parseInto(source: []const u8, report: *ImportReport) Error!void {
     if (tagContent(source, "beats")) |value| report.beats_per_measure = @intCast(@min(32, try parseUnsigned(value)));
     if (tagContent(source, "beat-type")) |value| report.beat_unit = @intCast(@min(32, try parseUnsigned(value)));
     if (tagContent(source, "fifths")) |value| report.key_fifths = @intCast(std.math.clamp(try parseSigned(value), -7, 7));
-    if (std.mem.indexOf(u8, source, "<ornaments") != null) report.approximations += 1;
+    report.approximations += unsupportedOrnamentCount(source);
+    try parsePartDefinitions(source, report);
 
     var stable_id: u64 = 1;
     var part_cursor: usize = 0;
     var part_index: u32 = 0;
     while (findOpenTag(source, part_cursor, "part")) |part_start| {
+        if (part_index >= model.max_instrument_parts) return error.TooManyParts;
         const part_open_end = std.mem.indexOfPos(u8, source, part_start, ">") orelse return error.InvalidMusicXml;
         const part_end = std.mem.indexOfPos(u8, source, part_open_end, "</part>") orelse return error.InvalidMusicXml;
-        try parsePart(source[part_open_end + 1 .. part_end], report, part_index, partIsVocalGuide(source, part_index), &stable_id);
+        if (part_index >= report.part_count) {
+            var fallback: model.ScorePart = .{ .source_index = part_index };
+            var fallback_buffer: [24]u8 = undefined;
+            const fallback_name = std.fmt.bufPrint(&fallback_buffer, "Part {d}", .{part_index + 1}) catch "Part";
+            fallback.setName(fallback_name);
+            report.parts[report.part_count] = fallback;
+            report.part_count += 1;
+        }
+        try parsePart(source[part_open_end + 1 .. part_end], report, part_index, report.parts[part_index].isVocal(), &stable_id);
         part_cursor = part_end + "</part>".len;
         part_index += 1;
     }
@@ -101,9 +119,37 @@ pub fn parseInto(source: []const u8, report: *ImportReport) Error!void {
     }.lessThan);
     std.mem.sort(model.PedalEvent, report.pedals[0..report.pedal_count], {}, struct {
         fn lessThan(_: void, left: model.PedalEvent, right: model.PedalEvent) bool {
-            return left.start_beat < right.start_beat or (left.start_beat == right.start_beat and left.action < right.action);
+            return left.start_beat < right.start_beat or
+                (left.start_beat == right.start_beat and left.pedal < right.pedal) or
+                (left.start_beat == right.start_beat and left.pedal == right.pedal and left.action < right.action);
         }
     }.lessThan);
+    std.mem.sort(model.Hairpin, report.hairpins[0..report.hairpin_count], {}, struct {
+        fn lessThan(_: void, left: model.Hairpin, right: model.Hairpin) bool {
+            return left.start_beat < right.start_beat or
+                (left.start_beat == right.start_beat and left.staff < right.staff) or
+                (left.start_beat == right.start_beat and left.staff == right.staff and left.number < right.number);
+        }
+    }.lessThan);
+}
+
+fn parsePartDefinitions(source: []const u8, report: *ImportReport) Error!void {
+    var cursor: usize = 0;
+    var index: u32 = 0;
+    while (findOpenTag(source, cursor, "score-part")) |start| {
+        if (report.part_count == report.parts.len) return error.TooManyParts;
+        const end = std.mem.indexOfPos(u8, source, start, "</score-part>") orelse return error.InvalidMusicXml;
+        const block = source[start .. end + "</score-part>".len];
+        const encoded_name = tagContent(block, "part-name") orelse tagContent(block, "instrument-name") orelse "Part";
+        var part: model.ScorePart = .{ .source_index = index };
+        part.name_len = @intCast(decodeXmlText(&part.name, encoded_name));
+        if (containsAsciiInsensitive(part.nameSlice(), "voice") or containsAsciiInsensitive(part.nameSlice(), "vocal") or containsAsciiInsensitive(part.nameSlice(), "singer")) part.flags |= model.score_part_flag_vocal;
+        if (tagContent(block, "midi-program")) |program| part.midi_program = @min(@as(u32, 128), try parseUnsigned(program));
+        report.parts[report.part_count] = part;
+        report.part_count += 1;
+        index += 1;
+        cursor = end + "</score-part>".len;
+    }
 }
 
 fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_guide: bool, stable_id: *u64) Error!void {
@@ -113,6 +159,17 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
     var beat_unit: u32 = report.beat_unit;
     var current_dynamic: u8 = 0;
     var current_velocity: u8 = dynamicVelocity(0);
+    var current_pedal_values = [_]u8{0} ** 3;
+    // MusicXML's `number` connects overlapping damper/sostenuto lines whose
+    // later stop/change types do not repeat the pedal kind.
+    var numbered_pedal_kinds = [_]u8{255} ** 17;
+    // Wedges use the same 1...16 MusicXML numbering model so concurrent or
+    // overlapping expressive spans can be closed independently across bars.
+    var open_hairpins = [_]?usize{null} ** 17;
+    // An ending's start/stop elements can be several measures apart. Retain
+    // its pass mask while parsing the first source part so every enclosed bar
+    // gets the playback condition, not just the two bracket endpoints.
+    var active_ending_mask: u16 = 0;
     while (findOpenTag(source, measure_cursor, "measure")) |measure_open| {
         const open_end = std.mem.indexOfPos(u8, source, measure_open, ">") orelse return error.InvalidMusicXml;
         const measure_end = std.mem.indexOfPos(u8, source, open_end, "</measure>") orelse return error.InvalidMusicXml;
@@ -120,7 +177,7 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
         const body = source[open_end + 1 .. measure_end];
         if (tagContent(body, "beats")) |value| beats = @max(1, try parseUnsigned(value));
         if (tagContent(body, "beat-type")) |value| beat_unit = @max(1, try parseUnsigned(value));
-        const extent = try parseMeasure(body, report, measure_start, part_index, vocal_guide, stable_id, &current_dynamic, &current_velocity);
+        const extent = try parseMeasure(body, report, measure_start, part_index, vocal_guide, stable_id, &current_dynamic, &current_velocity, &current_pedal_values, &numbered_pedal_kinds, &open_hairpins);
         // A regular MusicXML measure occupies its declared metrical duration.
         // Advancing by recognized note extent makes one missing OMR rest shift
         // every later bar and desynchronize parts. Explicit implicit measures
@@ -132,7 +189,7 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
             if (report.measure_count == report.measures.len) return error.TooManyMeasures;
             const sequential_number: u32 = @intCast(report.measure_count + 1);
             const number = if (attributeValue(opening, "number")) |value| parseUnsigned(value) catch sequential_number else sequential_number;
-            report.measures[report.measure_count] = .{
+            var measure = model.Measure{
                 .start_beat = measure_start,
                 .duration_beats = duration_beats,
                 .number = number,
@@ -140,14 +197,107 @@ fn parsePart(source: []const u8, report: *ImportReport, part_index: u32, vocal_g
                 .beat_unit = @intCast(@min(255, beat_unit)),
                 .implicit = @intFromBool(implicit),
             };
+            try parseMeasureRepeats(body, &measure);
+            try parseMeasureEndings(body, &measure, &active_ending_mask, &report.approximations);
+            report.measures[report.measure_count] = measure;
             report.measure_count += 1;
         }
         measure_start += duration_beats;
         measure_cursor = measure_end + "</measure>".len;
     }
+    // Preserve malformed-but-readable source wedges as spans through the end
+    // of their part instead of dropping them. The warning remains explicit.
+    for (&open_hairpins) |*open| if (open.*) |index| {
+        report.hairpins[index].end_beat = @max(report.hairpins[index].start_beat + 0.001, measure_start);
+        report.approximations += 1;
+        open.* = null;
+    };
 }
 
-fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, part_index: u32, vocal_guide: bool, stable_id: *u64, current_dynamic: *u8, current_velocity: *u8) Error!f32 {
+fn parseMeasureEndings(source: []const u8, measure: *model.Measure, active_mask: *u16, approximations: *u32) Error!void {
+    measure.ending_mask = active_mask.*;
+    var cursor: usize = 0;
+    while (findOpenTag(source, cursor, "ending")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, ">") orelse return error.InvalidMusicXml;
+        const tag = source[start .. end + 1];
+        const kind = attributeValue(tag, "type") orelse return error.InvalidMusicXml;
+        const parsed_mask = if (attributeValue(tag, "number")) |numbers|
+            parseEndingMask(numbers, approximations)
+        else blk: {
+            approximations.* += 1;
+            break :blk @as(u16, 0);
+        };
+
+        if (std.mem.eql(u8, kind, "start")) {
+            measure.ending_flags |= model.measure_ending_start;
+            if (parsed_mask != 0) {
+                measure.ending_mask = parsed_mask;
+                active_mask.* = parsed_mask;
+            }
+        } else if (std.mem.eql(u8, kind, "stop") or std.mem.eql(u8, kind, "discontinue")) {
+            measure.ending_flags |= if (std.mem.eql(u8, kind, "stop")) model.measure_ending_stop else model.measure_ending_discontinue;
+            if (measure.ending_mask == 0) measure.ending_mask = parsed_mask;
+            active_mask.* = 0;
+        } else {
+            approximations.* += 1;
+        }
+        cursor = end + 1;
+    }
+}
+
+fn parseEndingMask(source: []const u8, approximations: *u32) u16 {
+    var mask: u16 = 0;
+    var tokens = std.mem.tokenizeAny(u8, source, ",; \t\r\n");
+    while (tokens.next()) |token| {
+        if (std.mem.indexOfScalar(u8, token, '-')) |dash| {
+            const first = parseUnsigned(token[0..dash]) catch {
+                approximations.* += 1;
+                continue;
+            };
+            const last = parseUnsigned(token[dash + 1 ..]) catch {
+                approximations.* += 1;
+                continue;
+            };
+            if (first == 0 or first > last or last > 16) {
+                approximations.* += 1;
+                continue;
+            }
+            var pass = first;
+            while (pass <= last) : (pass += 1) mask |= @as(u16, 1) << @intCast(pass - 1);
+        } else {
+            const pass = parseUnsigned(token) catch {
+                approximations.* += 1;
+                continue;
+            };
+            if (pass == 0 or pass > 16) {
+                approximations.* += 1;
+                continue;
+            }
+            mask |= @as(u16, 1) << @intCast(pass - 1);
+        }
+    }
+    return mask;
+}
+
+fn parseMeasureRepeats(source: []const u8, measure: *model.Measure) Error!void {
+    var cursor: usize = 0;
+    while (findOpenTag(source, cursor, "repeat")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, ">") orelse return error.InvalidMusicXml;
+        const tag = source[start .. end + 1];
+        const direction = attributeValue(tag, "direction") orelse return error.InvalidMusicXml;
+        if (std.mem.eql(u8, direction, "forward")) {
+            measure.repeat |= model.measure_repeat_forward;
+        } else if (std.mem.eql(u8, direction, "backward")) {
+            measure.repeat |= model.measure_repeat_backward;
+            if (attributeValue(tag, "times")) |value| {
+                measure.setRepeatPasses(@intCast(@min(@as(u32, 63), try parseUnsigned(value))));
+            }
+        }
+        cursor = end + 1;
+    }
+}
+
+fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, part_index: u32, vocal_guide: bool, stable_id: *u64, current_dynamic: *u8, current_velocity: *u8, current_pedal_values: *[3]u8, numbered_pedal_kinds: *[17]u8, open_hairpins: *[17]?usize) Error!f32 {
     var divisions = report.divisions;
     if (tagContent(source, "divisions")) |value| {
         divisions = @max(1, try parseUnsigned(value));
@@ -188,10 +338,15 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                 if (performed_velocity == null) current_velocity.* = dynamicVelocity(dynamic_code);
             }
             if (performed_velocity) |velocity| current_velocity.* = velocity;
-            if (findOpenTag(block, 0, "pedal") != null) {
+            if (findOpenTag(block, 0, "pedal") != null or hasPedalSound(block)) {
                 const offset_units = if (tagContent(block, "offset")) |value| try parseSigned(value) else 0;
                 const offset_beats = @as(f32, @floatFromInt(offset_units)) / @as(f32, @floatFromInt(divisions));
-                try appendPedal(report, @max(0, measure_start + local_beat + offset_beats), block);
+                try appendPedals(report, @max(0, measure_start + local_beat + offset_beats), block, current_pedal_values, numbered_pedal_kinds);
+            }
+            if (findOpenTag(block, 0, "wedge") != null) {
+                const offset_units = if (tagContent(block, "offset")) |value| try parseSigned(value) else 0;
+                const offset_beats = @as(f32, @floatFromInt(offset_units)) / @as(f32, @floatFromInt(divisions));
+                try appendHairpinDirection(report, @max(0, measure_start + local_beat + offset_beats), part_index, vocal_guide, block, open_hairpins);
             }
             if (part_index == 0) {
                 if (tempoFromDirection(block)) |tempo| {
@@ -241,12 +396,14 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
         const duration = unitsToBeats(duration_units, divisions);
         const chord = findOpenTag(block, 0, "chord") != null;
         const grace = findOpenTag(block, 0, "grace") != null;
+        const grace_attributes = if (grace) try parseGraceAttributes(block, divisions) else GraceAttributes{};
         const rest = findOpenTag(block, 0, "rest") != null;
         const start_beat = if (chord) previous_start else local_beat;
         const staff_value = if (tagContent(block, "staff")) |value| try parseUnsigned(value) else 1;
         const voice_value = if (tagContent(block, "voice")) |value| try parseUnsigned(value) else 1;
         const stored_staff: u8 = @intCast(@min(part_index * 8 + staff_value -| 1, 255));
         const stored_voice: u8 = @intCast(@min(voice_value -| 1, 255));
+        const slurs = parseSlurNotation(block);
 
         if (rest) {
             if (report.note_count == report.notes.len) return error.TooManyNotes;
@@ -265,7 +422,9 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                 .written_step = rest_step,
                 .written_octave = rest_octave,
                 .dots = countOpenTags(block, "dot", 3),
-                .flags = notationFlags(block, vocal_guide) | model.note_flag_rest | if (std.mem.indexOf(u8, block, "<rest measure=\"yes\"") != null) model.note_flag_measure_rest else 0,
+                .slur_start_mask = slurs.start_mask,
+                .slur_stop_mask = slurs.stop_mask,
+                .flags = notationFlags(block, vocal_guide, slurs) | model.note_flag_rest | if (std.mem.indexOf(u8, block, "<rest measure=\"yes\"") != null) model.note_flag_measure_rest else 0,
             };
             report.note_count += 1;
             stable_id.* += 1;
@@ -291,7 +450,7 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                 report.skipped_notes += 1;
             } else {
                 if (report.note_count == report.notes.len) return error.TooManyNotes;
-                var flags = notationFlags(block, vocal_guide);
+                var flags = notationFlags(block, vocal_guide, slurs);
                 if (!chord and pending_dynamic != 0) flags = model.withDynamic(flags, pending_dynamic);
                 if (tagContent(block, "actual-notes")) |actual_text| {
                     const actual = try parseUnsigned(actual_text);
@@ -301,7 +460,7 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                 report.notes[report.note_count] = .{
                     .stable_id = stable_id.*,
                     .start_beat = measure_start + start_beat,
-                    .duration_beats = if (grace) 0.125 else @max(duration, 0.0625),
+                    .duration_beats = if (grace) grace_attributes.duration_beats else @max(duration, 0.0625),
                     .pitch = @intCast(midi_wide),
                     .velocity = current_velocity.*,
                     .staff = stored_staff,
@@ -310,13 +469,15 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
                     .written_alter = @intCast(std.math.clamp(alter, -2, 2)),
                     .written_octave = @intCast(octave),
                     .dots = countOpenTags(block, "dot", 3),
+                    .slur_start_mask = slurs.start_mask,
+                    .slur_stop_mask = slurs.stop_mask,
                     .flags = flags,
                     .fingering = authoredFingering(block),
+                    .notations = notationDetails(block) | grace_attributes.notations,
                 };
                 report.note_count += 1;
                 stable_id.* += 1;
                 if (!chord and pending_dynamic != 0) pending_dynamic = 0;
-                if (grace) report.approximations += 1;
             }
             if (tagContent(block, "text")) |text| try appendLyric(report, measure_start + start_beat, text);
         }
@@ -327,7 +488,69 @@ fn parseMeasure(source: []const u8, report: *ImportReport, measure_start: f32, p
     return @max(extent, local_beat);
 }
 
-fn notationFlags(block: []const u8, vocal_guide: bool) u32 {
+const GraceAttributes = struct {
+    duration_beats: f32 = 0.125,
+    notations: u32 = 0,
+};
+
+fn parseGraceAttributes(block: []const u8, divisions: u32) Error!GraceAttributes {
+    const start = findOpenTag(block, 0, "grace") orelse return .{};
+    const end = std.mem.indexOfPos(u8, block, start, ">") orelse return error.InvalidMusicXml;
+    const tag = block[start .. end + 1];
+    const following = if (attributeValue(tag, "steal-time-following")) |value| try parsePercent(value) else 0;
+    const previous = if (attributeValue(tag, "steal-time-previous")) |value| try parsePercent(value) else 0;
+    const make_units = if (attributeValue(tag, "make-time")) |value| try parsePositiveFloat(value) else 0;
+    const make_time = make_units > 0;
+    return .{
+        .duration_beats = if (make_time) make_units / @as(f32, @floatFromInt(@max(1, divisions))) else 0.125,
+        .notations = model.withGraceTiming(0, attributeIsYes(tag, "slash"), following, previous, make_time),
+    };
+}
+
+fn parsePercent(source: []const u8) Error!u8 {
+    const value = try parsePositiveFloat(source);
+    return @intFromFloat(@round(std.math.clamp(value, 0, 100)));
+}
+
+fn parsePositiveFloat(source: []const u8) Error!f32 {
+    const value = std.fmt.parseFloat(f32, std.mem.trim(u8, source, " \t\r\n")) catch return error.InvalidNumber;
+    if (!std.math.isFinite(value) or value < 0) return error.InvalidNumber;
+    return value;
+}
+
+const SlurNotation = struct {
+    start_mask: u8 = 0,
+    stop_mask: u8 = 0,
+    above: bool = false,
+};
+
+fn parseSlurNotation(block: []const u8) SlurNotation {
+    var result: SlurNotation = .{};
+    var cursor: usize = 0;
+    while (findOpenTag(block, cursor, "slur")) |start| {
+        const end = std.mem.indexOfPos(u8, block, start, ">") orelse break;
+        const opening = block[start .. end + 1];
+        const slur_type = attributeValue(opening, "type") orelse {
+            cursor = end + 1;
+            continue;
+        };
+        const raw_number = if (attributeValue(opening, "number")) |text|
+            std.fmt.parseUnsigned(u8, text, 10) catch 1
+        else
+            1;
+        const bit = model.slurNumberBit(raw_number);
+        if (std.mem.eql(u8, slur_type, "start")) {
+            result.start_mask |= bit;
+            if (attributeValue(opening, "placement")) |placement| result.above = result.above or std.mem.eql(u8, placement, "above");
+        } else if (std.mem.eql(u8, slur_type, "stop")) {
+            result.stop_mask |= bit;
+        }
+        cursor = end + 1;
+    }
+    return result;
+}
+
+fn notationFlags(block: []const u8, vocal_guide: bool, slurs: SlurNotation) u32 {
     var flags: u32 = if (vocal_guide or findOpenTag(block, 0, "cue") != null) model.note_flag_vocal_guide else 0;
     if (findOpenTag(block, 0, "grace") != null) flags |= model.note_flag_grace;
     if (std.mem.indexOf(u8, block, "<tie type=\"start\"") != null or std.mem.indexOf(u8, block, "<tied type=\"start\"") != null) flags |= model.note_flag_tie_start;
@@ -338,9 +561,9 @@ fn notationFlags(block: []const u8, vocal_guide: bool) u32 {
     if (findOpenTag(block, 0, "tenuto") != null) flags |= model.note_flag_tenuto;
     if (findOpenTag(block, 0, "strong-accent") != null) flags |= model.note_flag_marcato;
     if (findOpenTag(block, 0, "fermata") != null) flags |= model.note_flag_fermata;
-    if (std.mem.indexOf(u8, block, "<slur type=\"start\"") != null) flags |= model.note_flag_slur_start;
-    if (std.mem.indexOf(u8, block, "<slur type=\"stop\"") != null) flags |= model.note_flag_slur_stop;
-    if (std.mem.indexOf(u8, block, "<slur type=\"start\" placement=\"above\"") != null or std.mem.indexOf(u8, block, "<slur placement=\"above\" type=\"start\"") != null) flags |= model.note_flag_slur_above;
+    if (slurs.start_mask != 0) flags |= model.note_flag_slur_start;
+    if (slurs.stop_mask != 0) flags |= model.note_flag_slur_stop;
+    if (slurs.above) flags |= model.note_flag_slur_above;
     if (std.mem.indexOf(u8, block, "<tuplet type=\"start\"") != null) flags |= model.note_flag_tuplet_start;
     if (std.mem.indexOf(u8, block, "<tuplet type=\"stop\"") != null) flags |= model.note_flag_tuplet_stop;
     if (openTagContent(block, "beam")) |beam| {
@@ -349,6 +572,85 @@ fn notationFlags(block: []const u8, vocal_guide: bool) u32 {
         if (std.mem.eql(u8, std.mem.trim(u8, beam, " \t\r\n"), "end")) flags |= model.note_flag_beam_end;
     }
     return flags;
+}
+
+fn notationDetails(block: []const u8) u32 {
+    var details: u32 = 0;
+    if (findOpenTag(block, 0, "trill-mark") != null) details |= model.note_notation_trill;
+    if (findOpenTag(block, 0, "turn") != null) details |= model.note_notation_turn;
+    if (findOpenTag(block, 0, "inverted-turn") != null) details |= model.note_notation_inverted_turn;
+    if (findOpenTag(block, 0, "mordent") != null) details |= model.note_notation_mordent;
+    if (findOpenTag(block, 0, "inverted-mordent") != null) details |= model.note_notation_inverted_mordent;
+
+    if (findOpenTag(block, 0, "arpeggiate")) |start| {
+        details |= model.note_notation_arpeggiate;
+        const end = std.mem.indexOfPos(u8, block, start, ">") orelse block.len - 1;
+        const opening = block[start..@min(end + 1, block.len)];
+        if (attributeValue(opening, "direction")) |direction| {
+            if (std.mem.eql(u8, direction, "up")) details |= model.note_notation_arpeggiate_up;
+            if (std.mem.eql(u8, direction, "down")) details |= model.note_notation_arpeggiate_down;
+        }
+    }
+
+    const ornament_tags = [_][]const u8{ "trill-mark", "turn", "inverted-turn", "mordent", "inverted-mordent" };
+    inline for (ornament_tags) |tag| {
+        if (findOpenTag(block, 0, tag)) |start| {
+            if (std.mem.indexOfPos(u8, block, start, ">")) |end| {
+                if (attributeValue(block[start .. end + 1], "placement")) |placement| {
+                    if (std.mem.eql(u8, placement, "below")) details |= model.note_notation_ornament_below;
+                }
+            }
+        }
+    }
+    if (findOpenTag(block, 0, "tremolo")) |start| {
+        if (std.mem.indexOfPos(u8, block, start, ">")) |open_end| {
+            const opening = block[start .. open_end + 1];
+            const tremolo_type = attributeValue(opening, "type") orelse "single";
+            if (std.mem.eql(u8, tremolo_type, "single")) {
+                if (std.mem.indexOfPos(u8, block, open_end + 1, "</tremolo>")) |close| {
+                    const text = std.mem.trim(u8, block[open_end + 1 .. close], " \t\r\n");
+                    const marks = std.fmt.parseUnsigned(u8, text, 10) catch 0;
+                    if (marks >= 1 and marks <= 8) details = model.withSingleTremolo(details, marks);
+                }
+            }
+        }
+    }
+    return details;
+}
+
+fn unsupportedTremoloCount(source: []const u8) u32 {
+    var cursor: usize = 0;
+    var count: u32 = 0;
+    while (findOpenTag(source, cursor, "tremolo")) |start| {
+        const open_end = std.mem.indexOfPos(u8, source, start, ">") orelse return count + 1;
+        const opening = source[start .. open_end + 1];
+        const tremolo_type = attributeValue(opening, "type") orelse "single";
+        const close = std.mem.indexOfPos(u8, source, open_end + 1, "</tremolo>") orelse return count + 1;
+        const text = std.mem.trim(u8, source[open_end + 1 .. close], " \t\r\n");
+        const marks = std.fmt.parseUnsigned(u8, text, 10) catch 0;
+        if (!std.mem.eql(u8, tremolo_type, "single") or marks < 1 or marks > 8) count += 1;
+        cursor = close + "</tremolo>".len;
+    }
+    return count;
+}
+
+fn unsupportedOrnamentCount(source: []const u8) u32 {
+    // Common keyboard ornaments are retained semantically above. Report only
+    // the less common MusicXML forms that still need an explicit engine model.
+    const unsupported = [_][]const u8{
+        "delayed-turn",
+        "delayed-inverted-turn",
+        "vertical-turn",
+        "shake",
+        "wavy-line",
+        "schleifer",
+        "haydn",
+        "other-ornament",
+        "accidental-mark",
+    };
+    var count: u32 = 0;
+    inline for (unsupported) |tag| count += @as(u32, countOpenTags(source, tag, 255));
+    return count + unsupportedTremoloCount(source);
 }
 
 fn authoredFingering(block: []const u8) u8 {
@@ -424,21 +726,6 @@ fn countOpenTags(source: []const u8, comptime name: []const u8, maximum: u8) u8 
     return count;
 }
 
-fn partIsVocalGuide(source: []const u8, wanted_index: u32) bool {
-    var cursor: usize = 0;
-    var index: u32 = 0;
-    while (findOpenTag(source, cursor, "score-part")) |start| {
-        const end = std.mem.indexOfPos(u8, source, start, "</score-part>") orelse return false;
-        if (index == wanted_index) {
-            const name = tagContent(source[start..end], "part-name") orelse return false;
-            return containsAsciiInsensitive(name, "voice") or containsAsciiInsensitive(name, "vocal") or containsAsciiInsensitive(name, "singer");
-        }
-        index += 1;
-        cursor = end + "</score-part>".len;
-    }
-    return false;
-}
-
 fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
     for (0..haystack.len - needle.len + 1) |start| {
@@ -505,45 +792,190 @@ fn appendHarmony(report: *ImportReport, start_beat: f32, source: []const u8, div
     report.harmony_count += 1;
 }
 
-fn appendPedal(report: *ImportReport, start_beat: f32, source: []const u8) Error!void {
-    if (report.pedal_count == report.pedals.len) return error.TooManyPedals;
-    const start = findOpenTag(source, 0, "pedal") orelse return;
-    const open_end = std.mem.indexOfPos(u8, source, start, ">") orelse return error.InvalidMusicXml;
-    const opening = source[start .. open_end + 1];
-    const type_name = attributeValue(opening, "type") orelse return;
-    const action: u8 = if (std.mem.eql(u8, type_name, "start"))
-        model.pedal_action_start
-    else if (std.mem.eql(u8, type_name, "stop"))
-        model.pedal_action_stop
-    else if (std.mem.eql(u8, type_name, "change"))
-        model.pedal_action_change
-    else if (std.mem.eql(u8, type_name, "continue"))
-        model.pedal_action_continue
-    else if (std.mem.eql(u8, type_name, "resume"))
-        model.pedal_action_resume
-    else if (std.mem.eql(u8, type_name, "discontinue"))
-        model.pedal_action_discontinue
-    else
-        return;
-    var flags: u8 = 0;
-    if (attributeIsYes(opening, "line")) flags |= model.pedal_flag_line;
-    if (attributeIsYes(opening, "sign")) flags |= model.pedal_flag_sign;
-    var value: u8 = if (action == model.pedal_action_stop or action == model.pedal_action_discontinue) 0 else 127;
-    if (findOpenTag(source, 0, "sound")) |sound_start| {
-        const sound_end = std.mem.indexOfPos(u8, source, sound_start, ">") orelse return error.InvalidMusicXml;
-        if (attributeValue(source[sound_start .. sound_end + 1], "damper-pedal")) |text| {
-            const percent = std.fmt.parseFloat(f32, text) catch -1;
-            if (std.math.isFinite(percent) and percent >= 0) value = @intFromFloat(@round(std.math.clamp(percent, 0, 100) * 127.0 / 100.0));
-        }
+fn appendHairpinDirection(report: *ImportReport, beat: f32, part_index: u32, vocal_guide: bool, source: []const u8, open_hairpins: *[17]?usize) Error!void {
+    const wedge_start = findOpenTag(source, 0, "wedge") orelse return;
+    const wedge_end = std.mem.indexOfPos(u8, source, wedge_start, ">") orelse return error.InvalidMusicXml;
+    const wedge = source[wedge_start .. wedge_end + 1];
+    const type_name = attributeValue(wedge, "type") orelse return;
+    const raw_number = if (attributeValue(wedge, "number")) |value| std.fmt.parseUnsigned(usize, value, 10) catch 1 else 1;
+    const number = std.math.clamp(raw_number, 1, 16);
+    var flags: u8 = if (vocal_guide) model.hairpin_flag_vocal else 0;
+    const direction_end = std.mem.indexOf(u8, source, ">") orelse return error.InvalidMusicXml;
+    const direction_opening = source[0 .. direction_end + 1];
+    if (attributeValue(direction_opening, "placement")) |placement| if (std.mem.eql(u8, placement, "above")) {
+        flags |= model.hairpin_flag_above;
+    };
+    if (attributeIsYes(wedge, "niente")) flags |= model.hairpin_flag_niente;
+    if (attributeValue(wedge, "line-type")) |line_type| {
+        if (std.mem.eql(u8, line_type, "dashed")) flags |= model.hairpin_flag_dashed;
+        if (std.mem.eql(u8, line_type, "dotted")) flags |= model.hairpin_flag_dotted;
     }
+    const parsed_spread = if (attributeValue(wedge, "spread")) |value| std.fmt.parseFloat(f32, value) catch 0 else 0;
+    const spread = if (std.math.isFinite(parsed_spread) and parsed_spread > 0) parsed_spread else 15;
+
+    const kind: ?u8 = if (std.mem.eql(u8, type_name, "crescendo"))
+        model.hairpin_crescendo
+    else if (std.mem.eql(u8, type_name, "diminuendo"))
+        model.hairpin_diminuendo
+    else
+        null;
+    if (kind) |hairpin_kind| {
+        if (open_hairpins[number]) |previous| {
+            report.hairpins[previous].end_beat = @max(report.hairpins[previous].start_beat + 0.001, beat);
+            report.approximations += 1;
+        }
+        if (report.hairpin_count == report.hairpins.len) return error.TooManyHairpins;
+        const local_staff = if (tagContent(source, "staff")) |value| @min(try parseUnsigned(value) -| 1, model.staff_slots_per_part - 1) else 0;
+        report.hairpins[report.hairpin_count] = .{
+            .start_beat = beat,
+            .end_beat = beat,
+            .spread = spread,
+            .staff = model.encodedStaff(part_index, @intCast(local_staff)),
+            .kind = hairpin_kind,
+            .number = @intCast(number),
+            .flags = flags,
+        };
+        open_hairpins[number] = report.hairpin_count;
+        report.hairpin_count += 1;
+        return;
+    }
+
+    const index = open_hairpins[number] orelse {
+        if (std.mem.eql(u8, type_name, "stop")) report.approximations += 1;
+        return;
+    };
+    report.hairpins[index].flags |= flags & (model.hairpin_flag_niente | model.hairpin_flag_dashed | model.hairpin_flag_dotted);
+    report.hairpins[index].spread = @max(report.hairpins[index].spread, spread);
+    if (std.mem.eql(u8, type_name, "stop")) {
+        report.hairpins[index].end_beat = @max(report.hairpins[index].start_beat + 0.001, beat);
+        open_hairpins[number] = null;
+    }
+}
+
+fn appendPedalEvent(report: *ImportReport, start_beat: f32, pedal: u8, value: u8, action: u8, flags: u8) Error!void {
+    if (report.pedal_count == report.pedals.len) return error.TooManyPedals;
     report.pedals[report.pedal_count] = .{
         .start_beat = start_beat,
-        .pedal = model.pedal_sustain,
+        .pedal = pedal,
         .value = value,
         .action = action,
         .flags = flags,
     };
     report.pedal_count += 1;
+}
+
+fn hasPedalSound(source: []const u8) bool {
+    const sound_start = findOpenTag(source, 0, "sound") orelse return false;
+    const sound_end = std.mem.indexOfPos(u8, source, sound_start, ">") orelse return false;
+    const opening = source[sound_start .. sound_end + 1];
+    return attributeValue(opening, "damper-pedal") != null or
+        attributeValue(opening, "sostenuto-pedal") != null or
+        attributeValue(opening, "soft-pedal") != null;
+}
+
+fn pedalSoundValue(opening: []const u8, comptime name: []const u8) ?u8 {
+    const text = attributeValue(opening, name) orelse return null;
+    if (std.mem.eql(u8, text, "yes") or std.mem.eql(u8, text, "true")) return 127;
+    if (std.mem.eql(u8, text, "no") or std.mem.eql(u8, text, "false")) return 0;
+    const percent = std.fmt.parseFloat(f32, text) catch return null;
+    if (!std.math.isFinite(percent) or percent < 0) return null;
+    return @intFromFloat(@round(std.math.clamp(percent, 0, 100) * 127.0 / 100.0));
+}
+
+fn pedalAction(type_name: []const u8) ?u8 {
+    if (std.mem.eql(u8, type_name, "start") or std.mem.eql(u8, type_name, "sostenuto")) return model.pedal_action_start;
+    if (std.mem.eql(u8, type_name, "stop")) return model.pedal_action_stop;
+    if (std.mem.eql(u8, type_name, "change")) return model.pedal_action_change;
+    if (std.mem.eql(u8, type_name, "continue")) return model.pedal_action_continue;
+    if (std.mem.eql(u8, type_name, "resume")) return model.pedal_action_resume;
+    if (std.mem.eql(u8, type_name, "discontinue")) return model.pedal_action_discontinue;
+    return null;
+}
+
+fn inferredPedalAction(previous: u8, value: u8) u8 {
+    if (previous == 0 and value != 0) return model.pedal_action_start;
+    if (previous != 0 and value == 0) return model.pedal_action_stop;
+    return model.pedal_action_change;
+}
+
+fn defaultPedalValue(action: u8, previous: u8) u8 {
+    return switch (action) {
+        model.pedal_action_stop, model.pedal_action_discontinue => 0,
+        model.pedal_action_continue, model.pedal_action_change => if (previous != 0) previous else 127,
+        else => 127,
+    };
+}
+
+fn appendPedals(report: *ImportReport, start_beat: f32, source: []const u8, current_values: *[3]u8, numbered_kinds: *[17]u8) Error!void {
+    var notation_kind: ?u8 = null;
+    var notation_action: ?u8 = null;
+    var notation_flags: u8 = 0;
+    var notation_number: usize = 0;
+
+    if (findOpenTag(source, 0, "pedal")) |pedal_start| {
+        const pedal_end = std.mem.indexOfPos(u8, source, pedal_start, ">") orelse return error.InvalidMusicXml;
+        const opening = source[pedal_start .. pedal_end + 1];
+        const type_name = attributeValue(opening, "type") orelse "";
+        notation_action = pedalAction(type_name);
+        if (attributeIsYes(opening, "line")) notation_flags |= model.pedal_flag_line;
+        if (attributeIsYes(opening, "sign")) notation_flags |= model.pedal_flag_sign;
+        if (attributeValue(opening, "number")) |text| notation_number = @min(16, std.fmt.parseUnsigned(usize, text, 10) catch 0);
+
+        if (std.mem.eql(u8, type_name, "sostenuto")) {
+            notation_kind = model.pedal_sostenuto;
+        } else if (notation_number != 0 and numbered_kinds[notation_number] != 255) {
+            notation_kind = numbered_kinds[notation_number];
+        }
+    }
+
+    var sound_values = [_]?u8{ null, null, null };
+    if (findOpenTag(source, 0, "sound")) |sound_start| {
+        const sound_end = std.mem.indexOfPos(u8, source, sound_start, ">") orelse return error.InvalidMusicXml;
+        const sound = source[sound_start .. sound_end + 1];
+        sound_values[model.pedal_sustain] = pedalSoundValue(sound, "damper-pedal");
+        sound_values[model.pedal_sostenuto] = pedalSoundValue(sound, "sostenuto-pedal");
+        sound_values[model.pedal_soft] = pedalSoundValue(sound, "soft-pedal");
+    }
+
+    if (notation_kind == null) {
+        var sole_kind: ?u8 = null;
+        for (sound_values, 0..) |value, kind| if (value != null) {
+            if (sole_kind != null) {
+                sole_kind = null;
+                break;
+            }
+            sole_kind = @intCast(kind);
+        };
+        notation_kind = sole_kind orelse if (notation_action != null) model.pedal_sustain else null;
+    }
+
+    var emitted = [_]bool{false} ** 3;
+    for (sound_values, 0..) |maybe_value, kind_index| {
+        const value = maybe_value orelse continue;
+        const kind: u8 = @intCast(kind_index);
+        const action = if (notation_kind != null and notation_kind.? == kind and notation_action != null)
+            notation_action.?
+        else
+            inferredPedalAction(current_values[kind_index], value);
+        try appendPedalEvent(report, start_beat, kind, value, action, if (notation_kind != null and notation_kind.? == kind) notation_flags else 0);
+        current_values[kind_index] = value;
+        emitted[kind_index] = true;
+    }
+
+    if (notation_kind) |kind| if (!emitted[kind]) {
+        const action = notation_action orelse return;
+        const value = defaultPedalValue(action, current_values[kind]);
+        try appendPedalEvent(report, start_beat, kind, value, action, notation_flags);
+        current_values[kind] = value;
+    };
+
+    if (notation_number != 0 and notation_kind != null and notation_action != null) {
+        switch (notation_action.?) {
+            model.pedal_action_start, model.pedal_action_resume => numbered_kinds[notation_number] = notation_kind.?,
+            model.pedal_action_stop, model.pedal_action_discontinue => numbered_kinds[notation_number] = 255,
+            else => {},
+        }
+    }
 }
 
 fn attributeIsYes(opening: []const u8, comptime name: []const u8) bool {
@@ -851,12 +1283,72 @@ test "preserves professional note spelling dots beams accidentals and ties" {
     try std.testing.expect((report.notes[1].flags & model.note_flag_tuplet_stop) != 0);
 }
 
+test "preserves common ornaments and directional arpeggiation without approximation" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions></attributes>
+        \\<note><pitch><step>C</step><octave>5</octave></pitch><duration>1</duration><notations><ornaments><trill-mark placement="below"/><turn placement="below"/><inverted-turn/><mordent/><inverted-mordent/></ornaments><arpeggiate direction="down"/></notations></note>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(u32, 0), report.approximations);
+    try std.testing.expectEqual(
+        model.note_notation_ornament_mask | model.note_notation_ornament_below | model.note_notation_arpeggiate | model.note_notation_arpeggiate_down,
+        report.notes[0].notations,
+    );
+}
+
+test "preserves single-note tremolo while reporting another unsupported ornament" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><note><pitch><step>C</step><octave>5</octave></pitch><duration>1</duration><notations><ornaments><shake/><tremolo type="single">3</tremolo></ornaments></notations></note></measure></part>
+        \\</score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(u32, 1), report.approximations);
+    try std.testing.expectEqual(@as(u8, 3), model.singleTremoloMarks(report.notes[0]));
+}
+
+test "reports double-note unmeasured and invalid tremolos explicitly" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions></attributes>
+        \\<note><pitch><step>C</step><octave>5</octave></pitch><duration>1</duration><notations><ornaments><tremolo type="start">2</tremolo></ornaments></notations></note>
+        \\<note><pitch><step>D</step><octave>5</octave></pitch><duration>1</duration><notations><ornaments><tremolo type="unmeasured">0</tremolo></ornaments></notations></note>
+        \\<note><pitch><step>E</step><octave>5</octave></pitch><duration>1</duration><notations><ornaments><tremolo type="single">9</tremolo></ornaments></notations></note>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(u32, 3), report.approximations);
+    for (report.notes[0..report.note_count]) |note| try std.testing.expectEqual(@as(u8, 0), model.singleTremoloMarks(note));
+}
+
+test "imports independently numbered overlapping slurs regardless of attribute order" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions></attributes>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff><notations><slur number="1" placement="above" type="start"/></notations></note>
+        \\<note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff><notations><slur placement="above" type="start" number="2"/></notations></note>
+        \\<note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff><notations><slur type="stop" number="2"/></notations></note>
+        \\<note><pitch><step>F</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><staff>1</staff><notations><slur number="1" type="stop"/></notations></note>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 4), report.note_count);
+    try std.testing.expectEqual(model.slurNumberBit(1), report.notes[0].slur_start_mask);
+    try std.testing.expectEqual(model.slurNumberBit(2), report.notes[1].slur_start_mask);
+    try std.testing.expectEqual(model.slurNumberBit(2), report.notes[2].slur_stop_mask);
+    try std.testing.expectEqual(model.slurNumberBit(1), report.notes[3].slur_stop_mask);
+    try std.testing.expect((report.notes[0].flags & model.note_flag_slur_above) != 0);
+    try std.testing.expect((report.notes[1].flags & model.note_flag_slur_above) != 0);
+}
+
 test "imports timed lyrics and marks named vocal parts as guides" {
     const fixture =
         \\<?xml version="1.0"?>
         \\<score-partwise version="4.0">
         \\<part-list>
-        \\<score-part id="P1"><part-name>Piano</part-name></score-part>
+        \\<score-part id="P1"><part-name>Piano</part-name><midi-instrument><midi-program>1</midi-program></midi-instrument></score-part>
         \\<score-part id="P2"><part-name>Vocal guide</part-name></score-part>
         \\</part-list>
         \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
@@ -872,6 +1364,11 @@ test "imports timed lyrics and marks named vocal parts as guides" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), report.lyrics[0].start_beat, 0.001);
     try std.testing.expectEqualStrings("Some way", report.lyrics[0].textSlice());
     try std.testing.expect((report.notes[1].flags & model.note_flag_vocal_guide) != 0);
+    try std.testing.expectEqual(@as(usize, 2), report.part_count);
+    try std.testing.expectEqualStrings("Piano", report.parts[0].nameSlice());
+    try std.testing.expectEqual(@as(u32, 1), report.parts[0].midi_program);
+    try std.testing.expectEqualStrings("Vocal guide", report.parts[1].nameSlice());
+    try std.testing.expect(report.parts[1].isVocal());
 }
 
 test "semantic note lyrics suppress duplicate direction-word phrases" {
@@ -927,6 +1424,65 @@ test "imports timed MusicXML pedal start change and stop directions" {
     try std.testing.expectEqual(model.pedal_action_stop, report.pedals[1].action);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), report.pedals[2].start_beat, 0.001);
     try std.testing.expectEqual(model.pedal_action_change, report.pedals[2].action);
+}
+
+test "imports numbered MusicXML hairpins across measures with optical metadata" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1">
+        \\<measure number="1"><attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<direction placement="above"><direction-type><wedge type="crescendo" number="2" spread="12" niente="yes" line-type="dashed"/></direction-type><staff>2</staff></direction>
+        \\<note><pitch><step>C</step><octave>3</octave></pitch><duration>4</duration><staff>2</staff></note></measure>
+        \\<measure number="2"><direction placement="above"><direction-type><wedge type="stop" number="2" spread="18" line-type="dashed"/></direction-type><offset>2</offset><staff>2</staff></direction>
+        \\<note><pitch><step>D</step><octave>3</octave></pitch><duration>4</duration><staff>2</staff></note></measure>
+        \\</part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 1), report.hairpin_count);
+    const hairpin = report.hairpins[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 0), hairpin.start_beat, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.5), hairpin.end_beat, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), hairpin.spread, 0.001);
+    try std.testing.expectEqual(model.hairpin_crescendo, hairpin.kind);
+    try std.testing.expectEqual(@as(u8, 2), hairpin.number);
+    try std.testing.expectEqual(@as(u8, 1), hairpin.staff % model.staff_slots_per_part);
+    try std.testing.expect((hairpin.flags & model.hairpin_flag_above) != 0);
+    try std.testing.expect((hairpin.flags & model.hairpin_flag_niente) != 0);
+    try std.testing.expect((hairpin.flags & model.hairpin_flag_dashed) != 0);
+}
+
+test "imports semantic sostenuto soft and continuous three-pedal sound positions" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration></note>
+        \\<direction placement="below"><direction-type><words font-style="italic">una corda</words></direction-type><sound soft-pedal="50"/></direction>
+        \\<direction placement="below"><direction-type><pedal type="sostenuto" number="2" line="yes"/></direction-type><sound sostenuto-pedal="yes"/></direction>
+        \\<note><pitch><step>E</step><octave>4</octave></pitch><duration>4</duration></note>
+        \\<direction placement="below"><direction-type><other-direction print-object="no">soft pedal curve</other-direction></direction-type><sound soft-pedal="75"/></direction>
+        \\<direction placement="below"><direction-type><pedal type="stop" number="2" line="yes"/></direction-type></direction>
+        \\<note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration></note>
+        \\<direction placement="below"><direction-type><words font-style="italic">tre corde</words></direction-type><sound soft-pedal="no"/></direction>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 5), report.pedal_count);
+    try std.testing.expectEqual(model.pedal_sostenuto, report.pedals[0].pedal);
+    try std.testing.expectEqual(model.pedal_action_start, report.pedals[0].action);
+    try std.testing.expectEqual(@as(u8, 127), report.pedals[0].value);
+    try std.testing.expect((report.pedals[0].flags & model.pedal_flag_line) != 0);
+    try std.testing.expectEqual(model.pedal_soft, report.pedals[1].pedal);
+    try std.testing.expectEqual(model.pedal_action_start, report.pedals[1].action);
+    try std.testing.expectEqual(@as(u8, 64), report.pedals[1].value);
+    try std.testing.expectEqual(model.pedal_sostenuto, report.pedals[2].pedal);
+    try std.testing.expectEqual(model.pedal_action_stop, report.pedals[2].action);
+    try std.testing.expectEqual(@as(u8, 0), report.pedals[2].value);
+    try std.testing.expectEqual(model.pedal_soft, report.pedals[3].pedal);
+    try std.testing.expectEqual(model.pedal_action_change, report.pedals[3].action);
+    try std.testing.expectEqual(@as(u8, 95), report.pedals[3].value);
+    try std.testing.expectEqual(model.pedal_soft, report.pedals[4].pedal);
+    try std.testing.expectEqual(model.pedal_action_stop, report.pedals[4].action);
+    try std.testing.expectEqual(@as(u8, 0), report.pedals[4].value);
 }
 
 test "MusicXML backup voices and multiple parts share musical time" {
@@ -1012,4 +1568,67 @@ test "implicit pickup advances by encoded extent" {
     try std.testing.expectEqual(@as(u8, 1), report.measures[0].implicit);
     try std.testing.expectEqual(@as(f32, 1), report.measures[0].duration_beats);
     try std.testing.expectEqual(@as(f32, 1), report.measures[1].start_beat);
+}
+
+test "imports forward and counted backward repeat barlines" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list>
+        \\<score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1">
+        \\<measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<barline location="left"><repeat direction="forward"/></barline>
+        \\<note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration></note></measure>
+        \\<measure number="2"><note><pitch><step>D</step><octave>4</octave></pitch><duration>4</duration></note>
+        \\<barline location="right"><repeat direction="backward" times="3"/></barline></measure>
+        \\</part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(usize, 2), report.measure_count);
+    try std.testing.expect(report.measures[0].hasForwardRepeat());
+    try std.testing.expect(!report.measures[0].hasBackwardRepeat());
+    try std.testing.expect(report.measures[1].hasBackwardRepeat());
+    try std.testing.expectEqual(@as(u8, 3), report.measures[1].repeatPasses());
+}
+
+test "imports numbered alternate endings without approximation" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list>
+        \\<score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1">
+        \\<measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+        \\<barline location="left"><repeat direction="forward"/></barline><note><rest/><duration>4</duration></note></measure>
+        \\<measure number="2"><note><rest/><duration>4</duration></note></measure>
+        \\<measure number="3"><barline location="left"><ending number="1" type="start">1.</ending></barline><note><rest/><duration>4</duration></note>
+        \\<barline location="right"><ending number="1" type="stop"/><repeat direction="backward"/></barline></measure>
+        \\<measure number="4"><barline location="left"><ending number="2" type="start">2.</ending></barline><note><rest/><duration>4</duration></note>
+        \\<barline location="right"><ending number="2" type="discontinue"/></barline></measure>
+        \\</part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(u32, 0), report.approximations);
+    try std.testing.expectEqual(@as(usize, 4), report.measure_count);
+    try std.testing.expectEqual(@as(u16, 1), report.measures[2].ending_mask);
+    try std.testing.expect(report.measures[2].endingStarts());
+    try std.testing.expect(report.measures[2].endingStops());
+    try std.testing.expectEqual(@as(u16, 2), report.measures[3].ending_mask);
+    try std.testing.expect((report.measures[3].ending_flags & model.measure_ending_discontinue) != 0);
+}
+
+test "imports performed grace attributes without consuming metric time" {
+    const fixture =
+        \\<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>4</divisions></attributes>
+        \\<note><grace slash="yes" steal-time-following="33"/><pitch><step>D</step><octave>5</octave></pitch><voice>1</voice><type>eighth</type></note>
+        \\<note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><voice>1</voice></note>
+        \\</measure></part></score-partwise>
+    ;
+    const report = try parse(fixture);
+    try std.testing.expectEqual(@as(u32, 0), report.approximations);
+    try std.testing.expectEqual(@as(usize, 2), report.note_count);
+    try std.testing.expect((report.notes[0].flags & model.note_flag_grace) != 0);
+    try std.testing.expect((report.notes[0].notations & model.note_notation_grace_slash) != 0);
+    try std.testing.expectEqual(@as(u8, 33), model.graceFollowingPercent(report.notes[0]));
+    try std.testing.expectEqual(@as(f32, 0), report.notes[0].start_beat);
+    try std.testing.expectEqual(@as(f32, 0), report.notes[1].start_beat);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), report.notes[1].duration_beats, 0.001);
 }

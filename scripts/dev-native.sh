@@ -36,7 +36,7 @@ while true; do
     # independently from the executable. Rebuild and relaunch them together;
     # this prevents a new glyph UV table from sampling an old Metal texture.
     (
-        find src/platform/native src/audio src/render src/hot_reload -type f ! -path src/render/shaders/ui.wgsl
+        find src/platform/native src/platform/apple src/audio src/render src/hot_reload -type f ! -path src/render/shaders/ui.wgsl
         find src/core -type f ! -path src/core/ui.zig
         printf '%s\n' build.zig
     ) | sort | entr -np sh -c "printf restart > '$restart_marker'; kill -TERM '$score_app_pid'" &

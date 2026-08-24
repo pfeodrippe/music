@@ -33,6 +33,8 @@ xcrun --sdk "$score_ios_sdk_name" metallib \
 
 cp src/platform/apple/ios/Info.plist "$score_ios_app/Info.plist"
 cp src/platform/web/icons/score-icon-1024.png "$score_ios_app/AppIcon.png"
+cp .zig-cache/portable/accurate-salamander-grand.scorebank "$score_ios_app/portable-grand.scorebank"
+cp local-content/instruments/AccurateSalamanderGrandPianoV6.2beta2/README.txt "$score_ios_app/ACCURATE_SALAMANDER_LICENSE.txt"
 plutil -lint "$score_ios_app/Info.plist"
 
 xcrun --sdk "$score_ios_sdk_name" swiftc \

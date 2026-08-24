@@ -23,7 +23,10 @@ pub const pitch = @import("audio/pitch.zig");
 pub const wav = @import("audio/wav.zig");
 pub const transcribe = @import("audio/transcribe.zig");
 pub const instrument = @import("audio/instrument.zig");
+pub const audio_schedule = @import("audio/schedule.zig");
 pub const audio_quality = @import("audio/quality.zig");
+pub const audio_effects = @import("audio/effects.zig");
+pub const sample_bank = @import("audio/sample_bank.zig");
 
 test {
     _ = @import("core/app.zig");
@@ -50,5 +53,8 @@ test {
     _ = @import("audio/wav.zig");
     _ = @import("audio/transcribe.zig");
     _ = @import("audio/instrument.zig");
+    _ = @import("audio/schedule.zig");
     _ = @import("audio/quality.zig");
+    _ = @import("audio/effects.zig");
+    _ = @import("audio/sample_bank.zig");
 }

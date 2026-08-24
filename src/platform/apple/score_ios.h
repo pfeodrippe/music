@@ -29,6 +29,10 @@ typedef struct ScoreAccessibilityItem {
 } ScoreAccessibilityItem;
 
 uint32_t score_ios_api_version(void);
+uint32_t score_ios_audio_load_bank(const uint8_t *bytes, size_t length);
+void score_ios_audio_event(uint8_t pitch, uint8_t velocity, uint8_t channel, uint8_t on);
+void score_ios_audio_midi(uint8_t status, uint8_t data1, uint8_t data2);
+void score_ios_audio_render(float *left, float *right, size_t frame_count, float sample_rate);
 bool score_ios_create(float width, float height, float pixel_ratio);
 void score_ios_destroy(void);
 void score_ios_frame(float delta_seconds);
@@ -52,6 +56,7 @@ size_t score_ios_drain_playback(ScorePlaybackEvent *events, size_t capacity);
 uint32_t score_ios_import(const uint8_t *bytes, size_t length, uint32_t kind);
 size_t score_ios_serialize(uint8_t *bytes, size_t capacity);
 size_t score_ios_export_musicxml(uint8_t *bytes, size_t capacity);
+size_t score_ios_export_take_midi(uint8_t *bytes, size_t capacity);
 uint32_t score_ios_restore(const uint8_t *bytes, size_t length);
 
 #endif

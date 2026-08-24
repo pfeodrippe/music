@@ -42,6 +42,8 @@ pub const Id = struct {
     pub const zoom_down: u32 = 28;
     pub const zoom_up: u32 = 29;
     pub const focus_score: u32 = 30;
+    pub const instrument_part: u32 = 31;
+    pub const sampler_instrument: u32 = 32;
 };
 
 pub const Item = extern struct {
@@ -69,14 +71,26 @@ pub const Snapshot = struct {
             self.add(Id.library_close, .button, layout.library_close, "Close score library", 0);
             self.add(Id.library_first, .button, layout.library_items[0], "Open Minuet in G major by J. S. Bach", 0);
             self.add(Id.library_first + 1, .button, layout.library_items[1], "Open Fur Elise by Ludwig van Beethoven", 0);
+            self.add(Id.library_first + 2, .button, layout.library_items[2], "Open Flowing 6/4 Piano Lab tutorial", 0);
             return;
         }
         if (layout.library_trigger.width > 0) self.add(Id.library, .button, layout.library_trigger, "Open score library", 0);
-        if (layout.input_quick.width > 0) {
-            self.add(Id.input, .button, layout.input_quick, "Set up music input", 0);
-        } else if (layout.input_setup.width > 0) {
-            self.add(Id.input, .button, layout.input_setup, "Set up music input", 0);
+        if (layout.part_selector.width > 0 and @popCount(state.instrument_part_mask) > 1) {
+            var label_buffer: [48]u8 = undefined;
+            const label = @import("std").fmt.bufPrint(&label_buffer, "Show next part; {s}, {d} of {d} selected", .{ state.selectedPartLabel(), model.instrumentPartOrdinal(state.instrument_part_mask, state.selected_part), @popCount(state.instrument_part_mask) }) catch "Show next instrumental part";
+            self.add(Id.instrument_part, .button, layout.part_selector, label, 0);
         }
+        var input_label_buffer: [96]u8 = undefined;
+        const input_label = if (state.input_source == .none)
+            "Set up music input"
+        else
+            @import("std").fmt.bufPrint(&input_label_buffer, "Change music input; current {s}", .{state.inputLabel()}) catch "Change music input";
+        if (layout.input_quick.width > 0) {
+            self.add(Id.input, .button, layout.input_quick, input_label, 0);
+        } else if (layout.input_setup.width > 0) {
+            self.add(Id.input, .button, layout.input_setup, input_label, 0);
+        }
+        if (layout.instrument_setup.width > 0) self.add(Id.sampler_instrument, .button, layout.instrument_setup, "Load SFZ instrument", 0);
         self.add(Id.save, .button, layout.export_score, "Export score, PDF, or MIDI", 0);
         self.add(Id.import_score, .button, layout.import_score, "Import score", 0);
         self.add(Id.record, .button, layout.record, if (transport.recording != 0) "Stop recording" else "Start recording", Flag.toggle | (if (transport.recording != 0) Flag.pressed else 0));
@@ -93,8 +107,7 @@ pub const Snapshot = struct {
         self.add(Id.tempo_value, .button, layout.tempo_value, if (state.tempo_editing != 0) "Editing tempo; type 30 to 240 and press Enter" else "Edit tempo", 0);
         if (layout.view_mode_toggle.width > 0) self.add(Id.view_mode, .button, layout.view_mode_toggle, switch (state.score_view_mode) {
             .paged => "Use continuous score view",
-            .continuous => "Use two-page score view",
-            .spread => "Use paged score view",
+            .continuous => "Use paged score view",
         }, 0);
         if (layout.zoom_minus.width > 0) {
             self.add(Id.zoom_down, .button, layout.zoom_minus, "Zoom score out", 0);
@@ -139,12 +152,25 @@ test "accessibility snapshot mirrors responsive GPU controls" {
     try @import("std").testing.expectEqualStrings("Accessible score", snapshot.items[0].labelSlice());
     var found_previous_page = false;
     var found_next_page = false;
+    var found_paged_switch = false;
+    var found_sampler_instrument = false;
     for (snapshot.items[0..snapshot.len]) |item| {
         found_previous_page = found_previous_page or item.id == Id.page_previous;
         found_next_page = found_next_page or item.id == Id.page_next;
+        found_paged_switch = found_paged_switch or (item.id == Id.view_mode and @import("std").mem.eql(u8, item.labelSlice(), "Use continuous score view"));
+        found_sampler_instrument = found_sampler_instrument or item.id == Id.sampler_instrument;
     }
     try @import("std").testing.expect(found_previous_page);
     try @import("std").testing.expect(found_next_page);
+    try @import("std").testing.expect(found_paged_switch);
+    try @import("std").testing.expect(found_sampler_instrument);
+    state.score_view_mode = .continuous;
+    snapshot.build(&state, &transport, &meta);
+    var found_continuous_switch = false;
+    for (snapshot.items[0..snapshot.len]) |item| {
+        found_continuous_switch = found_continuous_switch or (item.id == Id.view_mode and @import("std").mem.eql(u8, item.labelSlice(), "Use paged score view"));
+    }
+    try @import("std").testing.expect(found_continuous_switch);
     state.viewport_width = 390;
     snapshot.build(&state, &transport, &meta);
     try @import("std").testing.expect(snapshot.len >= 8);

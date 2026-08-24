@@ -7,16 +7,24 @@ pub const BackendKind = enum(u32) {
 };
 
 pub const HostRequest = enum(u32) {
-    none,
-    open_score,
-    choose_midi,
-    choose_microphone,
-    export_score,
-    export_take,
-    start_recording,
-    stop_recording,
-    replay_take,
+    none = 0,
+    open_score = 1,
+    choose_midi = 2,
+    choose_microphone = 3,
+    export_score = 4,
+    export_take = 5,
+    start_recording = 6,
+    stop_recording = 7,
+    replay_take = 8,
+    open_instrument = 9,
 };
+
+test "portable host request ABI stays stable" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(@as(u32, 5), @intFromEnum(HostRequest.export_take));
+    try testing.expectEqual(@as(u32, 6), @intFromEnum(HostRequest.start_recording));
+    try testing.expectEqual(@as(u32, 9), @intFromEnum(HostRequest.open_instrument));
+}
 
 pub const PointerKind = enum(u32) { move, down, up, cancel, scroll };
 pub const PointerType = enum(u32) { mouse, pen, touch };

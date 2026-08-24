@@ -20,16 +20,32 @@ pub const Timeline = struct {
         var timeline: Timeline = .{};
         for (notes) |note| {
             if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
+            const performed = model.performedNoteRange(notes, note);
+            const tremolo_marks = model.singleTremoloMarks(note);
+            if (tremolo_marks != 0) {
+                const interval = model.singleTremoloInterval(note);
+                const attack_count = model.singleTremoloAttackCount(note, performed.end - performed.start);
+                if (timeline.len + attack_count * 2 > max_events) return error.TooManyPlaybackEvents;
+                for (0..attack_count) |attack_index| {
+                    const attack_start = performed.start + @as(f32, @floatFromInt(attack_index)) * interval;
+                    if (attack_start >= performed.end - 0.0001) break;
+                    const attack_end = @min(performed.end, attack_start + interval * 0.86);
+                    timeline.events[timeline.len] = .{ .beat = attack_start, .pitch = note.pitch, .velocity = note.velocity, .channel = note.voice, .on = 1, .stable_note_id = note.stable_id };
+                    timeline.events[timeline.len + 1] = .{ .beat = @max(attack_start + 0.005, attack_end), .pitch = note.pitch, .velocity = 0, .channel = note.voice, .on = 0, .stable_note_id = note.stable_id };
+                    timeline.len += 2;
+                }
+                continue;
+            }
             const continue_from_previous = (note.flags & model.note_flag_tie_stop) != 0 and hasConnectedTie(notes, note, false);
             const continue_into_next = (note.flags & model.note_flag_tie_start) != 0 and hasConnectedTie(notes, note, true);
             const required = @as(usize, @intFromBool(!continue_from_previous)) + @as(usize, @intFromBool(!continue_into_next));
             if (timeline.len + required > max_events) return error.TooManyPlaybackEvents;
             if (!continue_from_previous) {
-                timeline.events[timeline.len] = .{ .beat = note.start_beat, .pitch = note.pitch, .velocity = note.velocity, .channel = note.voice, .on = 1, .stable_note_id = note.stable_id };
+                timeline.events[timeline.len] = .{ .beat = performed.start, .pitch = note.pitch, .velocity = note.velocity, .channel = note.voice, .on = 1, .stable_note_id = note.stable_id };
                 timeline.len += 1;
             }
             if (!continue_into_next) {
-                timeline.events[timeline.len] = .{ .beat = note.start_beat + note.duration_beats, .pitch = note.pitch, .velocity = 0, .channel = note.voice, .on = 0, .stable_note_id = note.stable_id };
+                timeline.events[timeline.len] = .{ .beat = performed.end, .pitch = note.pitch, .velocity = 0, .channel = note.voice, .on = 0, .stable_note_id = note.stable_id };
                 timeline.len += 1;
             }
         }
@@ -62,6 +78,13 @@ pub const HostEvent = extern struct {
     velocity: u8,
     channel: u8,
     on: u8,
+};
+
+/// Native hosts use the scheduling metadata; portable ABI drains intentionally
+/// expose only `HostEvent`, keeping the current Wasm/iOS four-byte event ABI.
+pub const ScheduledHostEvent = struct {
+    event: HostEvent,
+    delay_seconds: f32 = 0,
 };
 
 test "playback orders note-off before the next note-on" {
@@ -116,4 +139,40 @@ test "dangling tie marks cannot leave playback notes stuck" {
     try std.testing.expectEqual(@as(usize, 2), timeline.len);
     try std.testing.expectEqual(@as(u8, 1), timeline.events[0].on);
     try std.testing.expectEqual(@as(u8, 0), timeline.events[1].on);
+}
+
+test "native timeline performs an appoggiatura instead of a chord" {
+    const notes = [_]model.Note{
+        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 0.125, .pitch = 62, .velocity = 72, .staff = 0, .voice = 0, .flags = model.note_flag_grace, .notations = model.withGraceTiming(0, false, 25, 0, false) },
+        .{ .stable_id = 2, .start_beat = 0, .duration_beats = 1, .pitch = 64, .velocity = 84, .staff = 0, .voice = 0 },
+    };
+    const timeline = try Timeline.build(&notes);
+    try std.testing.expectEqual(@as(usize, 4), timeline.len);
+    try std.testing.expectEqual(@as(u8, 62), timeline.events[0].pitch);
+    try std.testing.expectEqual(@as(u8, 1), timeline.events[0].on);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), timeline.events[0].beat, 0.0001);
+    try std.testing.expectEqual(@as(u8, 62), timeline.events[1].pitch);
+    try std.testing.expectEqual(@as(u8, 0), timeline.events[1].on);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), timeline.events[1].beat, 0.0001);
+    try std.testing.expectEqual(@as(u8, 64), timeline.events[2].pitch);
+    try std.testing.expectEqual(@as(u8, 1), timeline.events[2].on);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), timeline.events[2].beat, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), timeline.events[3].beat, 0.0001);
+}
+
+test "native timeline performs a three-mark single-note tremolo as 32nd attacks" {
+    const notes = [_]model.Note{
+        .{ .stable_id = 1, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 86, .staff = 0, .voice = 0, .notations = model.withSingleTremolo(0, 3) },
+    };
+    const timeline = try Timeline.build(&notes);
+    try std.testing.expectEqual(@as(usize, 16), timeline.len);
+    for (0..8) |index| {
+        const attack = timeline.events[index * 2];
+        const release = timeline.events[index * 2 + 1];
+        try std.testing.expectEqual(@as(u8, 1), attack.on);
+        try std.testing.expectEqual(@as(u8, 0), release.on);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index)) * 0.125, attack.beat, 0.0001);
+        try std.testing.expect(release.beat > attack.beat);
+        try std.testing.expect(release.beat < attack.beat + 0.125);
+    }
 }

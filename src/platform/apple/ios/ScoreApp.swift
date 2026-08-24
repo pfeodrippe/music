@@ -92,12 +92,14 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         case 3:
             audio.enableMicrophone { ready in score_ios_set_host_status(ready ? 4 : 5) }
         case 4: presentExporter()
-        case 5:
-            audio.startRecording(to: takeURL) { ready in score_ios_set_host_status(ready ? 4 : 5) }
+        case 5: presentTakeExporter()
         case 6:
+            audio.startRecording(to: takeURL) { ready in score_ios_set_host_status(ready ? 4 : 5) }
+        case 7:
             audio.stopRecording()
             score_ios_set_host_status(6)
-        case 7: audio.replay(takeURL)
+        case 8: audio.replay(takeURL)
+        case 9: presentInstrumentImporter()
         default: break
         }
     }
@@ -106,6 +108,14 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         let identifiers = ["musicxml", "xml", "mxl", "mid", "midi", "score"]
         let types = identifiers.compactMap { UTType(filenameExtension: $0) }
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: types.isEmpty ? [.data] : types, asCopy: true)
+        picker.delegate = self
+        picker.allowsMultipleSelection = false
+        present(picker, animated: true)
+    }
+
+    private func presentInstrumentImporter() {
+        let type = UTType(filenameExtension: "scorebank") ?? .data
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [type], asCopy: true)
         picker.delegate = self
         picker.allowsMultipleSelection = false
         present(picker, animated: true)
@@ -125,9 +135,27 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         }
     }
 
+    private func presentTakeExporter() {
+        guard let data = exportTakeMidi() else { score_ios_set_host_status(3); return }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("score-take.mid")
+        do {
+            try data.write(to: url, options: .atomic)
+            let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+            picker.delegate = self
+            present(picker, animated: true)
+            score_ios_set_host_status(8)
+        } catch {
+            score_ios_set_host_status(3)
+        }
+    }
+
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard let url = urls.first, let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
             score_ios_set_host_status(3)
+            return
+        }
+        if url.pathExtension.lowercased() == "scorebank" {
+            score_ios_set_host_status(audio.loadBank(data) ? 13 : 14)
             return
         }
         let kind: UInt32
@@ -159,6 +187,17 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         let length = data.withUnsafeMutableBytes { raw -> Int in
             guard let pointer = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
             return score_ios_export_musicxml(pointer, raw.count)
+        }
+        guard length > 0 else { return nil }
+        data.removeSubrange(length..<data.count)
+        return data
+    }
+
+    private func exportTakeMidi() -> Data? {
+        var data = Data(count: 4 * 1024 * 1024)
+        let length = data.withUnsafeMutableBytes { raw -> Int in
+            guard let pointer = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return score_ios_export_take_midi(pointer, raw.count)
         }
         guard length > 0 else { return nil }
         data.removeSubrange(length..<data.count)

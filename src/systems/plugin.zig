@@ -15,7 +15,7 @@ const development_plugin = hot.PluginDescriptor{
     // Bump whenever the reloadable systems/screen-composition module changes;
     // the host logs and validates the newly loaded descriptor without moving
     // the Flecs world or GPU resources out of the long-lived executable.
-    .generation = 13,
+    .generation = 22,
     .glyph_atlas_hash = glyph_atlas.content_hash,
     .systems = &all_systems,
     .system_count = all_systems.len,
@@ -32,10 +32,11 @@ fn drawFrame(context: *hot.FrameContext) callconv(.c) void {
     const notes: [*]const model.Note = @ptrCast(@alignCast(context.notes));
     const lyrics: [*]const model.Lyric = @ptrCast(@alignCast(context.lyrics));
     const harmonies: [*]const model.Harmony = @ptrCast(@alignCast(context.harmonies));
+    const hairpins: [*]const model.Hairpin = @ptrCast(@alignCast(context.hairpins));
     const pedals: [*]const model.PedalEvent = @ptrCast(@alignCast(context.pedals));
     const measures: [*]const model.Measure = @ptrCast(@alignCast(context.measures));
     const annotations: *const annotation.Store = @ptrCast(@alignCast(context.annotations));
-    ui.draw(packet, state, transport_state, practice_state, meta, notes[0..context.note_count], lyrics[0..context.lyric_count], harmonies[0..context.harmony_count], pedals[0..context.pedal_count], measures[0..context.measure_count], annotations, context.time_seconds);
+    ui.draw(packet, state, transport_state, practice_state, meta, notes[0..context.note_count], lyrics[0..context.lyric_count], harmonies[0..context.harmony_count], hairpins[0..context.hairpin_count], pedals[0..context.pedal_count], measures[0..context.measure_count], annotations, context.time_seconds);
 }
 
 /// This hook is compiled into the replaceable dylib. Add short-lived

@@ -2,15 +2,61 @@ const std = @import("std");
 const score = @import("score");
 
 var app: ?*score.App = null;
+var audio_piano: score.sample_bank.Piano = .{};
+var audio_bank_storage: ?[]u8 = null;
 
 pub export fn score_ios_api_version() u32 {
-    return 2;
+    return 3;
 }
 
 pub export fn score_ios_create(width: f32, height: f32, pixel_ratio: f32) bool {
     if (app != null) return true;
     app = score.App.create(std.heap.c_allocator, width, height, pixel_ratio) catch return false;
+    if (audio_piano.isLoaded()) app.?.setSamplerStatus(1, "Accurate Salamander Grand", @intCast(audio_piano.regionCount()), audio_piano.sampleCount());
     return true;
+}
+
+pub export fn score_ios_audio_load_bank(bytes: [*]const u8, length: usize) u32 {
+    if (length == 0 or length > score.sample_bank.max_bank_bytes) return 1;
+    const replacement = std.heap.c_allocator.alloc(u8, length) catch return 2;
+    @memcpy(replacement, bytes[0..length]);
+    _ = score.sample_bank.View.open(replacement) catch {
+        std.heap.c_allocator.free(replacement);
+        return 3;
+    };
+    audio_piano.unload();
+    if (audio_bank_storage) |previous| std.heap.c_allocator.free(previous);
+    audio_bank_storage = replacement;
+    audio_piano.load(replacement) catch unreachable;
+    if (app) |instance| instance.setSamplerStatus(1, "Accurate Salamander Grand", @intCast(audio_piano.regionCount()), audio_piano.sampleCount());
+    return 0;
+}
+
+pub export fn score_ios_audio_event(pitch: u8, velocity: u8, channel: u8, on: u8) void {
+    switch (on) {
+        0 => audio_piano.noteOff(channel, pitch),
+        1 => audio_piano.noteOn(channel, pitch, velocity),
+        2 => audio_piano.allNotesOff(),
+        3 => audio_piano.click(velocity >= 120),
+        4 => audio_piano.controlChange(channel, pitch, velocity),
+        else => {},
+    }
+}
+
+pub export fn score_ios_audio_midi(status: u8, data1: u8, data2: u8) void {
+    const message = status & 0xf0;
+    const channel = status & 0x0f;
+    if (message == 0x90 and data2 != 0) {
+        audio_piano.noteOn(channel, data1, data2);
+    } else if (message == 0x80 or (message == 0x90 and data2 == 0)) {
+        audio_piano.noteOff(channel, data1);
+    } else if (message == 0xb0) {
+        audio_piano.controlChange(channel, data1, data2);
+    }
+}
+
+pub export fn score_ios_audio_render(left: [*]f32, right: [*]f32, frame_count: usize, sample_rate: f32) void {
+    audio_piano.renderStereo(left[0..frame_count], right[0..frame_count], sample_rate);
 }
 
 pub export fn score_ios_destroy() void {
@@ -136,6 +182,11 @@ pub export fn score_ios_serialize(bytes: [*]u8, capacity: usize) usize {
 pub export fn score_ios_export_musicxml(bytes: [*]u8, capacity: usize) usize {
     const instance = app orelse return 0;
     return instance.exportMusicXml(bytes[0..capacity]) catch 0;
+}
+
+pub export fn score_ios_export_take_midi(bytes: [*]u8, capacity: usize) usize {
+    const instance = app orelse return 0;
+    return instance.exportTakeMidi(bytes[0..capacity]) catch 0;
 }
 
 pub export fn score_ios_restore(bytes: [*]const u8, length: usize) u32 {

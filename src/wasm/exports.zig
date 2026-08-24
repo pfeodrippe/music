@@ -63,6 +63,10 @@ pub export fn score_host_status(status: u32) void {
     if (app) |instance| instance.setHostStatus(status);
 }
 
+pub export fn score_host_sampler_status(status: u32, regions: u32, samples: u32) void {
+    if (app) |instance| instance.setSamplerStatus(status, if (status == 1) "Accurate Salamander Grand" else "Portable piano unavailable", regions, samples);
+}
+
 pub export fn score_drain_playback(pointer: [*]score.playback.HostEvent, capacity: usize) usize {
     const instance = app orelse return 0;
     return instance.drainPlaybackEvents(pointer[0..capacity]);
@@ -139,6 +143,11 @@ pub export fn score_serialize(pointer: [*]u8, capacity: usize) usize {
 pub export fn score_export_musicxml(pointer: [*]u8, capacity: usize) usize {
     const instance = app orelse return 0;
     return instance.exportMusicXml(pointer[0..capacity]) catch 0;
+}
+
+pub export fn score_export_take_midi(pointer: [*]u8, capacity: usize) usize {
+    const instance = app orelse return 0;
+    return instance.exportTakeMidi(pointer[0..capacity]) catch 0;
 }
 
 pub export fn score_restore(pointer: [*]const u8, length: usize) u32 {

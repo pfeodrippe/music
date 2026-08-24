@@ -1,16 +1,20 @@
 # Cross-Platform GPU Music Application — Implementation
 
-> Current correction (2026-08-23): the private study score and native
+> Current correction (2026-08-24): the private study score and native
 > transport use **quarter-note = 147**. All historical statements below that
 > report eighth=147 / 73.5 quarter-QPM playback are superseded and require a
 > fresh musical QA pass. Repository score tooling is now consolidated in the
-> Zig `score-workbench`; the former Python pipeline is retired.
+> Zig `score-workbench`; the former Python pipeline is retired. The user has
+> accepted the current private score as the frozen practice baseline, so older
+> `REVIEW_REQUIRED` narrative is provenance rather than an active transcription
+> gate unless that decision is explicitly reopened.
 
-Status: native macOS implementation under active completion and verification;
-WebGPU/Wasm and iOS/iPadOS ports exist but are intentionally deferred until the
-native release gate is clear
+Status: native macOS release candidate verified; WebGPU/Wasm and iPadOS/Metal
+builds use the shared Zig/Flecs UI and sampled-piano core and pass browser/iPad
+simulator smoke tests. Physical MIDI/microphone, VoiceOver, listening, and
+120-Hz iPad hardware acceptance remain device-lab work.
 
-Updated: 2026-08-23
+Updated: 2026-08-24
 
 Working name: **Score** (replace before public release)
 
@@ -32,6 +36,18 @@ This document started as the architecture plan and now also records the working 
   when only one side of the hot-module boundary changed. Debug builds can
   capture the real Dawn/Metal framebuffer for repeatable visual QA.
 - A signed macOS `.app` using Dawn/Metal, CoreAudio/AudioUnit, CoreMIDI, AudioQueue microphone capture, native import/export panels, app-support autosave, and WAV take replay.
+- A shared path-free `.scorebank` and allocation-free 128-layer-voice Zig piano
+  callback used by the browser AudioWorklet and iOS AVAudioSourceNode. The
+  bundled licensed Salamander derivative contains 353 deduplicated PCM16
+  samples and 931 regions in 135.3 MiB: 704 attack regions (all 88 keys ×
+  eight recorded velocity layers), 68 sampled damper releases for the damped
+  keys, 88 per-key hammer releases, 69 authored pedal-resonance regions, and
+  recorded pedal-down/up mechanisms. It implements pitch/sample-rate
+  conversion, equal-power interpolation between adjacent recorded velocity
+  layers, priority-aware de-clicked voice stealing, stereo key position,
+  sustain/half-pedal release, repedaling, sostenuto, una corda, room
+  response, DC rejection, and linked limiting; a deterministic offline gate
+  checks finite output, clipping, attack, dynamics, sustain, and safety.
 - Debug/native recovery uses a separate atomic `autosave-dev.score` journal:
   it survives a hot-reload host relaunch without racing older release windows.
   Debug-control imports synchronously replace that atomic journal before the
@@ -403,15 +419,17 @@ This document started as the architecture plan and now also records the working 
 - A core-owned semantic accessibility snapshot mirrored through NSAccessibility on macOS, hidden semantic DOM controls in the browser, and UIAccessibilityElement on iOS/iPadOS. Actions route back through the same Zig hit-testing path as pointer input.
 - Native, web, and iOS build gates plus portable unit/integration tests and a pinned macOS CI workflow.
 
-Release gaps are explicit rather than silently approximated: professional
-multi-voice/optical engraving, print layout, the deferred iOS Metal
-shader-reload equivalent, final editor/practice hardware QA,
-production concert-grand quality, PDF page import/annotation, text/lasso
+Release gaps are explicit rather than silently approximated: further
+professional optical-engraving breadth, the iOS Metal shader-reload equivalent,
+final editor/practice hardware QA, advanced multi-mic concert-grand acoustics,
+PDF page import/annotation, text/lasso
 annotation tools, optional cloud sync, App Store provisioning, and production
 content licensing remain open. The code must not describe those items as
 complete until their acceptance tests pass.
 
-The private, gitignored Holocene fixture is also explicitly incomplete. Its
+The private, gitignored Holocene fixture is accepted as the current practice
+baseline by explicit user direction, not represented as an authoritative
+published transcription. Its
 12-page OMR-derived core plus a separately gated repeated-finale extension are
 useful for exercising import and playback,
 and its meter/cursor structure now passes with zero structural issues. That
@@ -1248,7 +1266,8 @@ substitute for rights to the musical work.
 - Define the renderer around a Zig-owned WebGPU-shaped facade. The browser host binds it to Emdawnwebgpu; native hosts bind the same contract to Dawn/Metal/Vulkan/D3D12 as appropriate.
 - Run Zig tests natively for speed and run the same portable core tests against Wasm in browsers.
 
-The installed Zig is already 0.16.0. Xcode is no longer a browser build dependency. It becomes relevant only when a future iOS/macOS host is added.
+The installed Zig is 0.16.0. Xcode is not a browser build dependency; it is used
+only by the existing macOS/iOS platform packaging and signing paths.
 
 ### 3.2 Portable core and thin hosts
 
@@ -1348,8 +1367,8 @@ stealing hot-reload control from the watched native session.
   world, show a GPU notice, and expose exact diagnostics through
   `score-devctl shader state`. Release builds retain only the embedded shader.
 - GPU resources are addressed by stable logical handles and restored/rebound
-  after renderer or shader reloads. The equivalent iOS Metal development path
-  remains deferred until the native macOS release gate clears.
+  after renderer or shader reloads. iOS consumes the same static render packet;
+  an equivalent live Metal shader-reload host remains future development work.
 - Release builds import the same module descriptors statically. The watcher,
   dynamic-library loader, control socket, developer overlay, and migration
   diagnostics are removed, and Zig links the application into one platform
@@ -1358,8 +1377,10 @@ stealing hot-reload control from the watched native session.
 
 ### 3.6 Production multi-sampled instrument engine
 
-The existing oscillator synth is a diagnostic renderer only. The production
-audio path is a general instrument engine, with the concert grand as its first
+The former oscillator is only an emergency startup diagnostic. Normal browser
+and iOS playback uses the shared sampled-piano engine and licensed compact
+Salamander bank; native uses the complete sfizz pack. The long-term audio path
+remains a general instrument engine, with the concert grand as its first
 reference-quality library rather than a piano-only special case.
 
 - Normalize imported SFZ, SF2, and open multisample libraries into a validated

@@ -2,96 +2,8 @@ import Foundation
 import AVFoundation
 import CoreMIDI
 
-private struct ScoreSynthVoice {
-    var pitch: UInt8 = 0
-    var channel: UInt8 = 0
-    var phase: Double = 0
-    var gain: Float = 0
-    var envelope: Float = 0
-    var releasing = false
-    var active = false
-    var age: UInt64 = 0
-}
-
-private final class ScoreSynthState {
-    let lock = NSLock()
-    var voices = Array(repeating: ScoreSynthVoice(), count: 48)
-    var nextAge: UInt64 = 1
-    var clickPhase: Double = 0
-    var clickEnvelope: Float = 0
-    var clickFrequency: Double = 1320
-    var clickGain: Float = 0
-
-    func apply(_ event: ScorePlaybackEvent) {
-        lock.lock()
-        defer { lock.unlock() }
-        if event.on == 2 {
-            for index in voices.indices where voices[index].active { voices[index].releasing = true }
-            clickEnvelope = 0
-        } else if event.on == 3 {
-            clickPhase = 0
-            clickEnvelope = 1
-            clickFrequency = event.velocity >= 120 ? 1760 : 1320
-            clickGain = event.velocity >= 120 ? 0.82 : 0.56
-        } else if event.on == 0 {
-            for index in voices.indices where voices[index].active && voices[index].pitch == event.pitch && voices[index].channel == event.channel {
-                voices[index].releasing = true
-            }
-        } else {
-            let slot = voices.firstIndex(where: { !$0.active }) ?? voices.indices.min(by: { voices[$0].age < voices[$1].age }) ?? 0
-            voices[slot] = ScoreSynthVoice(
-                pitch: event.pitch, channel: event.channel, phase: 0,
-                gain: Float(event.velocity) / 127, envelope: 0,
-                releasing: false, active: true, age: nextAge
-            )
-            nextAge &+= 1
-        }
-    }
-
-    func render(_ buffers: UnsafeMutableAudioBufferListPointer, frames: Int, sampleRate: Double) {
-        lock.lock()
-        defer { lock.unlock() }
-        for buffer in buffers {
-            guard let pointer = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
-            pointer.update(repeating: 0, count: frames)
-        }
-        let clickDecay = exp(-1.0 / (sampleRate * 0.045))
-        for frame in 0..<frames {
-            var mixed: Float = 0
-            for index in voices.indices where voices[index].active {
-                let frequency = 440.0 * pow(2.0, (Double(voices[index].pitch) - 69.0) / 12.0)
-                voices[index].phase += frequency / sampleRate
-                voices[index].phase.formTruncatingRemainder(dividingBy: 1)
-                let angle = voices[index].phase * .pi * 2
-                let tone = sin(angle) + 0.32 * sin(angle * 2) + 0.12 * sin(angle * 3) + 0.045 * sin(angle * 5)
-                if voices[index].releasing {
-                    voices[index].envelope *= 0.99935
-                    if voices[index].envelope < 0.0005 { voices[index].active = false }
-                } else {
-                    voices[index].envelope += (1 - voices[index].envelope) * 0.0045
-                }
-                mixed += Float(tone) * voices[index].gain * voices[index].envelope
-            }
-            if clickEnvelope > 0.0004 {
-                clickPhase += clickFrequency / sampleRate
-                clickPhase.formTruncatingRemainder(dividingBy: 1)
-                let angle = clickPhase * .pi * 2
-                mixed += Float(sin(angle) + 0.34 * sin(angle * 2.7)) * clickGain * clickEnvelope
-                clickEnvelope *= Float(clickDecay)
-            } else {
-                clickEnvelope = 0
-            }
-            mixed = min(0.92, max(-0.92, mixed * 0.20))
-            for buffer in buffers {
-                buffer.mData?.assumingMemoryBound(to: Float.self)[frame] = mixed
-            }
-        }
-    }
-}
-
 final class ScoreAudioService {
     private let engine = AVAudioEngine()
-    private let synth = ScoreSynthState()
     private var sourceNode: AVAudioSourceNode!
     private var microphoneInstalled = false
     private let recordingLock = NSLock()
@@ -99,29 +11,61 @@ final class ScoreAudioService {
     private var replayPlayer: AVAudioPlayer?
 
     init() {
-        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
-        sourceNode = AVAudioSourceNode(format: format) { [synth] _, _, frameCount, audioBufferList in
-            synth.render(UnsafeMutableAudioBufferListPointer(audioBufferList), frames: Int(frameCount), sampleRate: format.sampleRate)
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: false)!
+        sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList in
+            let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard buffers.count >= 2,
+                  let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
+                  let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else {
+                for buffer in buffers { buffer.mData?.assumingMemoryBound(to: Float.self).update(repeating: 0, count: Int(frameCount)) }
+                return noErr
+            }
+            score_ios_audio_render(left, right, Int(frameCount), Float(format.sampleRate))
             return noErr
         }
         engine.attach(sourceNode)
         engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
+        loadBundledPiano()
         startOutput()
+    }
+
+    private func loadBundledPiano() {
+        guard let url = Bundle.main.url(forResource: "portable-grand", withExtension: "scorebank"),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            NSLog("Score sampled piano bank is missing")
+            return
+        }
+        if !loadBank(data) { NSLog("Score sampled piano bank was rejected") }
+    }
+
+    @discardableResult
+    func loadBank(_ data: Data) -> Bool {
+        // The Zig piano owns a zero-copy view into this bank. Stop the realtime
+        // callback while the view and its backing storage are swapped.
+        let restartOutput = engine.isRunning
+        if restartOutput { engine.stop() }
+        defer {
+            if restartOutput {
+                do { try engine.start() }
+                catch { NSLog("Score audio output restart failed: %@", String(describing: error)) }
+            }
+        }
+        let status = data.withUnsafeBytes { raw -> UInt32 in
+            guard let bytes = raw.bindMemory(to: UInt8.self).baseAddress else { return 1 }
+            return score_ios_audio_load_bank(bytes, raw.count)
+        }
+        if status != 0 { NSLog("Score sampled piano bank rejected: %u", status) }
+        return status == 0
     }
 
     func consume(_ events: [ScorePlaybackEvent]) {
         for event in events {
-            synth.apply(event)
+            score_ios_audio_event(event.pitch, event.velocity, event.channel, event.on)
         }
     }
 
     func monitor(status: UInt8, data1: UInt8, data2: UInt8) {
-        let message = status & 0xf0
-        if message == 0x90 && data2 != 0 {
-            synth.apply(ScorePlaybackEvent(pitch: data1, velocity: data2, channel: status & 0x0f, on: 1))
-        } else if message == 0x80 || (message == 0x90 && data2 == 0) {
-            synth.apply(ScorePlaybackEvent(pitch: data1, velocity: 0, channel: status & 0x0f, on: 0))
-        }
+        score_ios_audio_midi(status, data1, data2)
     }
 
     private func startOutput() {

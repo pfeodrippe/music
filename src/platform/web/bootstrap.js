@@ -166,12 +166,16 @@
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         if (!AudioContext) throw new Error("Web Audio unavailable");
         const context = new AudioContext({latencyHint:"interactive"});
-        const [module, _] = await Promise.all([
+        const [module, _, pianoBank] = await Promise.all([
           fetch("audio_dsp.wasm").then(response => {
             if (!response.ok) throw new Error("Audio DSP download failed");
             return response.arrayBuffer();
           }).then(bytes => WebAssembly.compile(bytes)),
-          context.audioWorklet.addModule("audio-worklet.js")
+          context.audioWorklet.addModule("audio-worklet.js"),
+          fetch("portable-grand.scorebank").then(response => {
+            if (!response.ok) throw new Error("Sampled grand-piano bank download failed");
+            return response.arrayBuffer();
+          })
         ]);
         const node = new AudioWorkletNode(context, "score-audio", {
           numberOfInputs: 1,
@@ -180,12 +184,18 @@
           processorOptions: {wasmModule: module}
         });
         node.port.onmessage = ({data}) => {
-          if (data.type !== "pitch") return;
-          const now = performance.now();
-          if (now - this.lastPitchTime < 80) return;
-          this.lastPitchTime = now;
-          Module._score_web_pitch(data.note, data.confidence);
+          if (data.type === "bank-status") {
+            Module._score_web_sampler_status(data.status === 0 ? 1 : 2, data.regions || 0, data.samples || 0);
+            return;
+          }
+          if (data.type === "pitch") {
+            const now = performance.now();
+            if (now - this.lastPitchTime < 80) return;
+            this.lastPitchTime = now;
+            Module._score_web_pitch(data.note, data.confidence);
+          }
         };
+        node.port.postMessage({type:"bank", bytes:pianoBank}, [pianoBank]);
         node.connect(context.destination);
         this.audioContext = context;
         this.audioNode = node;
@@ -242,8 +252,8 @@
           return stream;
         }));
       }
-      const settled = await Promise.allSettled(results);
-      const ready = settled.some(result => result.status === "fulfilled");
+      await Promise.allSettled(results);
+      const ready = Boolean(this.midiAccess || this.microphoneStream);
       Module._score_web_status(ready ? 4 : 5);
       return ready;
     },
@@ -275,11 +285,47 @@
       input.click();
     },
 
+    openInstrument() {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".scorebank,application/octet-stream";
+      input.style.display = "none";
+      input.onchange = async () => {
+        try {
+          const file = input.files?.[0];
+          if (!file) return;
+          if (file.size > 256 * 1024 * 1024) throw new Error("Instrument bank exceeds the 256 MB portable limit");
+          const node = await this.ensureAudio();
+          const bytes = await file.arrayBuffer();
+          node.port.postMessage({type:"bank", bytes}, [bytes]);
+        } catch (error) {
+          console.error("Instrument import failed", error);
+          Module._score_web_sampler_status(2, 0, 0);
+        } finally {
+          input.remove();
+        }
+      };
+      document.body.appendChild(input);
+      input.click();
+    },
+
     exportSnapshot(bytes) {
       const blob = new Blob([bytes.slice()], {type:"application/vnd.recordare.musicxml+xml"});
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
       link.download = "score.musicxml";
+      link.style.display = "none";
+      document.body.appendChild(link);
+      link.click();
+      Module._score_web_status(8);
+      setTimeout(() => { URL.revokeObjectURL(link.href); link.remove(); }, 0);
+    },
+
+    exportTake(bytes) {
+      const blob = new Blob([bytes.slice()], {type:"audio/midi"});
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "score-take.mid";
       link.style.display = "none";
       document.body.appendChild(link);
       link.click();

@@ -5,7 +5,7 @@ const musicxml = @import("../import/musicxml.zig");
 const recording = @import("../recording.zig");
 
 pub const magic = "SCOREAPP";
-pub const current_version: u32 = 15;
+pub const current_version: u32 = 20;
 const header_size = 20;
 
 pub const Snapshot = struct {
@@ -17,6 +17,8 @@ pub const Snapshot = struct {
     lyric_count: usize = 0,
     harmonies: [musicxml.max_import_harmonies]model.Harmony = undefined,
     harmony_count: usize = 0,
+    hairpins: [musicxml.max_import_hairpins]model.Hairpin = undefined,
+    hairpin_count: usize = 0,
     pedals: [musicxml.max_import_pedals]model.PedalEvent = undefined,
     pedal_count: usize = 0,
     measures: [musicxml.max_import_measures]model.Measure = undefined,
@@ -24,6 +26,8 @@ pub const Snapshot = struct {
     tempos: [model.max_tempo_events]model.TempoEvent = undefined,
     tempo_count: usize = 0,
     tempo_base_bpm: f32 = 72,
+    parts: [model.max_score_parts]model.ScorePart = [_]model.ScorePart{.{}} ** model.max_score_parts,
+    part_count: usize = 0,
     annotations: annotation.Store = .{},
     take: recording.Take = .{},
 };
@@ -38,9 +42,11 @@ pub const Error = error{
     TooManyNotes,
     TooManyLyrics,
     TooManyHarmonies,
+    TooManyHairpins,
     TooManyPedals,
     TooManyMeasures,
     TooManyTempos,
+    TooManyParts,
     TooManyStrokes,
     TooManyPoints,
     TooManyMidiEvents,
@@ -139,13 +145,32 @@ pub fn encode(snapshot: *const Snapshot, output: []u8) Error!usize {
         fields[0] = measure.beats;
         fields[1] = measure.beat_unit;
         fields[2] = measure.implicit;
-        fields[3] = measure.reserved;
+        fields[3] = measure.repeat;
+        try writer.u32(@as(u32, measure.ending_mask) | (@as(u32, measure.ending_flags) << 16));
     }
     try writer.f32(snapshot.tempo_base_bpm);
     try writer.u32(@intCast(snapshot.tempo_count));
     for (snapshot.tempos[0..snapshot.tempo_count]) |tempo| {
         try writer.f32(tempo.start_beat);
         try writer.f32(tempo.bpm);
+    }
+    try writer.u32(@intCast(snapshot.part_count));
+    for (snapshot.parts[0..snapshot.part_count]) |part| {
+        try writer.u32(part.source_index);
+        try writer.u32(part.flags);
+        try writer.u32(part.midi_program);
+        try writer.bytes(part.nameSlice());
+    }
+    try writer.u32(@intCast(snapshot.hairpin_count));
+    for (snapshot.hairpins[0..snapshot.hairpin_count]) |hairpin| {
+        try writer.f32(hairpin.start_beat);
+        try writer.f32(hairpin.end_beat);
+        try writer.f32(hairpin.spread);
+        const fields = try writer.reserve(4);
+        fields[0] = hairpin.staff;
+        fields[1] = hairpin.kind;
+        fields[2] = hairpin.number;
+        fields[3] = hairpin.flags;
     }
 
     const payload = output[header_size..writer.offset];
@@ -277,7 +302,12 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
             measure.beats = fields[0];
             measure.beat_unit = fields[1];
             measure.implicit = fields[2];
-            measure.reserved = fields[3];
+            measure.repeat = fields[3];
+            if (version >= 20) {
+                const ending = try reader.u32();
+                measure.ending_mask = @truncate(ending);
+                measure.ending_flags = @truncate(ending >> 16);
+            }
         }
     }
     if (version >= 13) {
@@ -292,10 +322,69 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
         snapshot.tempo_count = 1;
         snapshot.tempos[0] = .{ .start_beat = 0, .bpm = snapshot.transport.tempo_bpm };
     }
+    if (version >= 17) {
+        snapshot.part_count = try reader.u32();
+        if (snapshot.part_count > snapshot.parts.len) return error.TooManyParts;
+        for (snapshot.parts[0..snapshot.part_count]) |*part| {
+            part.* = .{
+                .source_index = try reader.u32(),
+                .flags = try reader.u32(),
+                .midi_program = try reader.u32(),
+            };
+            part.setName(try reader.bytes());
+        }
+    } else {
+        deriveLegacyParts(snapshot);
+    }
+    if (version >= 18) {
+        snapshot.hairpin_count = try reader.u32();
+        if (snapshot.hairpin_count > snapshot.hairpins.len) return error.TooManyHairpins;
+        for (snapshot.hairpins[0..snapshot.hairpin_count]) |*hairpin| {
+            hairpin.* = .{
+                .start_beat = try reader.f32(),
+                .end_beat = try reader.f32(),
+                .spread = try reader.f32(),
+            };
+            const fields = try reader.take(4);
+            hairpin.staff = fields[0];
+            hairpin.kind = fields[1];
+            hairpin.number = fields[2];
+            hairpin.flags = fields[3];
+        }
+    }
     snapshot.annotations.next_id = 1;
     for (snapshot.annotations.strokes[0..snapshot.annotations.stroke_count]) |stroke| snapshot.annotations.next_id = @max(snapshot.annotations.next_id, stroke.stable_id + 1);
     if (reader.offset != payload.len) return error.InvalidData;
     return;
+}
+
+fn deriveLegacyParts(snapshot: *Snapshot) void {
+    var present: u32 = 0;
+    var vocal: u32 = 0;
+    for (snapshot.notes[0..snapshot.note_count]) |note| {
+        const bit = @as(u32, 1) << @intCast(model.notePart(note));
+        present |= bit;
+        if ((note.flags & model.note_flag_vocal_guide) != 0) vocal |= bit;
+    }
+    if (present == 0) present = 1;
+    for (0..model.max_instrument_parts) |source_index| {
+        const bit = @as(u32, 1) << @intCast(source_index);
+        if ((present & bit) == 0 or snapshot.part_count == snapshot.parts.len) continue;
+        var part: model.ScorePart = .{ .source_index = @intCast(source_index) };
+        if ((vocal & bit) != 0) {
+            part.flags |= model.score_part_flag_vocal;
+            part.setName("Vocal guide");
+        } else if (@popCount(present & ~vocal) == 1) {
+            part.midi_program = 1;
+            part.setName("Piano");
+        } else {
+            var name_buffer: [24]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buffer, "Part {d}", .{source_index + 1}) catch "Part";
+            part.setName(name);
+        }
+        snapshot.parts[snapshot.part_count] = part;
+        snapshot.part_count += 1;
+    }
 }
 
 const Writer = struct {
@@ -344,9 +433,10 @@ const Writer = struct {
         try self.u32(value.flags);
         const technique = try self.reserve(4);
         technique[0] = value.fingering;
-        technique[1] = 0;
-        technique[2] = 0;
+        technique[1] = value.slur_start_mask;
+        technique[2] = value.slur_stop_mask;
         technique[3] = 0;
+        try self.u32(value.notations);
     }
 };
 
@@ -386,6 +476,7 @@ const Reader = struct {
         const selected = try self.u32();
         const flags = if (version >= 7) try self.u32() else 0;
         const technique = if (version >= 15) try self.take(4) else null;
+        const notations = if (version >= 19) try self.u32() else 0;
         return .{
             .stable_id = stable_id,
             .start_beat = start,
@@ -401,6 +492,9 @@ const Reader = struct {
             .selected = if (selected != 0) 1 else 0,
             .flags = flags,
             .fingering = if (technique) |value| if (value[0] >= 1 and value[0] <= 5) value[0] else 0 else 0,
+            .slur_start_mask = if (version >= 16) technique.?[1] else 0,
+            .slur_stop_mask = if (version >= 16) technique.?[2] else 0,
+            .notations = notations,
         };
     }
 };
@@ -423,7 +517,7 @@ test "native document round trips notes, transport and anchored ink" {
     snapshot.meta.tempo_beat_unit = 8;
     snapshot.transport.tempo_bpm = 84;
     snapshot.transport.metronome_enabled = 0;
-    snapshot.notes[0] = .{ .stable_id = 9, .start_beat = 1.5, .duration_beats = 0.75, .pitch = 63, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'E', .written_alter = -1, .written_octave = 4, .dots = 1, .flags = model.note_flag_beam_begin | model.note_flag_tie_start, .fingering = 4 };
+    snapshot.notes[0] = .{ .stable_id = 9, .start_beat = 1.5, .duration_beats = 0.75, .pitch = 63, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'E', .written_alter = -1, .written_octave = 4, .dots = 1, .flags = model.note_flag_beam_begin | model.note_flag_tie_start | model.note_flag_slur_start, .fingering = 4, .slur_start_mask = model.slurNumberBit(2) | model.slurNumberBit(4), .notations = model.withSingleTremolo(model.note_notation_trill | model.note_notation_arpeggiate_up, 4) };
     snapshot.note_count = 1;
     snapshot.lyrics[0] = .{ .start_beat = 1.5 };
     snapshot.lyrics[0].setText("sing this");
@@ -432,15 +526,23 @@ test "native document round trips notes, transport and anchored ink" {
     snapshot.harmonies[0].setKind("minor-seventh");
     snapshot.harmonies[0].setText("m7");
     snapshot.harmony_count = 1;
+    snapshot.hairpins[0] = .{ .start_beat = 1.25, .end_beat = 2.75, .spread = 18, .staff = 0, .kind = model.hairpin_crescendo, .number = 2, .flags = model.hairpin_flag_above | model.hairpin_flag_niente };
+    snapshot.hairpin_count = 1;
     snapshot.pedals[0] = .{ .start_beat = 1.25, .pedal = model.pedal_sustain, .value = 127, .action = model.pedal_action_start, .flags = model.pedal_flag_line };
     snapshot.pedal_count = 1;
-    snapshot.measures[0] = .{ .start_beat = 0, .duration_beats = 1, .number = 0, .beats = 4, .beat_unit = 4, .implicit = 1 };
-    snapshot.measures[1] = .{ .start_beat = 1, .duration_beats = 2, .number = 1, .beats = 2, .beat_unit = 4 };
+    snapshot.measures[0] = .{ .start_beat = 0, .duration_beats = 1, .number = 0, .beats = 4, .beat_unit = 4, .implicit = 1, .repeat = model.measure_repeat_forward, .ending_mask = 1, .ending_flags = model.measure_ending_start };
+    snapshot.measures[1] = .{ .start_beat = 1, .duration_beats = 2, .number = 1, .beats = 2, .beat_unit = 4, .repeat = model.measure_repeat_backward, .ending_mask = 1, .ending_flags = model.measure_ending_stop };
+    snapshot.measures[1].setRepeatPasses(3);
     snapshot.measure_count = 2;
     snapshot.tempo_base_bpm = 120;
     snapshot.tempos[0] = .{ .start_beat = 0, .bpm = 120 };
     snapshot.tempos[1] = .{ .start_beat = 2, .bpm = 108 };
     snapshot.tempo_count = 2;
+    snapshot.parts[0] = .{ .source_index = 0, .midi_program = 1 };
+    snapshot.parts[0].setName("Piano");
+    snapshot.parts[1] = .{ .source_index = 1, .midi_program = 49 };
+    snapshot.parts[1].setName("Strings");
+    snapshot.part_count = 2;
     snapshot.annotations.beginScore(.{ .u = 12.5, .v = 0.3, .pressure = 0.8, .time_ms = 10 }, 1);
     snapshot.annotations.end();
     var bytes: [4096]u8 = undefined;
@@ -456,11 +558,17 @@ test "native document round trips notes, transport and anchored ink" {
     try std.testing.expectEqual(@as(i8, 4), decoded.notes[0].written_octave);
     try std.testing.expectEqual(@as(u8, 1), decoded.notes[0].dots);
     try std.testing.expectEqual(@as(u8, 4), decoded.notes[0].fingering);
+    try std.testing.expectEqual(model.slurNumberBit(2) | model.slurNumberBit(4), decoded.notes[0].slur_start_mask);
+    try std.testing.expectEqual(@as(u8, 4), model.singleTremoloMarks(decoded.notes[0]));
+    try std.testing.expectEqual(model.note_notation_trill | model.note_notation_arpeggiate_up, decoded.notes[0].notations & (model.note_notation_ornament_mask | model.note_notation_arpeggiate_mask));
     try std.testing.expect((decoded.notes[0].flags & model.note_flag_tie_start) != 0);
     try std.testing.expectEqualStrings("sing this", decoded.lyrics[0].textSlice());
     try std.testing.expectEqual(@as(usize, 1), decoded.harmony_count);
     try std.testing.expectEqualStrings("minor-seventh", decoded.harmonies[0].kindSlice());
     try std.testing.expectEqual(@as(i8, -1), decoded.harmonies[0].bass_alter);
+    try std.testing.expectEqual(@as(usize, 1), decoded.hairpin_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.75), decoded.hairpins[0].end_beat, 0.001);
+    try std.testing.expectEqual(model.hairpin_flag_above | model.hairpin_flag_niente, decoded.hairpins[0].flags);
     try std.testing.expectEqual(@as(usize, 1), decoded.pedal_count);
     try std.testing.expectEqual(model.pedal_action_start, decoded.pedals[0].action);
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), decoded.pedals[0].start_beat, 0.001);
@@ -468,14 +576,54 @@ test "native document round trips notes, transport and anchored ink" {
     try std.testing.expectEqual(@as(u32, 0), decoded.measures[0].number);
     try std.testing.expectEqual(@as(u8, 1), decoded.measures[0].implicit);
     try std.testing.expectEqual(@as(u8, 2), decoded.measures[1].beats);
+    try std.testing.expect(decoded.measures[0].hasForwardRepeat());
+    try std.testing.expect(decoded.measures[1].hasBackwardRepeat());
+    try std.testing.expectEqual(@as(u8, 3), decoded.measures[1].repeatPasses());
+    try std.testing.expectEqual(@as(u16, 1), decoded.measures[0].ending_mask);
+    try std.testing.expect(decoded.measures[0].endingStarts());
+    try std.testing.expect(decoded.measures[1].endingStops());
     try std.testing.expectEqual(@as(usize, 2), decoded.tempo_count);
     try std.testing.expectApproxEqAbs(@as(f32, 120), decoded.tempo_base_bpm, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 108), decoded.tempos[1].bpm, 0.001);
+    try std.testing.expectEqual(@as(usize, 2), decoded.part_count);
+    try std.testing.expectEqualStrings("Piano", decoded.parts[0].nameSlice());
+    try std.testing.expectEqual(@as(u32, 1), decoded.parts[0].midi_program);
+    try std.testing.expectEqualStrings("Strings", decoded.parts[1].nameSlice());
+    try std.testing.expectEqual(@as(u32, 49), decoded.parts[1].midi_program);
     try std.testing.expectEqual(@as(usize, 1), decoded.annotations.point_count);
     try std.testing.expect(annotation.isScoreSpace(decoded.annotations.strokes[0]));
     try std.testing.expectEqual(@as(u32, 1), annotation.pageIndex(decoded.annotations.strokes[0]));
     try std.testing.expectApproxEqAbs(@as(f32, 12.5), decoded.annotations.points[0].u, 0.001);
     try std.testing.expectEqual(@as(u32, 0), decoded.transport.metronome_enabled);
+}
+
+test "version 15 native documents migrate without invented slur numbers" {
+    const snapshot = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(snapshot);
+    snapshot.* = .{};
+    snapshot.notes[0] = .{ .stable_id = 3, .start_beat = 0, .duration_beats = 1, .pitch = 60, .velocity = 80, .staff = 0, .voice = 0, .flags = model.note_flag_slur_start, .slur_start_mask = model.slurNumberBit(3) };
+    snapshot.note_count = 1;
+    var bytes: [4096]u8 = undefined;
+    const encoded_len = try encode(snapshot, &bytes);
+    var note_start: usize = header_size;
+    for (0..2) |_| {
+        const text_len: usize = readInt(u32, bytes[note_start .. note_start + 4]);
+        note_start += 4 + text_len;
+    }
+    note_start += 8 + 16 + 16 + 4;
+    const notation_start = note_start + 36;
+    std.mem.copyForwards(u8, bytes[notation_start .. encoded_len - 4], bytes[notation_start + 4 .. encoded_len]);
+    // v19 appended the notation word, v17 an empty part table, and v18 an
+    // empty hairpin table. Remove all three for a genuine v15 payload.
+    const len = encoded_len - 12;
+    writeInt(u32, bytes[12..16], @intCast(len - header_size));
+    writeInt(u32, bytes[8..12], 15);
+    writeInt(u32, bytes[16..20], std.hash.crc.Crc32.hash(bytes[header_size..len]));
+    const decoded = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(decoded);
+    try decode(bytes[0..len], decoded);
+    try std.testing.expectEqual(@as(u8, 0), decoded.notes[0].slur_start_mask);
+    try std.testing.expectEqual(@as(u8, 1), model.slurStartMask(decoded.notes[0]));
 }
 
 test "native document persists synchronized MIDI take metadata" {
@@ -515,8 +663,10 @@ test "version 14 native documents migrate with automatic fingering" {
     try std.testing.expectEqual(@as(u32, 1), readInt(u32, bytes[note_start .. note_start + 4]));
     note_start += 4;
     const technique_start = note_start + 32;
-    std.mem.copyForwards(u8, bytes[technique_start .. encoded_len - 4], bytes[technique_start + 4 .. encoded_len]);
-    const legacy_len = encoded_len - 4;
+    std.mem.copyForwards(u8, bytes[technique_start .. encoded_len - 8], bytes[technique_start + 8 .. encoded_len]);
+    // Strip the v15 note-technique quartet, v19 notation word, and the empty
+    // v17 part and v18 hairpin tables.
+    const legacy_len = encoded_len - 16;
     writeInt(u32, bytes[8..12], 14);
     writeInt(u32, bytes[12..16], @intCast(legacy_len - header_size));
     writeInt(u32, bytes[16..20], std.hash.crc.Crc32.hash(bytes[header_size..legacy_len]));

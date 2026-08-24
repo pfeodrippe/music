@@ -47,6 +47,8 @@ em++ src/platform/web/main.cpp build/web/score_core.o build/web/flecs.o \
 
 cp build/web/score.html build/web/index.html
 cp src/platform/web/audio-worklet.js build/web/audio-worklet.js
+cp .zig-cache/portable/accurate-salamander-grand.scorebank build/web/portable-grand.scorebank
+cp local-content/instruments/AccurateSalamanderGrandPianoV6.2beta2/README.txt build/web/ACCURATE_SALAMANDER_LICENSE.txt
 cp src/platform/web/manifest.webmanifest build/web/manifest.webmanifest
 cp src/platform/web/service-worker.js build/web/service-worker.js
 cp src/platform/web/_headers build/web/_headers

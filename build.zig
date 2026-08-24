@@ -108,8 +108,31 @@ pub fn build(b: *std.Build) void {
     sampler_verifier_run.step.dependOn(&sfizz_cmd.step);
     sampler_verifier_run.addArg("verify");
     if (b.args) |args| sampler_verifier_run.addArgs(args);
-    const sampler_verifier_step = b.step("sampler-verify", "Run offline grand-piano dynamics, pedal, overload, and queue gates");
+    const sampler_verifier_step = b.step("sampler-verify", "Run offline grand-piano dynamics, pedal, latency, spectral, overload, and queue gates");
     sampler_verifier_step.dependOn(&sampler_verifier_run.step);
+
+    const native_piano_path = b.option([]const u8, "native-piano", "Reference SFZ for the native release audio gate") orelse
+        "local-content/instruments/AccurateSalamanderGrandPianoV6.2beta2/sfz_live/Accurate-SalamanderGrandPiano_flat.Recommended.sfz";
+    const native_pack_inspection = b.addRunArtifact(sampler_workbench);
+    native_pack_inspection.step.dependOn(&sfizz_cmd.step);
+    native_pack_inspection.addArgs(&.{ "inspect-pack", native_piano_path, ".zig-cache/verification/native-release-pack.json" });
+    const native_sampler_gate = b.addRunArtifact(sampler_workbench);
+    native_sampler_gate.step.dependOn(&native_pack_inspection.step);
+    native_sampler_gate.addArgs(&.{ "verify", ".zig-cache/verification/native-release-audio.json", ".zig-cache/verification/native-release-audio.wav", native_piano_path });
+    const native_audio_gate_step = b.step("native-audio-gate", "Verify the installed native piano pack, dynamics, pedals, acoustic layers, timing, spectrum, and overload safety");
+    native_audio_gate_step.dependOn(&native_sampler_gate.step);
+
+    const portable_piano_path = b.option([]const u8, "portable-piano", "Licensed local SFZ compiled for browser and iOS") orelse native_piano_path;
+    const portable_pack_run = b.addRunArtifact(sampler_workbench);
+    portable_pack_run.step.dependOn(&sfizz_cmd.step);
+    portable_pack_run.addArgs(&.{ "portable-pack", portable_piano_path, ".zig-cache/portable/accurate-salamander-grand.scorebank" });
+    const portable_pack_step = b.step("portable-piano", "Compile the licensed local SFZ into the shared browser/iOS sampled-grand bank");
+    portable_pack_step.dependOn(&portable_pack_run.step);
+    const portable_verify_run = b.addRunArtifact(sampler_workbench);
+    portable_verify_run.step.dependOn(&portable_pack_run.step);
+    portable_verify_run.addArgs(&.{ "portable-verify", ".zig-cache/portable/accurate-salamander-grand.scorebank", ".zig-cache/verification/portable-grand.wav" });
+    const portable_verify_step = b.step("portable-piano-verify", "Verify the shared browser/iOS sampled-grand dynamics, attack, sustain, and safety");
+    portable_verify_step.dependOn(&portable_verify_run.step);
 
     const native = b.addExecutable(.{
         .name = "score",
@@ -157,6 +180,9 @@ pub fn build(b: *std.Build) void {
     bundle_cmd.step.dependOn(b.getInstallStep());
     bundle_cmd.step.dependOn(&sfizz_cmd.step);
     bundle_step.dependOn(&bundle_cmd.step);
+    const native_release_step = b.step("macos-release", "Build the signed macOS bundle and pass the installed concert-grand audio gate");
+    native_release_step.dependOn(&bundle_cmd.step);
+    native_release_step.dependOn(&native_sampler_gate.step);
 
     const systems_plugin = b.addLibrary(.{
         .name = "score-systems",
@@ -206,10 +232,12 @@ pub fn build(b: *std.Build) void {
 
     const web_step = b.step("web", "Build the Wasm/WebGPU export with Emscripten");
     const web_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-web.sh" });
+    web_cmd.step.dependOn(&portable_pack_run.step);
     web_step.dependOn(&web_cmd.step);
 
     const web_dev_step = b.step("dev-web", "Serve and statefully hot-reload the Wasm/WebGPU application");
     const web_dev_cmd = b.addSystemCommand(&.{ "sh", "scripts/dev-web.sh" });
+    web_dev_cmd.step.dependOn(&portable_pack_run.step);
     web_dev_step.dependOn(&web_dev_cmd.step);
 
     const ios_step = b.step("ios-core", "Build the portable iOS arm64 static core for an Xcode Metal host");
@@ -245,10 +273,12 @@ pub fn build(b: *std.Build) void {
 
     const ios_app_step = b.step("ios-app", "Build the unsigned UIKit/Metal iOS application bundle");
     const ios_app_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-ios-app.sh" });
+    ios_app_cmd.step.dependOn(&portable_pack_run.step);
     ios_app_cmd.step.dependOn(ios_step);
     ios_app_step.dependOn(&ios_app_cmd.step);
 
     const ios_simulator_step = b.step("ios-simulator", "Build an ad-hoc signed arm64 iOS Simulator application");
     const ios_simulator_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-ios-app.sh", "simulator" });
+    ios_simulator_cmd.step.dependOn(&portable_pack_run.step);
     ios_simulator_step.dependOn(&ios_simulator_cmd.step);
 }

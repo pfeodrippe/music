@@ -33,6 +33,20 @@ const char *score_application_support_path(void) {
     return support_path;
 }
 
+int score_current_work_area(int *x, int *y, int *width, int *height) {
+    @autoreleasepool {
+        NSScreen *screen = NSApp.keyWindow.screen ?: NSScreen.mainScreen;
+        if (screen == nil) return 0;
+        const NSRect visible = screen.visibleFrame;
+        const CGRect mainDisplay = CGDisplayBounds(CGMainDisplayID());
+        if (x != NULL) *x = (int)visible.origin.x;
+        if (y != NULL) *y = (int)(mainDisplay.size.height - visible.origin.y - visible.size.height);
+        if (width != NULL) *width = (int)visible.size.width;
+        if (height != NULL) *height = (int)visible.size.height;
+        return visible.size.width > 0 && visible.size.height > 0;
+    }
+}
+
 const char *score_open_score_panel(void) {
     static char selected_path[4096];
     selected_path[0] = '\0';
@@ -44,6 +58,28 @@ const char *score_open_score_panel(void) {
         panel.canChooseFiles = YES;
         panel.allowsMultipleSelection = NO;
         panel.allowedFileTypes = @[@"musicxml", @"xml", @"mxl", @"mid", @"midi", @"score"];
+        if ([panel runModal] == NSModalResponseOK) {
+            const char *path = panel.URL.fileSystemRepresentation;
+            if (path != NULL) {
+                strncpy(selected_path, path, sizeof(selected_path) - 1);
+                selected_path[sizeof(selected_path) - 1] = '\0';
+            }
+        }
+    }
+    return selected_path;
+}
+
+const char *score_open_instrument_panel(void) {
+    static char selected_path[4096];
+    selected_path[0] = '\0';
+    @autoreleasepool {
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        panel.title = @"Load a sampled instrument";
+        panel.message = @"Choose an SFZ file. Samples remain local and the current instrument stays active if loading fails.";
+        panel.canChooseDirectories = NO;
+        panel.canChooseFiles = YES;
+        panel.allowsMultipleSelection = NO;
+        panel.allowedFileTypes = @[@"sfz"];
         if ([panel runModal] == NSModalResponseOK) {
             const char *path = panel.URL.fileSystemRepresentation;
             if (path != NULL) {

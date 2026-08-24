@@ -24,6 +24,7 @@ void score_midi(uint64_t time_ns, uint8_t status, uint8_t data1, uint8_t data2);
 void score_microphone_pitch(uint8_t pitch, float confidence);
 uint32_t score_host_request();
 void score_host_status(uint32_t status);
+void score_host_sampler_status(uint32_t status, uint32_t regions, uint32_t samples);
 size_t score_drain_playback(ScoreHostEvent* events, size_t capacity);
 const ScoreDrawItem* score_draw_items();
 uint32_t score_draw_count();
@@ -37,6 +38,7 @@ void score_accessibility_activate(uint32_t id);
 uint32_t score_import(const uint8_t* bytes, size_t length, uint32_t kind);
 size_t score_serialize(uint8_t* bytes, size_t capacity);
 size_t score_export_musicxml(uint8_t* bytes, size_t capacity);
+size_t score_export_take_midi(uint8_t* bytes, size_t capacity);
 uint32_t score_restore(const uint8_t* bytes, size_t length);
 }
 
@@ -75,7 +77,9 @@ double devicePixelRatio() { return EM_ASM_DOUBLE({ return window.devicePixelRati
 EM_JS(void, webInitialize, (), { ScoreHost.initialize(Module.canvas); });
 EM_JS(void, webEnsureAudio, (), { ScoreHost.ensureAudio(); });
 EM_JS(void, webOpenFile, (), { ScoreHost.openFile(); });
+EM_JS(void, webOpenInstrument, (), { ScoreHost.openInstrument(); });
 EM_JS(void, webExportSnapshot, (const uint8_t* bytes, size_t length), { ScoreHost.exportSnapshot(HEAPU8.slice(bytes, bytes + length)); });
+EM_JS(void, webExportTake, (const uint8_t* bytes, size_t length), { ScoreHost.exportTake(HEAPU8.slice(bytes, bytes + length)); });
 EM_JS(void, webEnsureInputs, (), { ScoreHost.ensureInputs(); });
 EM_JS(void, webStartRecording, (), { ScoreHost.startRecording(); });
 EM_JS(void, webStopRecording, (), { ScoreHost.stopRecording(); });
@@ -107,9 +111,17 @@ void processHostRequest() {
             if (export_length != 0) webExportSnapshot(export_bytes.data(), export_length);
             break;
         }
-        case 5: webStartRecording(); break;
-        case 6: webStopRecording(); break;
-        case 7: webReplayAudio(); break;
+        case 5: {
+            static std::vector<uint8_t> take_bytes(4 * 1024 * 1024);
+            const size_t take_length = score_export_take_midi(take_bytes.data(), take_bytes.size());
+            if (take_length != 0) webExportTake(take_bytes.data(), take_length);
+            else score_host_status(3);
+            break;
+        }
+        case 6: webStartRecording(); break;
+        case 7: webStopRecording(); break;
+        case 8: webReplayAudio(); break;
+        case 9: webOpenInstrument(); break;
         default: break;
     }
 }
@@ -125,6 +137,10 @@ void pumpPlayback() {
         }
         if (event.on == 3) {
             webMetronome(event.velocity >= 120 ? 1 : 0);
+            continue;
+        }
+        if (event.on == 4) {
+            webAudioMidi(0xb0u | event.channel, event.pitch, event.velocity);
             continue;
         }
         const uint32_t status = (event.on ? 0x90u : 0x80u) | event.channel;
@@ -309,6 +325,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE uint32_t score_web_restore(uintptr_t pointer, si
 
 extern "C" EMSCRIPTEN_KEEPALIVE void score_web_status(uint32_t status) {
     score_host_status(status);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void score_web_sampler_status(uint32_t status, uint32_t regions, uint32_t samples) {
+    score_host_sampler_status(status, regions, samples);
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void score_web_save_now() {

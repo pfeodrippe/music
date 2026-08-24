@@ -6,6 +6,7 @@ class ScoreAudioProcessor extends AudioWorkletProcessor {
     this.exports = this.instance.exports;
     this.memory = this.exports.memory;
     this.exports.score_audio_reset();
+    this.outputChannels = this.exports.score_audio_channels();
     this.pitchCapacity = this.exports.score_pitch_input_capacity();
     this.pitchWindow = new Float32Array(this.pitchCapacity);
     this.pitchLength = 0;
@@ -16,6 +17,20 @@ class ScoreAudioProcessor extends AudioWorkletProcessor {
         this.exports.score_audio_all_notes_off();
       } else if (data.type === "click") {
         this.exports.score_audio_click(data.accent ? 1 : 0);
+      } else if (data.type === "bank") {
+        const bytes = new Uint8Array(data.bytes);
+        const pointer = this.exports.score_audio_bank_allocate(bytes.byteLength);
+        let status = 1;
+        if (pointer) {
+          new Uint8Array(this.memory.buffer, pointer, bytes.byteLength).set(bytes);
+          status = this.exports.score_audio_bank_commit(bytes.byteLength);
+        }
+        this.port.postMessage({
+          type: "bank-status",
+          status,
+          samples: status === 0 ? this.exports.score_audio_bank_samples() : 0,
+          regions: status === 0 ? this.exports.score_audio_bank_regions() : 0
+        });
       }
     };
   }
@@ -43,8 +58,12 @@ class ScoreAudioProcessor extends AudioWorkletProcessor {
     if (!output || output.length === 0) return true;
     const frames = output[0].length;
     const pointer = this.exports.score_audio_render(frames, sampleRate);
-    const mono = new Float32Array(this.memory.buffer, pointer, frames);
-    for (const channel of output) channel.set(mono);
+    const interleaved = new Float32Array(this.memory.buffer, pointer, frames * this.outputChannels);
+    for (let channelIndex = 0; channelIndex < output.length; channelIndex += 1) {
+      const channel = output[channelIndex];
+      const sourceChannel = Math.min(channelIndex, this.outputChannels - 1);
+      for (let frame = 0; frame < frames; frame += 1) channel[frame] = interleaved[frame * this.outputChannels + sourceChannel];
+    }
     this.analyzeInput(inputs[0]?.[0]);
     return true;
   }
