@@ -946,6 +946,20 @@ pub const App = struct {
         }
         snapshot.annotations = self.annotations;
         snapshot.take = self.take;
+        if (self.getConst(model.UiState, self.session, self.ids.ui_state)) |state| {
+            snapshot.view = .{
+                .view_start_beat = state.view_start_beat,
+                .zoom = state.zoom,
+                .continuous_pan_fraction = state.continuous_pan_fraction,
+                .tool = state.tool,
+                .score_view_mode = state.score_view_mode,
+                .focus_score = state.focus_score,
+                .keyboard_visible = state.keyboard_visible,
+                .vocal_guide_visible = state.vocal_guide_visible,
+                .pedal_guide_visible = state.pedal_guide_visible,
+                .selected_part = state.selected_part,
+            };
+        }
         return native_format.encode(snapshot, output);
     }
 
@@ -1019,6 +1033,21 @@ pub const App = struct {
         (self.getMut(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport).* = snapshot.transport;
         self.annotations = snapshot.annotations;
         self.take = snapshot.take;
+        if (self.getMut(model.UiState, self.session, self.ids.ui_state)) |state| {
+            state.view_start_beat = @max(@as(f32, 0), snapshot.view.view_start_beat);
+            state.zoom = std.math.clamp(snapshot.view.zoom, ui.min_score_zoom, ui.max_score_zoom);
+            state.continuous_pan_fraction = std.math.clamp(snapshot.view.continuous_pan_fraction, 0, 0.9999);
+            state.tool = snapshot.view.tool;
+            state.score_view_mode = snapshot.view.score_view_mode;
+            state.focus_score = snapshot.view.focus_score;
+            state.keyboard_visible = snapshot.view.keyboard_visible;
+            state.vocal_guide_visible = snapshot.view.vocal_guide_visible;
+            state.pedal_guide_visible = snapshot.view.pedal_guide_visible;
+            const selected_bit = @as(u32, 1) << @intCast(snapshot.view.selected_part);
+            if ((state.instrument_part_mask & selected_bit) != 0) state.selected_part = snapshot.view.selected_part;
+            self.refreshSelectedPartLabel();
+            c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        }
         c.ecs_modified_id(self.world, self.session, self.ids.document_meta);
         c.ecs_modified_id(self.world, self.session, self.ids.transport);
         self.buildFrame();
@@ -2991,11 +3020,14 @@ test "hot-reloadable transport stops at score end and replay starts over" {
 test "accessible GPU pedal button toggles score and keyboard guidance" {
     const app = try App.create(std.heap.c_allocator, 1440, 900, 2);
     defer app.destroy(std.heap.c_allocator);
-    const before_items = app.drawItems().len;
     app.accessibilityActivate(accessibility.Id.pedal_guide);
     const state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
     try std.testing.expectEqual(@as(u32, 0), state.pedal_guide_visible);
-    try std.testing.expect(app.drawItems().len < before_items);
+    var found_show_label = false;
+    for (app.accessibilityItems()) |item| {
+        if (item.id == accessibility.Id.pedal_guide and std.mem.eql(u8, item.labelSlice(), "Show pedal guidance")) found_show_label = true;
+    }
+    try std.testing.expect(found_show_label);
     app.key(.{ .key = 'G', .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
     try std.testing.expectEqual(@as(u32, 1), state.pedal_guide_visible);
 }
@@ -3104,6 +3136,48 @@ test "multi-part MusicXML selects one engraved practice part without muting docu
     try std.testing.expectEqual(before + 1, app.note_count);
     const inserted = app.getConst(model.Note, app.note_entities[app.note_count - 1], app.ids.note) orelse return error.MissingNote;
     try std.testing.expectEqual(@as(u32, 1), model.notePart(inserted.*));
+}
+
+test "native score snapshot restores portable reading preferences" {
+    const source =
+        \\<score-partwise version="4.0"><work><work-title>Persistent View</work-title></work>
+        \\<part-list><score-part id="P1"><part-name>Piano</part-name></score-part><score-part id="P2"><part-name>Harp</part-name></score-part></part-list>
+        \\<part id="P1"><measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration></note></measure></part>
+        \\<part id="P2"><measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes><note><pitch><step>G</step><octave>4</octave></pitch><duration>4</duration></note></measure></part></score-partwise>
+    ;
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+    try app.importMusicXml(source);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    state.view_start_beat = 6.5;
+    state.zoom = 0.65;
+    state.continuous_pan_fraction = 0.375;
+    state.tool = .practice;
+    state.score_view_mode = .continuous;
+    state.focus_score = 1;
+    state.keyboard_visible = 0;
+    state.vocal_guide_visible = 0;
+    state.pedal_guide_visible = 1;
+    state.selected_part = 1;
+    app.refreshSelectedPartLabel();
+
+    const bytes = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+    defer std.testing.allocator.free(bytes);
+    const length = try app.serialize(bytes);
+    state.* = .{};
+    try app.deserialize(bytes[0..length]);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 6.5), state.view_start_beat, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), state.zoom, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.375), state.continuous_pan_fraction, 0.001);
+    try std.testing.expectEqual(model.Tool.practice, state.tool);
+    try std.testing.expectEqual(model.ScoreViewMode.continuous, state.score_view_mode);
+    try std.testing.expectEqual(@as(u32, 1), state.focus_score);
+    try std.testing.expectEqual(@as(u32, 0), state.keyboard_visible);
+    try std.testing.expectEqual(@as(u32, 0), state.vocal_guide_visible);
+    try std.testing.expectEqual(@as(u32, 1), state.pedal_guide_visible);
+    try std.testing.expectEqual(@as(u32, 1), state.selected_part);
+    try std.testing.expectEqualStrings("Harp", state.selectedPartLabel());
 }
 
 test "practice assessment matches every distinct pitch in a chord once" {

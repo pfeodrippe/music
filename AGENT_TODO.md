@@ -23,8 +23,15 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   sostenuto, una corda, room response, DC blocking, and linked master limiting
   are in the shared engine. The deterministic portable gate passes finite PCM,
   clipping, dynamics, attack, sustain, and output-safety checks; it now also
-  reads the packed damper/hammer/resonance PCM directly and proves a 0.08792
+  reads the packed damper/hammer/resonance PCM directly and proves a 0.07945
   normalized change between otherwise identical dry and resonant note renders.
+  The current version-4 bank stores explicit per-zone attack, decay, sustain,
+  release, filter mode/cutoff/resonance, key tracking, key center, and velocity
+  tracking while retaining version-2 and version-3 read compatibility. The
+  real pack contains 69 authored attack and 931 authored release envelopes and
+  truthfully reports zero authored filter regions because this particular SFZ
+  source has no filter opcodes; synthetic regressions cover all eight filter
+  modes and tracking behavior.
 - [x] Replace browser/iPad oscillator playback with that shared sampled bank.
   WebGPU/WebAudio and Metal/AVAudio now consume identical Zig MIDI/CC events;
   a host-event ABI regression fixes sustain/sostenuto/soft controllers being
@@ -424,6 +431,57 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   the current private Holocene MXL is the accepted application baseline. Freeze
   its notes, timing, voicing, dynamics, articulation, and pedal data; do not
   reopen transcription work unless the user explicitly asks to revise it.
+- [x] Reopen and repair the opening after the user's later explicit revision
+  request. Preserve the upper broken-note harp/guitar reduction and add 22
+  restrained lower-staff attacks across measures 1..3 and 8..10 so the opening
+  is genuinely two-handed. Against the separated phase-consistent
+  accompaniment, envelope/attack/sustain correlation improves from
+  0.393275/0.488125/0.304848 to 0.412251/0.504432/0.335728, normalized error
+  falls from 0.281437 to 0.275876, and onset precision rises from 0.700000 to
+  0.736842. Three-stem exact/pitch-class agreement improves from 146/192 and
+  169/192 to 165/214 and 191/214. The resulting private canonical contains 195
+  measures, 2,781 events, 1,686 instrumental notes, 485 separate voice-guide
+  notes, 75 harmonies, 15 pedal events, and quarter=147; the playability gate,
+  live Dawn/Metal playback, and the 1,704-region sampler's zero-fault telemetry
+  pass. Add a Zig round-trip assertion so future note overlays cannot silently
+  shift timing during MXL serialization. The playable MusicXML part is now
+  explicitly named `Piano reduction (harp + ensemble)`, and the shared GPU/PDF
+  page header displays a lone instrumental part instead of hiding its identity.
+  This metadata-only relabel preserves every semantic count and note. Current
+  ignored canonical SHA-256:
+  `e7957b0bd106fac37073b3087c5e40bf20b3a6f5e2428beb1c2490dc3167143d`.
+  A fresh explicit native import and live MXL export re-import at the same
+  195/2,781/75/15 counts. Measure 1 retains twelve beamed upper-staff attacks
+  from the harp/guitar texture plus three lower-staff body notes, and the real
+  Dawn/Metal capture is
+  `tmp/native-acceptance/holocene-harp-labeled-restarted.png`; the matching
+  21-page A4 export is
+  `tmp/native-acceptance/holocene-harp-labeled-live-export-v3.pdf` and retains
+  the same explicit reduction label.
+- [x] Apply the user's final, narrower opening correction after listening to the
+  revised score: remove only nine isolated lower-staff attacks from measures
+  1..3 while retaining the complete upper harp/guitar shimmer, every authored
+  velocity and pedal event, the separate vocal guide, and all notation from
+  measure 4 onward. The accepted private MXL now re-imports at 195 measures,
+  2,772 note/rest events, 2,032 pitched events, 1,677 instrumental events, 485
+  vocal-guide events, 75 harmonies, 15 pedals, and quarter=147. The consolidated
+  Zig workbench owns this exact-note edit through `remove-notes`; its MXL writer
+  now also preserves part names and hairpins. Mechanical playability and the
+  Accurate Salamander render pass with zero overloads. Native Dawn/Metal, the
+  iPad simulator, and WebGPU all display the corrected opening; the WebGPU
+  document survives a real IndexedDB reload. The preceding denser version is
+  retained only as the ignored, recoverable
+  `Holocene-private-study.pre-clean-opening-20260824.mxl`. Current ignored
+  canonical SHA-256:
+  `0dff263e2a342d4d7f91a9497eb51bc8c2b1e06a5627082ff3504c33036c7e04`.
+- [x] Prevent platform recovery from silently replacing the corrected score.
+  iPadOS now restores its journal before arming the first-frame autosave
+  callback, so the bundled tutorial cannot overwrite a valid imported document
+  during startup. The browser accepts an optional same-origin development
+  `?score=...` preload through the normal semantic importer, commits it to
+  IndexedDB, removes the query string, and restores the same document after
+  reload. Simulator and browser acceptance both show the explicit
+  `Piano reduction (harp + ensemble)` label and quarter=147.
 - [x] Replace the sparse opening treble with the user's richer 42-quarter-beat
   D-flat fragment while preserving the recording-reviewed bass, independent
   vocal guide, lyrics, all 193 authored measures, and quarter=147 timing. Direct
@@ -560,8 +618,16 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   validation, exact diagnostics, and last-good pipeline retention. Prove both
   invalid WGSL and a missing entry point keep the PID, Flecs world, and rendered
   frame alive; expose `shader reload|state` through `score-devctl`.
-- [ ] Add the equivalent development-time last-good Metal shader reload path to
-  the deferred iOS host after the native release gate clears.
+- [x] Add the equivalent development-time last-good Metal shader reload path to
+  the iOS host. `zig build dev-ios` builds and launches a Debug simulator app,
+  seeds a writable Metal source in its application-support container, and
+  mirrors source edits there. The live host polls at 4 Hz, compiles a candidate
+  library and pipeline away from the render loop, and swaps on the main thread
+  only after both entry points and the pipeline validate. Simulator acceptance
+  proves malformed Metal emits exact compiler diagnostics while the same PID,
+  last-good frame, and Zig/Flecs world remain alive; a valid red-tint edit then
+  hot-swaps in that process, and restoring the source returns the original
+  frame with `live Flecs state preserved`.
 - [x] Prove hot reload interactively without losing imported score, transport,
   annotation, or current practice take.
 - [x] Keep score authoring/inspection/evidence operations in the single tested
@@ -718,6 +784,12 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   restoration, and signed-bundle verification pass.
 - [ ] Finish professional optical engraving: per-spanner placement for
   unusually complex concurrent curves and complete SMuFL coverage.
+- [x] Give concurrent MusicXML crescendo/diminuendo wedges deterministic
+  optical lanes. Overlapping beat ranges on the same part, staff, and side use
+  independent 22 px lanes that clear the maximum authored opening; unrelated
+  staves/sides reuse lane zero. The resolver is bounded and allocation-free,
+  survives system/page continuation, has focused Zig coverage, and passes a
+  live Dawn/Metal framebuffer review with two simultaneous opposing wedges.
 - [x] Replace the fixed two-system demo with measure-aware horizontal spacing
   and complete-measure system breaks. Short final pages render only populated
   systems instead of a phantom empty grand staff.
@@ -1910,6 +1982,24 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   concert grand the first reference-quality library, then support electric
   pianos, organs, strings, percussion, and licensed/user sample packs without
   changing the score or transport core.
+  The shared callback now honors validated sample loop points for ordinary
+  attack voices: held, sustain-latched, and sostenuto-latched voices wrap with
+  fractional overshoot and interpolate from loop end to loop start; key or
+  pedal release exits the loop into the authored sample tail. One-shot release
+  and mechanism samples never loop. `Instrument` exposes the general API while
+  `Piano` remains source-compatible for existing hosts. Focused loop/tail tests
+  and the 353-sample/931-region grand gate pass on WebAudio/iOS. SFZ
+  `ampeg_attack`, `ampeg_decay`, `ampeg_sustain`, and `ampeg_release` now inherit
+  through the normalizer into the version-4 portable bank and execute as
+  sample-accurate ADSR stages, including amplitude-continuous repedaling;
+  version-2 banks retain legacy defaults. Per-zone SFZ cutoff, resonance,
+  filter type, key tracking, key center, and velocity tracking now survive the
+  same normalizer and bank and execute through allocation-free one-, two-, and
+  four-pole filters; versions 2 and 3 read with filters disabled. The reference
+  pack contains 69 authored attack and 931 authored release envelopes, and the
+  current suite passes 279/279 Zig tests. General pack compilation,
+  LFO/modulation, buses,
+  automation, and streaming remain open, so this parent item stays unchecked.
 - [x] Vendor the current official sfizz engine as a pinned submodule and build
   its Apple-silicon shared library reproducibly. Route native score/MIDI events
   through an allocation-free SPSC queue so sfizz MIDI and rendering remain on
@@ -1962,7 +2052,7 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   The independent macro/include-heavy V3 fallback also passes at 641 FLAC
   assets / 1,121 zones / 748,397,030 bytes / zero issues with pack SHA-256
   `00b341f846d6e202aa45e0b88cbc80c03026ec824c1dfb716eb34c58b1f8f4ed`.
-  Its 184 not-yet-normalized control/DSP opcodes remain truthfully counted and
+  Its 176 not-yet-normalized control/DSP opcodes remain truthfully counted and
   are still performed by native sfizz.
 - [x] Add a safe GPU-native instrument workflow to the practice surface. The
   coach card exposes the active human-readable instrument, sfizz zone count,
@@ -1981,7 +2071,7 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   streaming meters. Keep this editor out of the focused practice layout.
 - [ ] Extend the completed SFZ/WAV/FLAC normalization path to SF2 and open
   multisample libraries, then serialize round-trip-safe user packs with the
-  same hashes and diagnostics. Close the 184 current SFZ opcode gaps required
+  same hashes and diagnostics. Close the 176 current SFZ opcode gaps required
   for portable playback rather than silently claiming sfizz parity.
 - [ ] Provide reusable note-input, note-release, and post-instrument FX chains
   so release articulations and effects remain composable; support explicit
@@ -2027,6 +2117,17 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   response curves. Raw recorded-take controller capture/persistence/export is
   complete; this remaining item is about how the production sampler sounds and
   responds to those values.
+- [x] Make the browser/iOS sampled resonance react to pedal motion, not only to
+  notes begun under an already-held pedal. The allocation-free portable engine
+  now identifies each distinct sounding attack key, excites exactly one
+  recorded per-key resonance layer when CC64 crosses into the resonant range,
+  avoids duplicates from adjacent velocity-layer interpolation, continuously
+  scales that layer with the current CC64 depth, releases it when the pedal
+  clears, and gives resonance lower steal priority than held primary attacks.
+  Focused state-machine tests cover late pedal-down, continuous depth changes,
+  duplicate suppression, and pedal-up release. The real 353-sample / 931-region
+  bank gate passes with 69 non-silent resonance regions, a 0.07945 normalized
+  dry/resonant PCM delta, and 279/279 Zig tests.
 - [x] Correct the shared Zig synth's pedal state machine: key-up voices under
   sustain/sostenuto now decay without re-entering attack, CC64 values 0...63
   continuously scale release time, repedaling catches a still-audible released
@@ -2240,6 +2341,13 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   accessibility, GPU rendering, and exporter wiring with no runtime warnings.
 - [x] Browser-test IndexedDB recovery, sampled playback, paged/continuous
   layout, zoom reflow, semantic controls, and MusicXML download.
+  A fresh WebGPU runtime pass found that document recovery originally omitted
+  reading-layout preferences. Portable `.score` v21 now restores view mode,
+  zoom, reading position, tool, selected part, and visible practice panels
+  while excluding transient device/runtime state. Optimized Zig tests include
+  v20 migration and an end-to-end multi-part restore; after the IndexedDB
+  autosave interval, a real browser reload retained continuous mode and reduced
+  zoom with multiple consecutive systems visible and no console warnings.
 - [ ] Browser-test microphone/MIDI permissions, physical-device input, audio
   take recording, and the downloaded MusicXML in an external desktop notation
   application.

@@ -5,15 +5,34 @@ const effects = @import("effects.zig");
 /// AVAudio callback. The format intentionally contains no paths or platform
 /// objects: a normalized region table is followed by little-endian PCM16.
 pub const magic = "SCBNK001";
-pub const version: u32 = 2;
+pub const version: u32 = 4;
+pub const legacy_version: u32 = 2;
+pub const envelope_version: u32 = 3;
 pub const header_size: usize = 32;
 pub const sample_descriptor_size: usize = 20;
-pub const region_descriptor_size: usize = 20;
+pub const legacy_region_descriptor_size: usize = 20;
+pub const envelope_region_descriptor_size: usize = 36;
+pub const region_descriptor_size: usize = 52;
 pub const max_bank_bytes: usize = 256 * 1024 * 1024;
 pub const max_samples: usize = 1024;
 pub const max_regions: usize = 4096;
 pub const max_voices: usize = 128;
 pub const region_flag_velocity_center_mask: u16 = 0x00ff;
+pub const envelope_millis_legacy: u32 = std.math.maxInt(u32);
+pub const envelope_sustain_full: u16 = 1000;
+pub const filter_cutoff_disabled: u32 = 0;
+
+pub const FilterType = enum(u8) {
+    none = 0,
+    low_pass_1p = 1,
+    high_pass_1p = 2,
+    low_pass_2p = 3,
+    high_pass_2p = 4,
+    band_pass_2p = 5,
+    band_reject_2p = 6,
+    low_pass_4p = 7,
+    high_pass_4p = 8,
+};
 
 pub const Trigger = enum(u8) {
     attack = 0,
@@ -46,6 +65,19 @@ pub const Region = struct {
     gain_centibels: i16,
     pan_milli: i16,
     flags: u16,
+    amp_attack_millis: u32 = envelope_millis_legacy,
+    amp_decay_millis: u32 = envelope_millis_legacy,
+    amp_release_millis: u32 = envelope_millis_legacy,
+    amp_sustain_permille: u16 = envelope_sustain_full,
+    envelope_flags: u16 = 0,
+    filter_cutoff_millihz: u32 = filter_cutoff_disabled,
+    filter_resonance_centibels: i16 = 0,
+    filter_keytrack_cents: i16 = 0,
+    filter_velocity_track_cents: i16 = 0,
+    filter_keycenter: u8 = 60,
+    filter_type: FilterType = .none,
+    filter_flags: u16 = 0,
+    filter_reserved: u16 = 0,
 };
 
 pub const View = struct {
@@ -55,10 +87,19 @@ pub const View = struct {
     sample_table_offset: usize,
     region_table_offset: usize,
     pcm_offset: usize,
+    format_version: u32,
+    region_descriptor_stride: usize,
 
     pub fn open(bytes: []const u8) !View {
         if (bytes.len < header_size or bytes.len > max_bank_bytes or !std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidSampleBank;
-        if (readU32(bytes, 8) != version) return error.UnsupportedSampleBank;
+        const format_version = readU32(bytes, 8);
+        if (format_version != version and format_version != envelope_version and format_version != legacy_version) return error.UnsupportedSampleBank;
+        const region_descriptor_stride = switch (format_version) {
+            legacy_version => legacy_region_descriptor_size,
+            envelope_version => envelope_region_descriptor_size,
+            version => region_descriptor_size,
+            else => unreachable,
+        };
         const sample_count: usize = readU32(bytes, 12);
         const region_count: usize = readU32(bytes, 16);
         const sample_table_offset: usize = readU32(bytes, 20);
@@ -67,7 +108,7 @@ pub const View = struct {
         if (sample_count == 0 or sample_count > max_samples or region_count == 0 or region_count > max_regions) return error.InvalidSampleBank;
         if (sample_table_offset < header_size or region_table_offset < sample_table_offset or pcm_offset < region_table_offset) return error.InvalidSampleBank;
         if (sample_descriptor_size * sample_count > region_table_offset - sample_table_offset) return error.InvalidSampleBank;
-        if (region_descriptor_size * region_count > pcm_offset - region_table_offset or pcm_offset > bytes.len) return error.InvalidSampleBank;
+        if (region_descriptor_stride * region_count > pcm_offset - region_table_offset or pcm_offset > bytes.len) return error.InvalidSampleBank;
         const view: View = .{
             .bytes = bytes,
             .sample_count = sample_count,
@@ -75,6 +116,8 @@ pub const View = struct {
             .sample_table_offset = sample_table_offset,
             .region_table_offset = region_table_offset,
             .pcm_offset = pcm_offset,
+            .format_version = format_version,
+            .region_descriptor_stride = region_descriptor_stride,
         };
         for (0..sample_count) |index| {
             const descriptor = view.sample(index);
@@ -87,6 +130,10 @@ pub const View = struct {
         for (0..region_count) |index| {
             const zone = try view.region(index);
             if (zone.sample_index >= sample_count or zone.key_low > zone.key_high or zone.velocity_low > zone.velocity_high or zone.soft_low > zone.soft_high) return error.InvalidSampleBank;
+            if (zone.amp_sustain_permille > envelope_sustain_full or zone.envelope_flags != 0) return error.InvalidSampleBank;
+            if (zone.filter_flags != 0 or zone.filter_reserved != 0) return error.InvalidSampleBank;
+            if ((zone.filter_type == .none) != (zone.filter_cutoff_millihz == filter_cutoff_disabled)) return error.InvalidSampleBank;
+            if (zone.filter_cutoff_millihz > 192_000_000 or zone.filter_resonance_centibels < 0 or zone.filter_resonance_centibels > 6000 or zone.filter_keytrack_cents < -1200 or zone.filter_keytrack_cents > 1200 or zone.filter_velocity_track_cents < -9600 or zone.filter_velocity_track_cents > 9600 or zone.filter_keycenter > 127) return error.InvalidSampleBank;
         }
         return view;
     }
@@ -105,8 +152,9 @@ pub const View = struct {
 
     pub fn region(self: View, index: usize) !Region {
         if (index >= self.region_count) return error.InvalidRegionIndex;
-        const offset = self.region_table_offset + index * region_descriptor_size;
+        const offset = self.region_table_offset + index * self.region_descriptor_stride;
         if (self.bytes[offset + 9] > @intFromEnum(Trigger.pedal_resonance)) return error.InvalidSampleBank;
+        if (self.format_version == version and self.bytes[offset + 47] > @intFromEnum(FilterType.high_pass_4p)) return error.InvalidSampleBank;
         const trigger: Trigger = @enumFromInt(self.bytes[offset + 9]);
         return .{
             .sample_index = readU32(self.bytes, offset),
@@ -122,6 +170,19 @@ pub const View = struct {
             .gain_centibels = readI16(self.bytes, offset + 14),
             .pan_milli = readI16(self.bytes, offset + 16),
             .flags = readU16(self.bytes, offset + 18),
+            .amp_attack_millis = if (self.format_version == legacy_version) envelope_millis_legacy else readU32(self.bytes, offset + 20),
+            .amp_decay_millis = if (self.format_version == legacy_version) envelope_millis_legacy else readU32(self.bytes, offset + 24),
+            .amp_release_millis = if (self.format_version == legacy_version) envelope_millis_legacy else readU32(self.bytes, offset + 28),
+            .amp_sustain_permille = if (self.format_version == legacy_version) envelope_sustain_full else readU16(self.bytes, offset + 32),
+            .envelope_flags = if (self.format_version == legacy_version) 0 else readU16(self.bytes, offset + 34),
+            .filter_cutoff_millihz = if (self.format_version == version) readU32(self.bytes, offset + 36) else filter_cutoff_disabled,
+            .filter_resonance_centibels = if (self.format_version == version) readI16(self.bytes, offset + 40) else 0,
+            .filter_keytrack_cents = if (self.format_version == version) readI16(self.bytes, offset + 42) else 0,
+            .filter_velocity_track_cents = if (self.format_version == version) readI16(self.bytes, offset + 44) else 0,
+            .filter_keycenter = if (self.format_version == version) self.bytes[offset + 46] else 60,
+            .filter_type = if (self.format_version == version) @enumFromInt(self.bytes[offset + 47]) else .none,
+            .filter_flags = if (self.format_version == version) readU16(self.bytes, offset + 48) else 0,
+            .filter_reserved = if (self.format_version == version) readU16(self.bytes, offset + 50) else 0,
         };
     }
 
@@ -134,6 +195,102 @@ pub const View = struct {
 
 const Event = extern struct { kind: u8, key: u8, value: u8, channel: u8 };
 const event_capacity = 1024;
+const pedal_resonance_activation: u8 = 8;
+
+const Biquad = struct {
+    b0: f32 = 1,
+    b1: f32 = 0,
+    b2: f32 = 0,
+    a1: f32 = 0,
+    a2: f32 = 0,
+    z1: f32 = 0,
+    z2: f32 = 0,
+
+    fn process(self: *Biquad, input: f32) f32 {
+        const output = self.b0 * input + self.z1;
+        self.z1 = self.b1 * input - self.a1 * output + self.z2;
+        self.z2 = self.b2 * input - self.a2 * output;
+        return output;
+    }
+};
+
+const VoiceFilter = struct {
+    kind: FilterType = .none,
+    one_pole_feedback: f32 = 0,
+    one_pole_low: f32 = 0,
+    first: Biquad = .{},
+    second: Biquad = .{},
+
+    fn init(region: Region, pitch: u8, velocity: u8, sample_rate: f32) VoiceFilter {
+        if (region.filter_type == .none or region.filter_cutoff_millihz == filter_cutoff_disabled or sample_rate <= 0) return .{};
+        const base_cutoff = @as(f32, @floatFromInt(region.filter_cutoff_millihz)) / 1000.0;
+        const key_offset = @as(f32, @floatFromInt(@as(i16, pitch) - @as(i16, region.filter_keycenter))) * @as(f32, @floatFromInt(region.filter_keytrack_cents));
+        const velocity_offset = @as(f32, @floatFromInt(region.filter_velocity_track_cents)) * @as(f32, @floatFromInt(velocity)) / 127.0;
+        const cutoff = std.math.clamp(base_cutoff * std.math.pow(f32, 2, (key_offset + velocity_offset) / 1200.0), 10, sample_rate * 0.45);
+        var result: VoiceFilter = .{ .kind = region.filter_type };
+        if (region.filter_type == .low_pass_1p or region.filter_type == .high_pass_1p) {
+            result.one_pole_feedback = @exp(-std.math.tau * cutoff / sample_rate);
+            return result;
+        }
+        const resonance_db = @as(f32, @floatFromInt(region.filter_resonance_centibels)) / 100.0;
+        const q = std.math.clamp(@as(f32, 0.70710678) * std.math.pow(f32, 10, resonance_db / 40.0), 0.1, 24);
+        result.first = biquadFor(region.filter_type, cutoff, q, sample_rate);
+        if (region.filter_type == .low_pass_4p or region.filter_type == .high_pass_4p) result.second = result.first;
+        return result;
+    }
+
+    fn process(self: *VoiceFilter, input: f32) f32 {
+        switch (self.kind) {
+            .none => return input,
+            .low_pass_1p, .high_pass_1p => {
+                self.one_pole_low = (1 - self.one_pole_feedback) * input + self.one_pole_feedback * self.one_pole_low;
+                return if (self.kind == .low_pass_1p) self.one_pole_low else input - self.one_pole_low;
+            },
+            .low_pass_4p, .high_pass_4p => return self.second.process(self.first.process(input)),
+            else => return self.first.process(input),
+        }
+    }
+};
+
+fn biquadFor(kind: FilterType, cutoff: f32, q: f32, sample_rate: f32) Biquad {
+    const omega = std.math.tau * cutoff / sample_rate;
+    const sine = @sin(omega);
+    const cosine = @cos(omega);
+    const alpha = sine / (2 * q);
+    const a0 = 1 + alpha;
+    var b0: f32 = 1;
+    var b1: f32 = 0;
+    var b2: f32 = 0;
+    switch (kind) {
+        .low_pass_2p, .low_pass_4p => {
+            b0 = (1 - cosine) * 0.5;
+            b1 = 1 - cosine;
+            b2 = b0;
+        },
+        .high_pass_2p, .high_pass_4p => {
+            b0 = (1 + cosine) * 0.5;
+            b1 = -(1 + cosine);
+            b2 = b0;
+        },
+        .band_pass_2p => {
+            b0 = alpha;
+            b2 = -alpha;
+        },
+        .band_reject_2p => {
+            b0 = 1;
+            b1 = -2 * cosine;
+            b2 = 1;
+        },
+        else => return .{},
+    }
+    return .{
+        .b0 = b0 / a0,
+        .b1 = b1 / a0,
+        .b2 = b2 / a0,
+        .a1 = (-2 * cosine) / a0,
+        .a2 = (1 - alpha) / a0,
+    };
+}
 
 const Voice = struct {
     sample_index: u32 = 0,
@@ -145,6 +302,7 @@ const Voice = struct {
     pitch: u8 = 0,
     velocity: u8 = 0,
     channel: u8 = 0,
+    trigger: Trigger = .attack,
     key_down: bool = false,
     sustain_latched: bool = false,
     sostenuto_latched: bool = false,
@@ -156,6 +314,21 @@ const Voice = struct {
     last_right: f32 = 0,
     steal_left: f32 = 0,
     steal_right: f32 = 0,
+    amp_attack_millis: u32 = envelope_millis_legacy,
+    amp_decay_millis: u32 = envelope_millis_legacy,
+    amp_release_millis: u32 = envelope_millis_legacy,
+    amp_sustain_permille: u16 = envelope_sustain_full,
+    envelope_stage: EnvelopeStage = .attack,
+    envelope_stage_frames: u32 = 0,
+    envelope_release_start: f32 = 0,
+    filter: VoiceFilter = .{},
+};
+
+const EnvelopeStage = enum(u8) {
+    attack,
+    decay,
+    sustain,
+    release,
 };
 
 const VelocityBlend = struct {
@@ -267,6 +440,8 @@ pub const Piano = struct {
             if (self.bank) |bank| for (&self.voices) |*voice| {
                 if (!voice.active) continue;
                 const sample = bank.sample(voice.sample_index);
+                const looping = voiceUsesSampleLoop(voice, sample);
+                if (looping) voice.position = wrapLoopPosition(voice.position, sample);
                 const frame: usize = @intFromFloat(voice.position);
                 if (frame + 1 >= sample.frame_count) {
                     voice.active = false;
@@ -274,27 +449,25 @@ pub const Piano = struct {
                 }
                 const fraction: f32 = @floatCast(voice.position - @floor(voice.position));
                 const a = bank.pcm(sample, frame);
-                const b = bank.pcm(sample, frame + 1);
-                const value = a + (b - a) * fraction;
+                const next_frame: usize = if (looping and frame + 1 >= sample.loop_end)
+                    sample.loop_start
+                else
+                    frame + 1;
+                const b = bank.pcm(sample, next_frame);
+                const value = voice.filter.process(a + (b - a) * fraction);
                 voice.position += voice.increment;
-                if (voice.one_shot) {
-                    voice.envelope += (1 - voice.envelope) * 0.04;
-                } else if (voice.key_down) {
-                    voice.envelope += (1 - voice.envelope) * 0.016;
-                } else if (voice.sustain_latched or voice.sostenuto_latched) {
-                    const pedal = @as(f32, @floatFromInt(self.sustain[voice.channel])) / 127.0;
-                    voice.envelope *= @exp(-1.0 / (sample_rate * (7 + pedal * 18)));
-                } else {
-                    voice.releasing = true;
-                    const half = @as(f32, @floatFromInt(@min(self.sustain[voice.channel], 63))) / 63.0;
-                    voice.envelope *= @exp(-1.0 / (sample_rate * (0.22 + half * half * 1.8)));
-                }
+                if (looping) voice.position = wrapLoopPosition(voice.position, sample);
+                advanceVoiceEnvelope(voice, self.sustain[voice.channel], sample_rate);
                 if (voice.envelope < 0.00008) {
                     voice.active = false;
                     continue;
                 }
-                const main_left = value * voice.gain_left * voice.envelope;
-                const main_right = value * voice.gain_right * voice.envelope;
+                const resonance_gain = if (voice.trigger == .pedal_resonance)
+                    pedalResonanceGain(self.sustain[voice.channel])
+                else
+                    1;
+                const main_left = value * voice.gain_left * voice.envelope * resonance_gain;
+                const main_right = value * voice.gain_right * voice.envelope * resonance_gain;
                 mixed_left += main_left + voice.steal_left;
                 mixed_right += main_right + voice.steal_right;
                 voice.last_left = main_left + voice.steal_left;
@@ -386,9 +559,8 @@ pub const Piano = struct {
         const blend = self.selectAttackBlend(pitch, @max(velocity, 1), self.soft[channel]) orelse return;
         if (blend.lower) |region| self.startRegionVoice(region, .attack, channel, pitch, velocity, sample_rate, blend.lower_gain);
         if (blend.upper) |region| self.startRegionVoice(region, .attack, channel, pitch, velocity, sample_rate, blend.upper_gain);
-        if (self.sustain[channel] >= 22) {
-            const scaled: u16 = @as(u16, velocity) * self.sustain[channel] / 127;
-            self.startTriggeredVoice(.pedal_resonance, channel, pitch, @intCast(@max(scaled, 1)), sample_rate);
+        if (self.sustain[channel] >= pedal_resonance_activation) {
+            self.startTriggeredVoice(.pedal_resonance, channel, pitch, @max(velocity, 1), sample_rate);
         }
     }
 
@@ -420,12 +592,21 @@ pub const Piano = struct {
             .pitch = pitch,
             .velocity = velocity,
             .channel = channel,
+            .trigger = trigger,
             .key_down = trigger == .attack or trigger == .pedal_resonance,
             .one_shot = trigger != .attack and trigger != .pedal_resonance,
             .age = self.voice_age,
             .active = true,
             .steal_left = steal_left,
             .steal_right = steal_right,
+            .amp_attack_millis = region.amp_attack_millis,
+            .amp_decay_millis = region.amp_decay_millis,
+            .amp_release_millis = region.amp_release_millis,
+            .amp_sustain_permille = region.amp_sustain_permille,
+            .envelope_stage = .attack,
+            .envelope_stage_frames = 0,
+            .envelope_release_start = 0,
+            .filter = VoiceFilter.init(region, pitch, velocity, sample_rate),
         };
         self.voice_age +%= 1;
     }
@@ -449,6 +630,7 @@ pub const Piano = struct {
 
     fn stealClass(voice: *const Voice) u8 {
         if (voice.one_shot) return 0;
+        if (voice.trigger == .pedal_resonance) return if (voice.key_down or voice.sustain_latched) 2 else 1;
         if (!voice.key_down and !voice.sustain_latched and !voice.sostenuto_latched) return 1;
         if (!voice.key_down) return 2;
         return 3;
@@ -495,10 +677,11 @@ pub const Piano = struct {
         var release_velocity: u8 = 0;
         for (&self.voices) |*voice| if (voice.active and voice.channel == channel and voice.pitch == pitch) {
             if (voice.one_shot) continue;
-            release_velocity = @max(release_velocity, voice.velocity);
+            if (voice.trigger == .attack) release_velocity = @max(release_velocity, voice.velocity);
             voice.key_down = false;
             voice.sustain_latched = self.sustain[channel] >= 64;
             voice.releasing = !voice.sustain_latched and !voice.sostenuto_latched;
+            if (voice.releasing) beginVoiceRelease(voice);
         };
         // A held damper pedal prevents the key damper from contacting the
         // string, so sampled key-release noise starts only when the damper is
@@ -529,16 +712,29 @@ pub const Piano = struct {
     fn applyControlChange(self: *Piano, channel: u8, controller: u8, value: u8, sample_rate: f32) void {
         switch (controller) {
             64 => {
-                const was_down = self.sustain[channel] >= 64;
+                const previous = self.sustain[channel];
+                const was_down = previous >= 64;
+                const was_resonant = previous >= pedal_resonance_activation;
+                const is_resonant = value >= pedal_resonance_activation;
                 self.sustain[channel] = value;
-                if (!was_down and value >= 64) {
+                if (!was_resonant and is_resonant) {
                     self.startTriggeredVoice(.pedal_down, channel, 60, 127, sample_rate);
+                    self.startResonanceForSoundingKeys(channel, sample_rate);
+                } else if (was_resonant and !is_resonant) {
+                    self.startTriggeredVoice(.pedal_up, channel, 60, 127, sample_rate);
+                    for (&self.voices) |*voice| if (voice.active and voice.channel == channel and voice.trigger == .pedal_resonance) {
+                        voice.key_down = false;
+                        voice.sustain_latched = false;
+                        voice.releasing = true;
+                        beginVoiceRelease(voice);
+                    };
+                }
+                if (!was_down and value >= 64) {
                     for (&self.voices) |*voice| if (voice.active and voice.channel == channel and !voice.key_down and !voice.sostenuto_latched) {
                         voice.sustain_latched = true;
                         voice.releasing = false;
                     };
                 } else {
-                    if (was_down and value < 64) self.startTriggeredVoice(.pedal_up, channel, 60, 127, sample_rate);
                     self.updateUnheld(channel);
                 }
             },
@@ -563,6 +759,7 @@ pub const Piano = struct {
                     voice.sustain_latched = false;
                     voice.sostenuto_latched = false;
                     voice.releasing = true;
+                    beginVoiceRelease(voice);
                 };
                 self.sustain[channel] = 0;
                 self.sostenuto[channel] = 0;
@@ -575,7 +772,29 @@ pub const Piano = struct {
         for (&self.voices) |*voice| if (voice.active and voice.channel == channel and !voice.key_down and !voice.sostenuto_latched) {
             voice.sustain_latched = self.sustain[channel] >= 64;
             voice.releasing = !voice.sustain_latched;
+            if (voice.releasing) beginVoiceRelease(voice);
         };
+    }
+
+    /// Moving the damper pedal after a note begins exposes the same sampled
+    /// string-resonance layer as beginning the note under pedal. Collect first
+    /// so allocating a resonance voice cannot perturb the scan or duplicate a
+    /// velocity-crossfaded attack layer.
+    fn startResonanceForSoundingKeys(self: *Piano, channel: u8, sample_rate: f32) void {
+        var sounding_velocity = [_]u8{0} ** 128;
+        var already_resonant = [_]bool{false} ** 128;
+        for (self.voices) |voice| {
+            if (!voice.active or voice.channel != channel) continue;
+            if (voice.trigger == .attack and voice.envelope >= 0.00008) {
+                sounding_velocity[voice.pitch] = @max(sounding_velocity[voice.pitch], voice.velocity);
+            } else if (voice.trigger == .pedal_resonance and (voice.key_down or voice.sustain_latched)) {
+                already_resonant[voice.pitch] = true;
+            }
+        }
+        for (sounding_velocity, 0..) |velocity, pitch| {
+            if (velocity == 0 or already_resonant[pitch]) continue;
+            self.startTriggeredVoice(.pedal_resonance, channel, @intCast(pitch), velocity, sample_rate);
+        }
     }
 
     fn allNotesOffImmediate(self: *Piano) void {
@@ -588,6 +807,139 @@ pub const Piano = struct {
         self.output_chain.reset();
     }
 };
+
+/// General sampled-instrument name for the shared callback engine. `Piano`
+/// remains a source-compatible alias for the existing platform hosts while
+/// non-piano packs adopt the capability incrementally.
+pub const Instrument = Piano;
+
+fn hasAuthoredEnvelope(voice: *const Voice) bool {
+    return voice.amp_attack_millis != envelope_millis_legacy or
+        voice.amp_decay_millis != envelope_millis_legacy or
+        voice.amp_release_millis != envelope_millis_legacy or
+        voice.amp_sustain_permille != envelope_sustain_full;
+}
+
+fn envelopeDurationFrames(milliseconds: u32, sample_rate: f32) u32 {
+    if (milliseconds == 0) return 0;
+    const frames = @as(f64, @floatFromInt(milliseconds)) * @as(f64, @floatCast(@max(1, sample_rate))) / 1000.0;
+    return @intFromFloat(@min(@as(f64, @floatFromInt(std.math.maxInt(u32))), @max(1, @round(frames))));
+}
+
+fn beginVoiceRelease(voice: *Voice) void {
+    if (voice.envelope_stage == .release) return;
+    voice.envelope_release_start = voice.envelope;
+    voice.envelope_stage_frames = 0;
+    voice.envelope_stage = .release;
+}
+
+fn advanceVoiceEnvelope(voice: *Voice, pedal_value: u8, sample_rate: f32) void {
+    if (voice.one_shot) {
+        voice.envelope += (1 - voice.envelope) * 0.04;
+        return;
+    }
+
+    const held = voice.key_down or voice.sustain_latched or voice.sostenuto_latched;
+    if (!hasAuthoredEnvelope(voice)) {
+        if (voice.key_down) {
+            voice.envelope += (1 - voice.envelope) * 0.016;
+        } else if (held) {
+            const pedal = @as(f32, @floatFromInt(pedal_value)) / 127.0;
+            voice.envelope *= @exp(-1.0 / (sample_rate * (7 + pedal * 18)));
+        } else {
+            voice.releasing = true;
+            voice.envelope_stage = .release;
+            const half = @as(f32, @floatFromInt(@min(pedal_value, 63))) / 63.0;
+            voice.envelope *= @exp(-1.0 / (sample_rate * (0.22 + half * half * 1.8)));
+        }
+        return;
+    }
+
+    if (!held) {
+        voice.releasing = true;
+        beginVoiceRelease(voice);
+        if (voice.amp_release_millis == 0) {
+            voice.envelope = 0;
+        } else if (voice.amp_release_millis == envelope_millis_legacy) {
+            const half = @as(f32, @floatFromInt(@min(pedal_value, 63))) / 63.0;
+            voice.envelope *= @exp(-1.0 / (sample_rate * (0.22 + half * half * 1.8)));
+        } else {
+            const duration = envelopeDurationFrames(voice.amp_release_millis, sample_rate);
+            voice.envelope_stage_frames +|= 1;
+            const progress = @min(1, @as(f32, @floatFromInt(voice.envelope_stage_frames)) / @as(f32, @floatFromInt(duration)));
+            voice.envelope = voice.envelope_release_start * (1 - progress);
+        }
+        return;
+    }
+
+    // Repedaling catches the current amplitude without a discontinuity. It
+    // resumes at sustain rather than re-running attack or jumping upward.
+    if (voice.envelope_stage == .release) {
+        voice.envelope_stage = .sustain;
+        voice.envelope_stage_frames = 0;
+        voice.releasing = false;
+        return;
+    }
+
+    const sustain_level = @as(f32, @floatFromInt(@min(voice.amp_sustain_permille, envelope_sustain_full))) / @as(f32, envelope_sustain_full);
+    switch (voice.envelope_stage) {
+        .attack => {
+            if (voice.amp_attack_millis == 0) {
+                voice.envelope = 1;
+                voice.envelope_stage = .decay;
+                voice.envelope_stage_frames = 0;
+            } else if (voice.amp_attack_millis == envelope_millis_legacy) {
+                voice.envelope += (1 - voice.envelope) * 0.016;
+            } else {
+                const duration = envelopeDurationFrames(voice.amp_attack_millis, sample_rate);
+                voice.envelope_stage_frames +|= 1;
+                voice.envelope = @min(1, @as(f32, @floatFromInt(voice.envelope_stage_frames)) / @as(f32, @floatFromInt(duration)));
+                if (voice.envelope_stage_frames >= duration) {
+                    voice.envelope = 1;
+                    voice.envelope_stage = .decay;
+                    voice.envelope_stage_frames = 0;
+                }
+            }
+        },
+        .decay => {
+            if (voice.amp_decay_millis == 0 or voice.amp_decay_millis == envelope_millis_legacy) {
+                voice.envelope = sustain_level;
+                voice.envelope_stage = .sustain;
+                voice.envelope_stage_frames = 0;
+            } else {
+                const duration = envelopeDurationFrames(voice.amp_decay_millis, sample_rate);
+                voice.envelope_stage_frames +|= 1;
+                const progress = @min(1, @as(f32, @floatFromInt(voice.envelope_stage_frames)) / @as(f32, @floatFromInt(duration)));
+                voice.envelope = 1 + (sustain_level - 1) * progress;
+                if (voice.envelope_stage_frames >= duration) {
+                    voice.envelope = sustain_level;
+                    voice.envelope_stage = .sustain;
+                    voice.envelope_stage_frames = 0;
+                }
+            }
+        },
+        .sustain => {},
+        .release => unreachable,
+    }
+}
+
+fn voiceUsesSampleLoop(voice: *const Voice, sample: Sample) bool {
+    return voice.trigger == .attack and
+        (voice.key_down or voice.sustain_latched or voice.sostenuto_latched) and
+        sample.loop_start < sample.loop_end;
+}
+
+fn wrapLoopPosition(position: f64, sample: Sample) f64 {
+    const loop_start: f64 = @floatFromInt(sample.loop_start);
+    const loop_end: f64 = @floatFromInt(sample.loop_end);
+    if (position < loop_end) return position;
+    return loop_start + @mod(position - loop_start, loop_end - loop_start);
+}
+
+fn pedalResonanceGain(value: u8) f32 {
+    if (value < pedal_resonance_activation) return 0;
+    return std.math.sqrt(@as(f32, @floatFromInt(value)) / 127.0);
+}
 
 pub fn writeHeader(output: []u8, sample_count: u32, region_count: u32, sample_table_offset: u32, region_table_offset: u32, pcm_offset: u32) void {
     std.debug.assert(output.len >= header_size);
@@ -622,6 +974,19 @@ pub fn writeRegion(output: []u8, offset: usize, region: Region) void {
     writeI16(output, offset + 14, region.gain_centibels);
     writeI16(output, offset + 16, region.pan_milli);
     writeU16(output, offset + 18, region.flags);
+    writeU32(output, offset + 20, region.amp_attack_millis);
+    writeU32(output, offset + 24, region.amp_decay_millis);
+    writeU32(output, offset + 28, region.amp_release_millis);
+    writeU16(output, offset + 32, region.amp_sustain_permille);
+    writeU16(output, offset + 34, region.envelope_flags);
+    writeU32(output, offset + 36, region.filter_cutoff_millihz);
+    writeI16(output, offset + 40, region.filter_resonance_centibels);
+    writeI16(output, offset + 42, region.filter_keytrack_cents);
+    writeI16(output, offset + 44, region.filter_velocity_track_cents);
+    output[offset + 46] = region.filter_keycenter;
+    output[offset + 47] = @intFromEnum(region.filter_type);
+    writeU16(output, offset + 48, region.filter_flags);
+    writeU16(output, offset + 50, region.filter_reserved);
 }
 
 pub fn writePcm16(output: []u8, offset: usize, sample: f32) void {
@@ -661,6 +1026,110 @@ fn testBank(allocator: std.mem.Allocator) ![]u8 {
     writeHeader(bytes, 1, 1, sample_table, region_table, pcm_offset);
     writeSample(bytes, sample_table, .{ .data_offset = 0, .frame_count = 256, .sample_rate = 48_000, .loop_start = 0, .loop_end = 0 });
     writeRegion(bytes, region_table, .{ .sample_index = 0, .key_low = 0, .key_high = 127, .root_key = 69, .velocity_low = 1, .velocity_high = 127, .trigger = .attack, .soft_low = 0, .soft_high = 127, .tune_cents = 0, .gain_centibels = 0, .pan_milli = 0, .flags = 0 });
+    for (0..256) |frame| writePcm16(bytes, pcm_offset + frame * 2, @sin(@as(f32, @floatFromInt(frame)) * std.math.tau * 440 / 48_000));
+    return bytes;
+}
+
+fn testLoopBank(allocator: std.mem.Allocator) ![]u8 {
+    const sample_table = header_size;
+    const region_table = sample_table + sample_descriptor_size;
+    const pcm_offset = region_table + region_descriptor_size;
+    const frame_count = 16;
+    const bytes = try allocator.alloc(u8, pcm_offset + frame_count * 2);
+    @memset(bytes, 0);
+    writeHeader(bytes, 1, 1, sample_table, region_table, pcm_offset);
+    writeSample(bytes, sample_table, .{ .data_offset = 0, .frame_count = frame_count, .sample_rate = 48_000, .loop_start = 4, .loop_end = 12 });
+    writeRegion(bytes, region_table, .{ .sample_index = 0, .key_low = 0, .key_high = 127, .root_key = 69, .velocity_low = 1, .velocity_high = 127, .trigger = .attack, .soft_low = 0, .soft_high = 127, .tune_cents = 0, .gain_centibels = 0, .pan_milli = 0, .flags = 0 });
+    for (0..frame_count) |frame| writePcm16(bytes, pcm_offset + frame * 2, @as(f32, @floatFromInt(frame + 1)) / frame_count);
+    return bytes;
+}
+
+fn testEnvelopeBank(allocator: std.mem.Allocator) ![]u8 {
+    const sample_table = header_size;
+    const region_table = sample_table + sample_descriptor_size;
+    const pcm_offset = region_table + region_descriptor_size;
+    const frame_count = 2048;
+    const bytes = try allocator.alloc(u8, pcm_offset + frame_count * 2);
+    @memset(bytes, 0);
+    writeHeader(bytes, 1, 1, sample_table, region_table, pcm_offset);
+    writeSample(bytes, sample_table, .{ .data_offset = 0, .frame_count = frame_count, .sample_rate = 4_000, .loop_start = 128, .loop_end = 1024 });
+    writeRegion(bytes, region_table, .{
+        .sample_index = 0,
+        .key_low = 69,
+        .key_high = 69,
+        .root_key = 69,
+        .velocity_low = 1,
+        .velocity_high = 127,
+        .trigger = .attack,
+        .soft_low = 0,
+        .soft_high = 127,
+        .tune_cents = 0,
+        .gain_centibels = 0,
+        .pan_milli = 0,
+        .flags = 0,
+        .amp_attack_millis = 100,
+        .amp_decay_millis = 100,
+        .amp_release_millis = 200,
+        .amp_sustain_permille = 500,
+        .filter_cutoff_millihz = 2_400_000,
+        .filter_resonance_centibels = 600,
+        .filter_keytrack_cents = 100,
+        .filter_velocity_track_cents = 1200,
+        .filter_keycenter = 60,
+        .filter_type = .low_pass_4p,
+    });
+    for (0..frame_count) |frame| writePcm16(bytes, pcm_offset + frame * 2, if (frame & 1 == 0) 0.5 else -0.5);
+    return bytes;
+}
+
+fn testEnvelopeVersionBank(allocator: std.mem.Allocator) ![]u8 {
+    const sample_table = header_size;
+    const region_table = sample_table + sample_descriptor_size;
+    const pcm_offset = region_table + envelope_region_descriptor_size;
+    const bytes = try allocator.alloc(u8, pcm_offset + 256 * 2);
+    @memset(bytes, 0);
+    writeHeader(bytes, 1, 1, sample_table, region_table, pcm_offset);
+    writeU32(bytes, 8, envelope_version);
+    writeSample(bytes, sample_table, .{ .data_offset = 0, .frame_count = 256, .sample_rate = 48_000, .loop_start = 0, .loop_end = 0 });
+    writeU32(bytes, region_table, 0);
+    bytes[region_table + 4] = 0;
+    bytes[region_table + 5] = 127;
+    bytes[region_table + 6] = 69;
+    bytes[region_table + 7] = 1;
+    bytes[region_table + 8] = 127;
+    bytes[region_table + 9] = @intFromEnum(Trigger.attack);
+    bytes[region_table + 10] = 0;
+    bytes[region_table + 11] = 127;
+    writeU32(bytes, region_table + 20, 125);
+    writeU32(bytes, region_table + 24, 250);
+    writeU32(bytes, region_table + 28, 500);
+    writeU16(bytes, region_table + 32, 750);
+    for (0..256) |frame| writePcm16(bytes, pcm_offset + frame * 2, @sin(@as(f32, @floatFromInt(frame)) * std.math.tau * 440 / 48_000));
+    return bytes;
+}
+
+fn testLegacyBank(allocator: std.mem.Allocator) ![]u8 {
+    const sample_table = header_size;
+    const region_table = sample_table + sample_descriptor_size;
+    const pcm_offset = region_table + legacy_region_descriptor_size;
+    const bytes = try allocator.alloc(u8, pcm_offset + 256 * 2);
+    @memset(bytes, 0);
+    writeHeader(bytes, 1, 1, sample_table, region_table, pcm_offset);
+    writeU32(bytes, 8, legacy_version);
+    writeSample(bytes, sample_table, .{ .data_offset = 0, .frame_count = 256, .sample_rate = 48_000, .loop_start = 0, .loop_end = 0 });
+    writeU32(bytes, region_table, 0);
+    bytes[region_table + 4] = 0;
+    bytes[region_table + 5] = 127;
+    bytes[region_table + 6] = 69;
+    bytes[region_table + 7] = 1;
+    bytes[region_table + 8] = 127;
+    bytes[region_table + 9] = @intFromEnum(Trigger.attack);
+    bytes[region_table + 10] = 0;
+    bytes[region_table + 11] = 127;
+    writeI16(bytes, region_table + 12, 0);
+    writeI16(bytes, region_table + 14, 0);
+    writeI16(bytes, region_table + 16, 0);
+    writeU16(bytes, region_table + 18, 0);
     for (0..256) |frame| writePcm16(bytes, pcm_offset + frame * 2, @sin(@as(f32, @floatFromInt(frame)) * std.math.tau * 440 / 48_000));
     return bytes;
 }
@@ -713,6 +1182,154 @@ test "sample bank validates and portable piano renders sampled audio" {
     var right_energy: f32 = 0;
     for (right) |sample| right_energy += @abs(sample);
     try std.testing.expect(right_energy > 0.01);
+}
+
+test "version four banks preserve per-zone amplitude envelope and filter data" {
+    const bytes = try testEnvelopeBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const view = try View.open(bytes);
+    try std.testing.expectEqual(version, view.format_version);
+    const region = try view.region(0);
+    try std.testing.expectEqual(@as(u32, 100), region.amp_attack_millis);
+    try std.testing.expectEqual(@as(u32, 100), region.amp_decay_millis);
+    try std.testing.expectEqual(@as(u32, 200), region.amp_release_millis);
+    try std.testing.expectEqual(@as(u16, 500), region.amp_sustain_permille);
+    try std.testing.expectEqual(@as(u32, 2_400_000), region.filter_cutoff_millihz);
+    try std.testing.expectEqual(@as(i16, 600), region.filter_resonance_centibels);
+    try std.testing.expectEqual(@as(i16, 100), region.filter_keytrack_cents);
+    try std.testing.expectEqual(@as(i16, 1200), region.filter_velocity_track_cents);
+    try std.testing.expectEqual(@as(u8, 60), region.filter_keycenter);
+    try std.testing.expectEqual(FilterType.low_pass_4p, region.filter_type);
+}
+
+test "version three envelope banks remain readable with filters disabled" {
+    const bytes = try testEnvelopeVersionBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const view = try View.open(bytes);
+    try std.testing.expectEqual(envelope_version, view.format_version);
+    try std.testing.expectEqual(envelope_region_descriptor_size, view.region_descriptor_stride);
+    const region = try view.region(0);
+    try std.testing.expectEqual(@as(u32, 125), region.amp_attack_millis);
+    try std.testing.expectEqual(@as(u16, 750), region.amp_sustain_permille);
+    try std.testing.expectEqual(FilterType.none, region.filter_type);
+    try std.testing.expectEqual(filter_cutoff_disabled, region.filter_cutoff_millihz);
+}
+
+test "portable per-voice filters attenuate the intended spectrum and track pitch" {
+    var region = Region{
+        .sample_index = 0,
+        .key_low = 0,
+        .key_high = 127,
+        .root_key = 60,
+        .velocity_low = 1,
+        .velocity_high = 127,
+        .trigger = .attack,
+        .soft_low = 0,
+        .soft_high = 127,
+        .tune_cents = 0,
+        .gain_centibels = 0,
+        .pan_milli = 0,
+        .flags = 0,
+        .filter_cutoff_millihz = 600_000,
+        .filter_resonance_centibels = 0,
+        .filter_keytrack_cents = 100,
+        .filter_keycenter = 60,
+        .filter_type = .low_pass_2p,
+    };
+    var low_pass = VoiceFilter.init(region, 60, 127, 48_000);
+    const high_pitch = VoiceFilter.init(region, 72, 127, 48_000);
+    try std.testing.expect(high_pitch.first.b0 > low_pass.first.b0);
+
+    var filtered_energy: f32 = 0;
+    var dry_energy: f32 = 0;
+    for (0..4096) |frame| {
+        const input: f32 = if (frame & 1 == 0) 1 else -1;
+        const output = low_pass.process(input);
+        if (frame >= 512) {
+            filtered_energy += @abs(output);
+            dry_energy += @abs(input);
+        }
+    }
+    try std.testing.expect(filtered_energy < dry_energy * 0.01);
+
+    region.filter_type = .high_pass_1p;
+    var high_pass = VoiceFilter.init(region, 60, 127, 48_000);
+    var dc_energy: f32 = 0;
+    for (0..4096) |frame| {
+        const output = high_pass.process(0.5);
+        if (frame >= 1024) dc_energy += @abs(output);
+    }
+    try std.testing.expect(dc_energy < 0.001);
+}
+
+test "version two banks retain the legacy piano envelope" {
+    const bytes = try testLegacyBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const view = try View.open(bytes);
+    try std.testing.expectEqual(legacy_version, view.format_version);
+    try std.testing.expectEqual(legacy_region_descriptor_size, view.region_descriptor_stride);
+    const region = try view.region(0);
+    try std.testing.expectEqual(envelope_millis_legacy, region.amp_attack_millis);
+    try std.testing.expectEqual(envelope_millis_legacy, region.amp_decay_millis);
+    try std.testing.expectEqual(envelope_millis_legacy, region.amp_release_millis);
+    try std.testing.expectEqual(envelope_sustain_full, region.amp_sustain_permille);
+}
+
+test "authored ADSR reaches attack decay sustain and release stages" {
+    const bytes = try testEnvelopeBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var instrument: Instrument = .{};
+    try instrument.load(bytes);
+    instrument.noteOn(0, 69, 100);
+
+    var left: [400]f32 = undefined;
+    var right: [400]f32 = undefined;
+    instrument.renderStereo(&left, &right, 4_000);
+    try std.testing.expectEqual(EnvelopeStage.decay, instrument.voices[0].envelope_stage);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), instrument.voices[0].envelope, 0.002);
+    instrument.renderStereo(&left, &right, 4_000);
+    try std.testing.expectEqual(EnvelopeStage.sustain, instrument.voices[0].envelope_stage);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), instrument.voices[0].envelope, 0.002);
+
+    instrument.noteOff(0, 69);
+    var release_left: [800]f32 = undefined;
+    var release_right: [800]f32 = undefined;
+    instrument.renderStereo(&release_left, &release_right, 4_000);
+    try std.testing.expect(!instrument.voices[0].active);
+}
+
+test "sample bank rejects invalid authored sustain levels" {
+    const bytes = try testBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const region_table = header_size + sample_descriptor_size;
+    writeU16(bytes, region_table + 32, envelope_sustain_full + 1);
+    try std.testing.expectError(error.InvalidSampleBank, View.open(bytes));
+}
+
+test "sample loops sustain held instruments and release into the authored tail" {
+    const bytes = try testLoopBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var instrument: Instrument = .{};
+    try instrument.load(bytes);
+
+    instrument.noteOn(0, 69, 100);
+    var left: [96]f32 = undefined;
+    var right: [96]f32 = undefined;
+    instrument.renderStereo(&left, &right, 48_000);
+    try std.testing.expect(instrument.voices[0].active);
+    try std.testing.expect(instrument.voices[0].position >= 4);
+    try std.testing.expect(instrument.voices[0].position < 12);
+
+    instrument.noteOff(0, 69);
+    instrument.renderStereo(&left, &right, 48_000);
+    try std.testing.expect(!instrument.voices[0].active);
+}
+
+test "sample loop wrapping retains overshoot and interpolates across its boundary" {
+    const sample: Sample = .{ .data_offset = 0, .frame_count = 32, .sample_rate = 48_000, .loop_start = 7, .loop_end = 13 };
+    try std.testing.expectApproxEqAbs(@as(f64, 8.5), wrapLoopPosition(14.5, sample), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.25), wrapLoopPosition(31.25, sample), 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.75), wrapLoopPosition(12.75, sample), 0.000001);
 }
 
 test "portable piano applies sustain and pedal release" {
@@ -798,6 +1415,52 @@ test "portable piano plays sampled key release and pedal mechanisms" {
         sustained_layers += 1;
     };
     try std.testing.expectEqual(@as(usize, 2), sustained_layers);
+}
+
+test "portable piano excites sounding-note resonance when the pedal moves" {
+    const bytes = try testTriggerBank(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var piano: Piano = .{};
+    try piano.load(bytes);
+    var left: [32]f32 = undefined;
+    var right: [32]f32 = undefined;
+
+    piano.noteOn(0, 69, 96);
+    piano.renderStereo(&left, &right, 48_000);
+    for (piano.voices) |voice| try std.testing.expect(voice.trigger != .pedal_resonance or !voice.active);
+
+    piano.controlChange(0, 64, 54);
+    piano.renderStereo(&left, &right, 48_000);
+    var resonant: usize = 0;
+    for (piano.voices) |voice| if (voice.active and voice.trigger == .pedal_resonance and voice.key_down) {
+        resonant += 1;
+        try std.testing.expectEqual(@as(u8, 96), voice.velocity);
+    };
+    try std.testing.expectEqual(@as(usize, 1), resonant);
+
+    piano.controlChange(0, 64, 100);
+    piano.renderStereo(&left, &right, 48_000);
+    resonant = 0;
+    for (piano.voices) |voice| {
+        if (voice.active and voice.trigger == .pedal_resonance and voice.key_down) resonant += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), resonant);
+
+    piano.controlChange(0, 64, 0);
+    piano.renderStereo(&left, &right, 48_000);
+    for (piano.voices) |voice| if (voice.active and voice.trigger == .pedal_resonance) {
+        try std.testing.expect(!voice.key_down);
+        try std.testing.expect(voice.releasing);
+    };
+}
+
+test "portable sampled resonance follows continuous pedal depth" {
+    try std.testing.expectEqual(@as(f32, 0), pedalResonanceGain(0));
+    try std.testing.expectEqual(@as(f32, 0), pedalResonanceGain(pedal_resonance_activation - 1));
+    const half = pedalResonanceGain(54);
+    const full = pedalResonanceGain(127);
+    try std.testing.expect(half > 0 and half < full);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), full, 0.000001);
 }
 
 test "portable piano continuously blends recorded velocity layers" {

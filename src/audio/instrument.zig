@@ -3,6 +3,20 @@ const std = @import("std");
 pub const max_samples = 4096;
 pub const max_zones = 16_384;
 pub const max_selected_layers = 16;
+pub const max_envelope_seconds: f32 = 3600;
+pub const max_filter_cutoff_hz: f32 = 192_000;
+
+pub const FilterType = enum(u8) {
+    none = 0,
+    low_pass_1p = 1,
+    high_pass_1p = 2,
+    low_pass_2p = 3,
+    high_pass_2p = 4,
+    band_pass_2p = 5,
+    band_reject_2p = 6,
+    low_pass_4p = 7,
+    high_pass_4p = 8,
+};
 
 pub const Trigger = enum(u8) {
     attack,
@@ -91,6 +105,16 @@ pub const Zone = struct {
     tune_cents: i16 = 0,
     gain_db: f32 = 0,
     pan: f32 = 0,
+    amp_attack_seconds: ?f32 = null,
+    amp_decay_seconds: ?f32 = null,
+    amp_sustain_percent: ?f32 = null,
+    amp_release_seconds: ?f32 = null,
+    filter_type: FilterType = .none,
+    filter_cutoff_hz: ?f32 = null,
+    filter_resonance_db: f32 = 0,
+    filter_keytrack_cents: f32 = 0,
+    filter_keycenter: u8 = 60,
+    filter_velocity_track_cents: f32 = 0,
 };
 
 const ZoneTemplate = struct {
@@ -118,6 +142,21 @@ const ZoneTemplate = struct {
     tune_cents: i16 = 0,
     gain_db: f32 = 0,
     pan: f32 = 0,
+    amp_attack_seconds: ?f32 = null,
+    amp_decay_seconds: ?f32 = null,
+    amp_sustain_percent: ?f32 = null,
+    amp_release_seconds: ?f32 = null,
+    filter_type: FilterType = .none,
+    filter_cutoff_hz: ?f32 = null,
+    filter_resonance_db: f32 = 0,
+    filter_keytrack_cents: f32 = 0,
+    filter_keycenter: u8 = 60,
+    filter_velocity_track_cents: f32 = 0,
+    /// An explicitly unsupported `fil_type` must disable the inferred cutoff
+    /// filter regardless of SFZ opcode order. Silently turning an unknown mode
+    /// into the default two-pole low-pass would materially change an imported
+    /// instrument while claiming successful normalization.
+    filter_type_unsupported: bool = false,
     on_cc64_low: ?u8 = null,
     on_cc64_high: ?u8 = null,
 };
@@ -319,6 +358,44 @@ fn applySfzOpcode(template: *ZoneTemplate, key: []const u8, value: []const u8) !
     } else if (std.mem.eql(u8, key, "pan")) {
         const sfz_pan = try std.fmt.parseFloat(f32, value);
         template.pan = std.math.clamp(sfz_pan / 100.0, -1, 1);
+    } else if (std.mem.eql(u8, key, "ampeg_attack")) {
+        template.amp_attack_seconds = try parseEnvelopeSeconds(value);
+    } else if (std.mem.eql(u8, key, "ampeg_decay")) {
+        template.amp_decay_seconds = try parseEnvelopeSeconds(value);
+    } else if (std.mem.eql(u8, key, "ampeg_sustain")) {
+        const percent = try std.fmt.parseFloat(f32, value);
+        if (!std.math.isFinite(percent) or percent < 0 or percent > 100) return error.InvalidEnvelopeSustain;
+        template.amp_sustain_percent = percent;
+    } else if (std.mem.eql(u8, key, "ampeg_release")) {
+        template.amp_release_seconds = try parseEnvelopeSeconds(value);
+    } else if (std.mem.eql(u8, key, "cutoff")) {
+        const cutoff = try std.fmt.parseFloat(f32, value);
+        if (!std.math.isFinite(cutoff) or cutoff <= 0 or cutoff > max_filter_cutoff_hz) return error.InvalidFilterCutoff;
+        template.filter_cutoff_hz = cutoff;
+        if (!template.filter_type_unsupported and template.filter_type == .none) template.filter_type = .low_pass_2p;
+    } else if (std.mem.eql(u8, key, "resonance")) {
+        const resonance = try std.fmt.parseFloat(f32, value);
+        if (!std.math.isFinite(resonance) or resonance < 0 or resonance > 60) return error.InvalidFilterResonance;
+        template.filter_resonance_db = resonance;
+    } else if (std.mem.eql(u8, key, "fil_type")) {
+        if (parseFilterType(value)) |kind| {
+            template.filter_type = kind;
+            template.filter_type_unsupported = false;
+        } else {
+            template.filter_type = .none;
+            template.filter_type_unsupported = true;
+            return false;
+        }
+    } else if (std.mem.eql(u8, key, "fil_keytrack")) {
+        const cents = try std.fmt.parseFloat(f32, value);
+        if (!std.math.isFinite(cents) or cents < -1200 or cents > 1200) return error.InvalidFilterTracking;
+        template.filter_keytrack_cents = cents;
+    } else if (std.mem.eql(u8, key, "fil_keycenter")) {
+        template.filter_keycenter = try parseMidiKey(value);
+    } else if (std.mem.eql(u8, key, "fil_veltrack")) {
+        const cents = try std.fmt.parseFloat(f32, value);
+        if (!std.math.isFinite(cents) or cents < -9600 or cents > 9600) return error.InvalidFilterTracking;
+        template.filter_velocity_track_cents = cents;
     } else if (std.mem.eql(u8, key, "trigger")) {
         if (std.mem.eql(u8, value, "release") or std.mem.eql(u8, value, "release_key")) {
             template.trigger = .release;
@@ -329,6 +406,18 @@ fn applySfzOpcode(template: *ZoneTemplate, key: []const u8, value: []const u8) !
         template.mic_bus = try std.fmt.parseInt(u8, value, 10);
     } else return false;
     return true;
+}
+
+fn parseFilterType(value: []const u8) ?FilterType {
+    if (std.mem.eql(u8, value, "lpf_1p")) return .low_pass_1p;
+    if (std.mem.eql(u8, value, "hpf_1p")) return .high_pass_1p;
+    if (std.mem.eql(u8, value, "lpf_2p")) return .low_pass_2p;
+    if (std.mem.eql(u8, value, "hpf_2p")) return .high_pass_2p;
+    if (std.mem.eql(u8, value, "bpf_2p")) return .band_pass_2p;
+    if (std.mem.eql(u8, value, "brf_2p")) return .band_reject_2p;
+    if (std.mem.eql(u8, value, "lpf_4p")) return .low_pass_4p;
+    if (std.mem.eql(u8, value, "hpf_4p")) return .high_pass_4p;
+    return null;
 }
 
 fn detailControllerOpcode(key: []const u8, prefix: []const u8) ?u8 {
@@ -407,7 +496,23 @@ fn appendRegion(
         .tune_cents = template.tune_cents,
         .gain_db = template.gain_db,
         .pan = template.pan,
+        .amp_attack_seconds = template.amp_attack_seconds,
+        .amp_decay_seconds = template.amp_decay_seconds,
+        .amp_sustain_percent = template.amp_sustain_percent,
+        .amp_release_seconds = template.amp_release_seconds,
+        .filter_type = if (template.filter_type_unsupported) .none else template.filter_type,
+        .filter_cutoff_hz = if (template.filter_type_unsupported) null else template.filter_cutoff_hz,
+        .filter_resonance_db = template.filter_resonance_db,
+        .filter_keytrack_cents = template.filter_keytrack_cents,
+        .filter_keycenter = template.filter_keycenter,
+        .filter_velocity_track_cents = template.filter_velocity_track_cents,
     });
+}
+
+fn parseEnvelopeSeconds(value: []const u8) !f32 {
+    const seconds = try std.fmt.parseFloat(f32, value);
+    if (!std.math.isFinite(seconds) or seconds < 0 or seconds > max_envelope_seconds) return error.InvalidEnvelopeTime;
+    return seconds;
 }
 
 fn normalizeSamplePath(allocator: std.mem.Allocator, default_path: []const u8, sample_path: []const u8) ![]u8 {
@@ -572,6 +677,17 @@ pub const Manifest = struct {
             if (zone.detail_controller != 0 and (zone.detail_controller < 20 or zone.detail_controller > 23)) return error.InvalidDetailController;
             if (zone.root_key > 127 or zone.round_robin_count == 0 or zone.round_robin_index >= zone.round_robin_count or zone.round_robin_group >= 32) return error.InvalidRoundRobin;
             if (!std.math.isFinite(zone.gain_db) or !std.math.isFinite(zone.pan) or zone.pan < -1 or zone.pan > 1 or !std.math.isFinite(zone.key_track) or zone.key_track < -4 or zone.key_track > 4) return error.InvalidMix;
+            for ([_]?f32{ zone.amp_attack_seconds, zone.amp_decay_seconds, zone.amp_release_seconds }) |seconds| if (seconds) |present| {
+                if (!std.math.isFinite(present) or present < 0 or present > max_envelope_seconds) return error.InvalidEnvelopeTime;
+            };
+            if (zone.amp_sustain_percent) |percent| {
+                if (!std.math.isFinite(percent) or percent < 0 or percent > 100) return error.InvalidEnvelopeSustain;
+            }
+            if (zone.filter_cutoff_hz) |cutoff| {
+                if (!std.math.isFinite(cutoff) or cutoff <= 0 or cutoff > max_filter_cutoff_hz or zone.filter_type == .none) return error.InvalidFilterCutoff;
+            }
+            if (!std.math.isFinite(zone.filter_resonance_db) or zone.filter_resonance_db < 0 or zone.filter_resonance_db > 60) return error.InvalidFilterResonance;
+            if (zone.filter_keycenter > 127 or !std.math.isFinite(zone.filter_keytrack_cents) or zone.filter_keytrack_cents < -1200 or zone.filter_keytrack_cents > 1200 or !std.math.isFinite(zone.filter_velocity_track_cents) or zone.filter_velocity_track_cents < -9600 or zone.filter_velocity_track_cents > 9600) return error.InvalidFilterTracking;
         }
     }
 };
@@ -714,6 +830,65 @@ test "SFZ normalization preserves hierarchy paths triggers and round robins" {
     try std.testing.expectEqual(Trigger.release, imported.zones[1].trigger);
     try std.testing.expectEqual(Trigger.pedal_down, imported.zones[2].trigger);
     try std.testing.expectEqual(@as(u8, 126), imported.zones[2].pedal_low);
+}
+
+test "SFZ normalization inherits per-zone amplitude envelopes" {
+    const sfz =
+        \\<global> ampeg_attack=0.125 ampeg_decay=0.75 ampeg_sustain=62.5 ampeg_release=1.5
+        \\<group> ampeg_attack=0.25
+        \\<region> sample=tone.wav key=C4
+        \\<region> sample=tail.wav key=D4 ampeg_release=3
+    ;
+    var imported = try parseSfz(std.testing.allocator, sfz);
+    defer imported.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), imported.zones.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), imported.zones[0].amp_attack_seconds.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), imported.zones[0].amp_decay_seconds.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 62.5), imported.zones[0].amp_sustain_percent.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), imported.zones[0].amp_release_seconds.?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3), imported.zones[1].amp_release_seconds.?, 0.0001);
+}
+
+test "SFZ normalization preserves inherited filter modes and tracking" {
+    const sfz =
+        \\<global> cutoff=8400 resonance=6 fil_type=lpf_4p fil_keytrack=100 fil_keycenter=C4 fil_veltrack=1200
+        \\<group> cutoff=3200 fil_type=hpf_2p
+        \\<region> sample=tone.wav key=D4
+        \\<region> sample=tail.wav key=E4 cutoff=12000 fil_type=brf_2p
+    ;
+    var imported = try parseSfz(std.testing.allocator, sfz);
+    defer imported.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), imported.zones.len);
+    try std.testing.expectEqual(FilterType.high_pass_2p, imported.zones[0].filter_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 3200), imported.zones[0].filter_cutoff_hz.?, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 6), imported.zones[0].filter_resonance_db, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), imported.zones[0].filter_keytrack_cents, 0.001);
+    try std.testing.expectEqual(@as(u8, 60), imported.zones[0].filter_keycenter);
+    try std.testing.expectApproxEqAbs(@as(f32, 1200), imported.zones[0].filter_velocity_track_cents, 0.001);
+    try std.testing.expectEqual(FilterType.band_reject_2p, imported.zones[1].filter_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 12000), imported.zones[1].filter_cutoff_hz.?, 0.001);
+
+    try std.testing.expectError(error.InvalidFilterCutoff, parseSfz(std.testing.allocator, "<region> sample=x.wav cutoff=0"));
+    try std.testing.expectError(error.InvalidFilterResonance, parseSfz(std.testing.allocator, "<region> sample=x.wav resonance=61"));
+    try std.testing.expectError(error.InvalidFilterTracking, parseSfz(std.testing.allocator, "<region> sample=x.wav fil_keytrack=1201"));
+}
+
+test "unsupported explicit SFZ filter modes never become an inferred low pass" {
+    const before_cutoff =
+        \\<region> sample=first.wav fil_type=exotic_6p cutoff=4200
+        \\<region> sample=second.wav cutoff=5100 fil_type=exotic_6p
+    ;
+    var imported = try parseSfz(std.testing.allocator, before_cutoff);
+    defer imported.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), imported.zones.len);
+    try std.testing.expectEqual(@as(usize, 2), imported.unsupported_opcode_count);
+    for (imported.zones) |zone| {
+        try std.testing.expectEqual(FilterType.none, zone.filter_type);
+        try std.testing.expectEqual(@as(?f32, null), zone.filter_cutoff_hz);
+    }
 }
 
 test "WAV and FLAC metadata inspection hashes lossless assets" {

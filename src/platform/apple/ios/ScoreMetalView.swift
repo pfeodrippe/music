@@ -31,7 +31,7 @@ final class ScoreMetalView: UIView {
 
     private let metalDevice: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
+    private var pipeline: MTLRenderPipelineState
     private let glyphTexture: MTLTexture
     private let glyphSampler: MTLSamplerState
     private var itemBuffer: MTLBuffer
@@ -40,6 +40,12 @@ final class ScoreMetalView: UIView {
     private var nextAutosaveTimestamp: CFTimeInterval = 0
     private let itemCapacity = 16_384
     private var accessibilitySignature = ""
+#if DEBUG
+    private var shaderOverrideURL: URL?
+    private var shaderModificationTime: TimeInterval?
+    private var nextShaderPollTimestamp: CFTimeInterval = 0
+    private var shaderReloadInFlight = false
+#endif
 
     private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
@@ -54,15 +60,6 @@ final class ScoreMetalView: UIView {
               let fragment = library.makeFunction(name: "scoreFragment") else {
             fatalError("Score Metal shader library is missing")
         }
-        let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.vertexFunction = vertex
-        descriptor.fragmentFunction = fragment
-        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        descriptor.colorAttachments[0].isBlendingEnabled = true
-        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         let atlasWidth = Int(score_ios_glyph_atlas_width())
         let atlasHeight = Int(score_ios_glyph_atlas_height())
         let atlasDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: atlasWidth, height: atlasHeight, mipmapped: false)
@@ -72,7 +69,7 @@ final class ScoreMetalView: UIView {
         samplerDescriptor.magFilter = .linear
         samplerDescriptor.sAddressMode = .clampToEdge
         samplerDescriptor.tAddressMode = .clampToEdge
-        guard let pipelineState = try? device.makeRenderPipelineState(descriptor: descriptor),
+        guard let pipelineState = try? Self.makePipeline(device: device, vertex: vertex, fragment: fragment),
               let buffer = device.makeBuffer(length: itemCapacity * MemoryLayout<ScoreDrawItem>.stride, options: .storageModeShared),
               let atlas = device.makeTexture(descriptor: atlasDescriptor),
               let sampler = device.makeSamplerState(descriptor: samplerDescriptor),
@@ -107,6 +104,9 @@ final class ScoreMetalView: UIView {
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
         link.add(to: .main, forMode: .common)
         displayLink = link
+#if DEBUG
+        configureShaderReload()
+#endif
     }
 
     required init?(coder: NSCoder) { fatalError("ScoreMetalView is programmatic") }
@@ -129,6 +129,9 @@ final class ScoreMetalView: UIView {
     @objc private func renderFrame(_ link: CADisplayLink) {
         let delta = previousTimestamp == 0 ? 1.0 / 60.0 : min(link.timestamp - previousTimestamp, 0.1)
         previousTimestamp = link.timestamp
+#if DEBUG
+        pollShaderReload(at: link.timestamp)
+#endif
         score_ios_frame(Float(delta))
         updateAccessibility()
 
@@ -160,6 +163,96 @@ final class ScoreMetalView: UIView {
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
+
+    private static func makePipeline(
+        device: MTLDevice,
+        vertex: MTLFunction,
+        fragment: MTLFunction
+    ) throws -> MTLRenderPipelineState {
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertex
+        descriptor.fragmentFunction = fragment
+        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        return try device.makeRenderPipelineState(descriptor: descriptor)
+    }
+
+#if DEBUG
+    /// Development builds seed a writable shader beside the autosave data.
+    /// `scripts/dev-ios.sh` replaces this file in the running simulator. A
+    /// physical development build can receive the same file through its
+    /// file-sharing container without changing the signed application bundle.
+    private func configureShaderReload() {
+        guard let bundledSource = Bundle.main.url(forResource: "ScoreShaders", withExtension: "metal"),
+              let supportRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            print("Score shader reload unavailable: development source is missing")
+            return
+        }
+        let directory = supportRoot.appendingPathComponent("Score", isDirectory: true)
+        let override = directory.appendingPathComponent("ScoreShaders.metal")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: override.path) {
+                try FileManager.default.copyItem(at: bundledSource, to: override)
+            }
+            shaderOverrideURL = override
+            shaderModificationTime = Self.modificationTime(of: override)
+            print("Score shader reload watching \(override.path)")
+        } catch {
+            print("Score shader reload unavailable: \(error)")
+        }
+    }
+
+    private static func modificationTime(of url: URL) -> TimeInterval? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes?[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate
+    }
+
+    private func pollShaderReload(at timestamp: CFTimeInterval) {
+        guard timestamp >= nextShaderPollTimestamp else { return }
+        nextShaderPollTimestamp = timestamp + 0.25
+        guard !shaderReloadInFlight, let url = shaderOverrideURL,
+              let modified = Self.modificationTime(of: url), modified != shaderModificationTime else { return }
+
+        // Mark this revision attempted before compiling so invalid source does
+        // not trigger every frame. A later save changes the timestamp and gets
+        // another independent attempt.
+        shaderModificationTime = modified
+        shaderReloadInFlight = true
+        let device = metalDevice
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<MTLRenderPipelineState, Error>
+            do {
+                let source = try String(contentsOf: url, encoding: .utf8)
+                let library = try device.makeLibrary(source: source, options: nil)
+                guard let vertex = library.makeFunction(name: "scoreVertex"),
+                      let fragment = library.makeFunction(name: "scoreFragment") else {
+                    throw ScoreShaderReloadError.missingEntryPoint
+                }
+                result = .success(try Self.makePipeline(device: device, vertex: vertex, fragment: fragment))
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.shaderReloadInFlight = false
+                switch result {
+                case .success(let candidate):
+                    // The render loop and this assignment both run on the main
+                    // thread, so no frame can observe a partially built state.
+                    self.pipeline = candidate
+                    print("Score shader reload accepted; live Flecs state preserved")
+                case .failure(let error):
+                    print("Score shader reload rejected; retaining last-good pipeline: \(error)")
+                }
+            }
+        }
+    }
+#endif
 
     private func renderPass(for drawable: CAMetalDrawable) -> MTLRenderPassDescriptor {
         let pass = MTLRenderPassDescriptor()
@@ -228,3 +321,16 @@ final class ScoreMetalView: UIView {
         score_ios_pointer(0, 0, 0, Float(point.x), Float(point.y), 0, 0, 0, 0)
     }
 }
+
+#if DEBUG
+private enum ScoreShaderReloadError: LocalizedError {
+    case missingEntryPoint
+
+    var errorDescription: String? {
+        switch self {
+        case .missingEntryPoint:
+            return "scoreVertex or scoreFragment is missing"
+        }
+    }
+}
+#endif

@@ -5,8 +5,24 @@ const musicxml = @import("../import/musicxml.zig");
 const recording = @import("../recording.zig");
 
 pub const magic = "SCOREAPP";
-pub const current_version: u32 = 20;
+pub const current_version: u32 = 21;
 const header_size = 20;
+
+/// Deliberately small, platform-independent reading state. These fields are
+/// safe to restore across native/WebGPU frontends; transient device, pointer,
+/// modal, and sampler state remains owned by the active platform host.
+pub const ViewPreferences = struct {
+    view_start_beat: f32 = 0,
+    zoom: f32 = 1,
+    continuous_pan_fraction: f32 = 0,
+    tool: model.Tool = .read,
+    score_view_mode: model.ScoreViewMode = .paged,
+    focus_score: u32 = 0,
+    keyboard_visible: u32 = 1,
+    vocal_guide_visible: u32 = 1,
+    pedal_guide_visible: u32 = 1,
+    selected_part: u32 = 0,
+};
 
 pub const Snapshot = struct {
     meta: model.DocumentMeta = .{},
@@ -30,6 +46,7 @@ pub const Snapshot = struct {
     part_count: usize = 0,
     annotations: annotation.Store = .{},
     take: recording.Take = .{},
+    view: ViewPreferences = .{},
 };
 
 pub const Error = error{
@@ -172,6 +189,16 @@ pub fn encode(snapshot: *const Snapshot, output: []u8) Error!usize {
         fields[2] = hairpin.number;
         fields[3] = hairpin.flags;
     }
+    try writer.f32(snapshot.view.view_start_beat);
+    try writer.f32(snapshot.view.zoom);
+    try writer.f32(snapshot.view.continuous_pan_fraction);
+    try writer.u32(@intFromEnum(snapshot.view.tool));
+    try writer.u32(@intFromEnum(snapshot.view.score_view_mode));
+    try writer.u32(snapshot.view.focus_score);
+    try writer.u32(snapshot.view.keyboard_visible);
+    try writer.u32(snapshot.view.vocal_guide_visible);
+    try writer.u32(snapshot.view.pedal_guide_visible);
+    try writer.u32(snapshot.view.selected_part);
 
     const payload = output[header_size..writer.offset];
     @memcpy(output[0..8], magic);
@@ -351,6 +378,32 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
             hairpin.number = fields[2];
             hairpin.flags = fields[3];
         }
+    }
+    if (version >= 21) {
+        snapshot.view.view_start_beat = try reader.f32();
+        snapshot.view.zoom = try reader.f32();
+        snapshot.view.continuous_pan_fraction = try reader.f32();
+        if (!std.math.isFinite(snapshot.view.view_start_beat) or
+            !std.math.isFinite(snapshot.view.zoom) or
+            !std.math.isFinite(snapshot.view.continuous_pan_fraction)) return error.InvalidData;
+        snapshot.view.tool = switch (try reader.u32()) {
+            0 => .read,
+            1 => .edit,
+            2 => .annotate,
+            3 => .practice,
+            else => return error.InvalidData,
+        };
+        snapshot.view.score_view_mode = switch (try reader.u32()) {
+            0 => .paged,
+            1 => .continuous,
+            else => return error.InvalidData,
+        };
+        snapshot.view.focus_score = if ((try reader.u32()) != 0) 1 else 0;
+        snapshot.view.keyboard_visible = if ((try reader.u32()) != 0) 1 else 0;
+        snapshot.view.vocal_guide_visible = if ((try reader.u32()) != 0) 1 else 0;
+        snapshot.view.pedal_guide_visible = if ((try reader.u32()) != 0) 1 else 0;
+        snapshot.view.selected_part = try reader.u32();
+        if (snapshot.view.selected_part >= model.max_instrument_parts) return error.InvalidData;
     }
     snapshot.annotations.next_id = 1;
     for (snapshot.annotations.strokes[0..snapshot.annotations.stroke_count]) |stroke| snapshot.annotations.next_id = @max(snapshot.annotations.next_id, stroke.stable_id + 1);
@@ -543,6 +596,18 @@ test "native document round trips notes, transport and anchored ink" {
     snapshot.parts[1] = .{ .source_index = 1, .midi_program = 49 };
     snapshot.parts[1].setName("Strings");
     snapshot.part_count = 2;
+    snapshot.view = .{
+        .view_start_beat = 18,
+        .zoom = 0.65,
+        .continuous_pan_fraction = 0.375,
+        .tool = .practice,
+        .score_view_mode = .continuous,
+        .focus_score = 1,
+        .keyboard_visible = 0,
+        .vocal_guide_visible = 0,
+        .pedal_guide_visible = 1,
+        .selected_part = 1,
+    };
     snapshot.annotations.beginScore(.{ .u = 12.5, .v = 0.3, .pressure = 0.8, .time_ms = 10 }, 1);
     snapshot.annotations.end();
     var bytes: [4096]u8 = undefined;
@@ -595,6 +660,16 @@ test "native document round trips notes, transport and anchored ink" {
     try std.testing.expectEqual(@as(u32, 1), annotation.pageIndex(decoded.annotations.strokes[0]));
     try std.testing.expectApproxEqAbs(@as(f32, 12.5), decoded.annotations.points[0].u, 0.001);
     try std.testing.expectEqual(@as(u32, 0), decoded.transport.metronome_enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), decoded.view.view_start_beat, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.65), decoded.view.zoom, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.375), decoded.view.continuous_pan_fraction, 0.001);
+    try std.testing.expectEqual(model.Tool.practice, decoded.view.tool);
+    try std.testing.expectEqual(model.ScoreViewMode.continuous, decoded.view.score_view_mode);
+    try std.testing.expectEqual(@as(u32, 1), decoded.view.focus_score);
+    try std.testing.expectEqual(@as(u32, 0), decoded.view.keyboard_visible);
+    try std.testing.expectEqual(@as(u32, 0), decoded.view.vocal_guide_visible);
+    try std.testing.expectEqual(@as(u32, 1), decoded.view.pedal_guide_visible);
+    try std.testing.expectEqual(@as(u32, 1), decoded.view.selected_part);
 }
 
 test "version 15 native documents migrate without invented slur numbers" {
@@ -613,9 +688,9 @@ test "version 15 native documents migrate without invented slur numbers" {
     note_start += 8 + 16 + 16 + 4;
     const notation_start = note_start + 36;
     std.mem.copyForwards(u8, bytes[notation_start .. encoded_len - 4], bytes[notation_start + 4 .. encoded_len]);
-    // v19 appended the notation word, v17 an empty part table, and v18 an
-    // empty hairpin table. Remove all three for a genuine v15 payload.
-    const len = encoded_len - 12;
+    // v19 appended the notation word, v17 an empty part table, v18 an empty
+    // hairpin table, and v21 the 40-byte view tail. Remove them for v15.
+    const len = encoded_len - 52;
     writeInt(u32, bytes[12..16], @intCast(len - header_size));
     writeInt(u32, bytes[8..12], 15);
     writeInt(u32, bytes[16..20], std.hash.crc.Crc32.hash(bytes[header_size..len]));
@@ -645,6 +720,29 @@ test "native document persists synchronized MIDI take metadata" {
     try std.testing.expectApproxEqAbs(@as(f32, 93.5), decoded.take.tempo_bpm, 0.001);
 }
 
+test "version 20 native documents keep default reading preferences" {
+    const snapshot = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(snapshot);
+    snapshot.* = .{};
+    snapshot.measures[0] = .{ .start_beat = 0, .duration_beats = 4, .number = 1, .beats = 4, .beat_unit = 4, .ending_mask = 2, .ending_flags = model.measure_ending_start };
+    snapshot.measure_count = 1;
+    snapshot.view = .{ .zoom = 0.55, .score_view_mode = .continuous, .keyboard_visible = 0 };
+    var bytes: [4096]u8 = undefined;
+    const encoded_len = try encode(snapshot, &bytes);
+    const legacy_len = encoded_len - 40;
+    writeInt(u32, bytes[8..12], 20);
+    writeInt(u32, bytes[12..16], @intCast(legacy_len - header_size));
+    writeInt(u32, bytes[16..20], std.hash.crc.Crc32.hash(bytes[header_size..legacy_len]));
+
+    const decoded = try std.testing.allocator.create(Snapshot);
+    defer std.testing.allocator.destroy(decoded);
+    try decode(bytes[0..legacy_len], decoded);
+    try std.testing.expectEqual(@as(u16, 2), decoded.measures[0].ending_mask);
+    try std.testing.expectEqual(model.ScoreViewMode.paged, decoded.view.score_view_mode);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), decoded.view.zoom, 0.001);
+    try std.testing.expectEqual(@as(u32, 1), decoded.view.keyboard_visible);
+}
+
 test "version 14 native documents migrate with automatic fingering" {
     const snapshot = try std.testing.allocator.create(Snapshot);
     defer std.testing.allocator.destroy(snapshot);
@@ -664,9 +762,9 @@ test "version 14 native documents migrate with automatic fingering" {
     note_start += 4;
     const technique_start = note_start + 32;
     std.mem.copyForwards(u8, bytes[technique_start .. encoded_len - 8], bytes[technique_start + 8 .. encoded_len]);
-    // Strip the v15 note-technique quartet, v19 notation word, and the empty
-    // v17 part and v18 hairpin tables.
-    const legacy_len = encoded_len - 16;
+    // Strip the v15 note-technique quartet, v19 notation word, the empty v17
+    // part/v18 hairpin tables, and the v21 40-byte view tail.
+    const legacy_len = encoded_len - 56;
     writeInt(u32, bytes[8..12], 14);
     writeInt(u32, bytes[12..16], @intCast(legacy_len - header_size));
     writeInt(u32, bytes[16..20], std.hash.crc.Crc32.hash(bytes[header_size..legacy_len]));

@@ -2,7 +2,7 @@
 
 Score is a game-style, local-first notation and piano-practice application. The score scene, product UI, hit testing, transport, recording model, assessment, persistence, and hot-reloadable systems are Zig/Flecs code. macOS presents the shared render packets through Dawn/Metal; the browser presents them through WebGPU. There is no DOM application UI, Canvas 2D, WebGL, or software renderer.
 
-The current build can import MusicXML/XML/MXL, standard MIDI, and portable `.score` documents; export MusicXML/MXL, MIDI, `.score`, or the complete score as a paginated A4 PDF; preserve timed lyrics and optional vocal-guide cues separately from instrument notes; preserve separate instrumental source parts instead of superimposing an ensemble onto one staff; render and page through a properly braced piano grand staff; insert, select, move, delete, undo, annotate, loop, count in, adjust tempo, play, record microphone audio plus synchronized MIDI, replay a take, and assess live MIDI or detected microphone pitch. The selected instrumental part controls notation, editing, printable pages, practice assessment, and virtual-piano guidance, while full-document playback and MusicXML/MXL export retain every part. MusicXML grace notes remain non-time-consuming exchange events and engrave as ordered cue-size attacks before their principal note instead of collapsing into a chord; connected cue-size beams, slash, following/previous steal percentages, and make-time survive round trips, while the timing attributes drive native/MIDI performance. Single-note tremolo counts also survive native and MusicXML/MXL round trips, engrave as analytic GPU stem strokes independently from ordinary note beams, and drive repeated native/MIDI attacks at the notated subdivision. Numbered MusicXML crescendo/diminuendo hairpins retain staff ownership, placement, spread, niente and line style through native saves and exchange export; the GPU engraver preserves their opening across responsive system/page breaks. The guided piano shows live and authored soft, sostenuto, and sustain positions, previews the next event across all three pedals, and counts both late attempts and completely missed changes during practice. MusicXML round trips continuous positions for all three pedals; Edit mode records CC64, CC66, and CC67 at the score cursor, while the GPU score shows separate pressure curves and measure heatmaps. The shared semantic control tree is exposed through NSAccessibility, browser accessibility controls, and UIAccessibilityElement. Browser state stays in IndexedDB and the installable PWA works offline after its first successful load. Native state and captured audio stay under `~/Library/Application Support/Score`.
+The current build can import MusicXML/XML/MXL, standard MIDI, and portable `.score` documents; export MusicXML/MXL, MIDI, `.score`, or the complete score as a paginated A4 PDF; preserve timed lyrics and optional vocal-guide cues separately from instrument notes; preserve separate instrumental source parts instead of superimposing an ensemble onto one staff; render and page through a properly braced piano grand staff; insert, select, move, delete, undo, annotate, loop, count in, adjust tempo, play, record microphone audio plus synchronized MIDI, replay a take, and assess live MIDI or detected microphone pitch. The selected instrumental part controls notation, editing, printable pages, practice assessment, and virtual-piano guidance, while full-document playback and MusicXML/MXL export retain every part. MusicXML grace notes remain non-time-consuming exchange events and engrave as ordered cue-size attacks before their principal note instead of collapsing into a chord; connected cue-size beams, slash, following/previous steal percentages, and make-time survive round trips, while the timing attributes drive native/MIDI performance. Single-note tremolo counts also survive native and MusicXML/MXL round trips, engrave as analytic GPU stem strokes independently from ordinary note beams, and drive repeated native/MIDI attacks at the notated subdivision. Numbered MusicXML crescendo/diminuendo hairpins retain staff ownership, placement, spread, niente and line style through native saves and exchange export; the GPU engraver preserves their opening across responsive system/page breaks. The guided piano shows live and authored soft, sostenuto, and sustain positions, previews the next event across all three pedals, and counts both late attempts and completely missed changes during practice. MusicXML round trips continuous positions for all three pedals; Edit mode records CC64, CC66, and CC67 at the score cursor, while the GPU score shows separate pressure curves and measure heatmaps. The shared semantic control tree is exposed through NSAccessibility, browser accessibility controls, and UIAccessibilityElement. Browser state stays in IndexedDB—including view mode, zoom, reading position, selected part, and visible practice panels—and the installable PWA works offline after its first successful load. Native state and captured audio stay under `~/Library/Application Support/Score`.
 
 ## Toolchain
 
@@ -107,7 +107,7 @@ presentation time reported separately, 120 Hz and 60 Hz budget misses (with
 navigating a representative large score; the counters deliberately do not
 pretend to be Dawn GPU timestamp data.
 
-The native large-score reference pass uses a 195-measure, 2,759-note private
+The native large-score reference pass uses a 195-measure, 2,781-event private
 MusicXML document at four visible systems. On this development Mac it measures
 3.313 ms average CPU/submit work in ReleaseSafe with 1,573 draw items and no
 120/60 Hz budget misses. Chord, voice, accidental, and notation queries are
@@ -160,7 +160,8 @@ zig build portable-piano
 zig build portable-piano-verify
 ```
 
-The current version-2 bank is a licensed local build artifact and is not committed. It
+The current version-4 bank is a licensed local build artifact and is not committed; the
+runtime remains backward-compatible with versions 2 and 3. It
 contains 353 deduplicated Salamander samples and 931 regions in 135.3 MiB:
 704 attack regions (all 88 keys × eight recorded velocity layers), 68 sampled
 damper releases for the damped keys, 88 per-key hammer releases, 69 authored
@@ -169,15 +170,23 @@ the bank and its attribution into Web and iOS
 bundles. The shared Zig callback is allocation-free with 128 layer voices and
 implements equal-power interpolation between adjacent recorded velocity
 layers, priority-aware de-clicked voice stealing, sample-rate/pitch conversion,
-key-position stereo, sustain/half-pedal release,
+key-position stereo, validated sustain loops, authored SFZ amplitude
+attack/decay/sustain/release envelopes, and per-zone SFZ filters (one-, two-,
+and four-pole low/high pass plus two-pole band pass/reject, cutoff, resonance,
+key tracking, and velocity tracking), sustain/half-pedal release,
 repedaling, sostenuto, una corda, room response, DC rejection, and linked
-limiting. User `.scorebank` replacement is validated before the live bank is
-changed.
+limiting. Pedal resonance follows the continuous CC64 depth; moving the pedal
+after an attack excites one sampled resonance layer for each already-sounding
+key without duplicating velocity-crossfaded attack voices. User `.scorebank`
+replacement is validated before the live bank is changed.
 
 The portable quality gate also reads the packed PCM for each acoustic trigger
 class and compares an otherwise identical dry/resonant note render. Current
-evidence measures non-silent damper/hammer/resonance assets and a 0.08792
-normalized resonance delta without clipping.
+evidence measures non-silent damper/hammer/resonance assets, 69 authored attack
+envelopes, 931 authored release envelopes, and a 0.07945 normalized resonance
+delta without clipping. The current Accurate Salamander source authors no
+filter opcodes, so its truthful packed filter count is zero; synthetic DSP and
+version-compatibility regressions exercise every portable filter path.
 
 The schema-3 report includes the velocity/pedal/acoustic-layer checks, queue
 stress, calibrated audible sample-attack latency, and a normalized eight-band
@@ -249,11 +258,25 @@ python3 -m http.server 8080 --directory build/web
 
 Open `http://localhost:8080/` (or `score.html`). `zig build dev-web` rebuilds and serves the export, autosaving the world before a development refresh and restoring it afterward. The generated shell contains only the presentation canvas and launch metadata. A browser without WebGPU receives a diagnostic page; it never enters an alternate renderer.
 
+For a local development fixture, copy an authorized MusicXML/MXL/MIDI/`.score`
+file under `build/web` and open
+`http://localhost:8080/score.html?score=relative-file.mxl`. The same semantic
+import path used by the file picker loads it, saves it to IndexedDB, and removes
+the query parameter; an ordinary reload then restores the imported document.
+The URL must remain same-origin and the development preload is not bundled
+content.
+
 `build/web` is a self-contained static deployment, including the sampled grand
 piano bank. Production hosting must use HTTPS, preserve the supplied `_headers`
 where supported, and serve `.wasm` as `application/wasm`; no application server
 is required. Publish the complete directory so the Service Worker can make the
 studio and piano available offline.
+
+The shared allocation-free callback is available as `sample_bank.Instrument`
+(`Piano` remains a compatibility alias). Banks with validated sample loop
+points sustain held, damper-latched, and sostenuto-latched attack voices with
+fractional boundary interpolation, then continue into the recorded tail on
+release. Release and pedal-mechanism one-shots never loop.
 
 ## iOS/iPadOS
 
@@ -261,6 +284,8 @@ studio and piano available offline.
 zig build ios-core
 zig build ios-app
 zig build ios-simulator
+# With an iOS Simulator already booted:
+zig build dev-ios
 ```
 
 `ios-core` produces `zig-out/lib/libscore-ios-core.a` and
@@ -271,6 +296,10 @@ local recovery under `build/ios/Score.app`; set `SCORE_IOS_SIGN_IDENTITY` to a
 valid identity for device signing. `ios-simulator` creates an ad-hoc signed
 arm64 simulator bundle under `build/ios-simulator/Score.app`. UIKit is only the
 lifecycle/device host—the product UI and audio instrument remain shared Zig.
+`dev-ios` builds and launches the Debug simulator app, then watches the Metal
+source. A changed shader is compiled into a candidate pipeline without pausing
+the render loop; invalid source retains the last-good pipeline and live
+Zig/Flecs state, while a valid edit swaps at a main-thread frame boundary.
 
 ## Controls
 
@@ -319,6 +348,10 @@ lifecycle/device host—the product UI and audio instrument remain shared Zig.
 - Dynamic markings use collision-aware optical lanes: duplicate markings on a
   simultaneous chord are coalesced, while cross-staff notes, stems, beams, and
   articulations make the expression move to the nearest clear lane.
+- Concurrent crescendo/diminuendo wedges use interval-partitioned optical
+  lanes per part, staff, and placement side. Overlapping wedges remain visibly
+  separate at maximum opening, while unrelated staff/side groups reuse their
+  closest conventional lane; the bounded resolver allocates nothing per frame.
 - Simultaneous MusicXML voices retain independent rhythm while sharing a
   professional visual resolver: compatible unisons share a head, conflicting
   unisons/seconds separate horizontally with opposing stems, rests split into

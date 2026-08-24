@@ -42,7 +42,10 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             guard let self else { return }
             self.audio.consume(events)
         }
-        scoreView.onAutosave = { [weak self] in self?.saveAutosave() }
+        // Autosave is armed only after the existing journal has been restored
+        // in viewDidAppear. CADisplayLink can render before that callback; an
+        // eagerly installed closure would overwrite a valid score with the
+        // built-in tutorial on the very first frame.
         view = scoreView
     }
 
@@ -50,6 +53,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         super.viewDidAppear(animated)
         becomeFirstResponder()
         restoreAutosave()
+        (view as? ScoreMetalView)?.onAutosave = { [weak self] in self?.saveAutosave() }
         midi.onMessage = { [weak self] status, data1, data2 in
             self?.audio.monitor(status: status, data1: data1, data2: data2)
             score_ios_midi(DispatchTime.now().uptimeNanoseconds, status, data1, data2)

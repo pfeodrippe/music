@@ -1608,8 +1608,20 @@ fn drawScorePage(packet: *render.Packet, stage: Rect, state: *const model.UiStat
         else => "BUILT-IN PRACTICE SCORE",
     };
     if (show_header and !compact_header) packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 60, if (geometry.page_width < 500) "SCORE PRACTICE" else source_label, if (geometry.page_width < 500) 0.9 else 1.2, .{ 0.30, 0.31, 0.31, 1 });
+    // A single instrumental part used to hide its source name completely: the
+    // top-bar part selector only exists for multi-part scores. Keep the active
+    // MusicXML part visible on the paper as well, so a playable reduction such
+    // as "Piano reduction (harp + ensemble)" cannot masquerade as an unrelated
+    // sparse piano part. This is semantic score metadata, not a Holocene-only
+    // UI string, and it is retained by screen and PDF rendering alike.
+    if (show_header and !compact_header and geometry.page_width >= 500 and state.selected_part_label_len != 0) {
+        const part_label = state.selectedPartLabel();
+        const available_width = @max(@as(f32, 120), geometry.page_width - geometry.page_padding * 2 - 220);
+        const part_scale = std.math.clamp(available_width / @max(1, render.Packet.textWidth(part_label, 1)), 0.82, 1.08);
+        packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 76, part_label, part_scale, .{ 0.28, 0.29, 0.29, 1 });
+    }
     if (show_header and !compact_header and state.tool == .edit and geometry.page_width >= 700) {
-        packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 77, "PEDALS: CLICK A LANE TO ADD / DRAG A POINT / DELETE TO REMOVE / CC64, 66, 67", 0.62, .{ 0.45, 0.36, 0.24, 1 });
+        packet.text(geometry.page_x + geometry.page_padding - 5, geometry.page_y + 89, "PEDALS: CLICK A LANE TO ADD / DRAG A POINT / DELETE TO REMOVE / CC64, 66, 67", 0.62, .{ 0.45, 0.36, 0.24, 1 });
     }
     var page_buffer: [40]u8 = undefined;
     const page_number = page.page_index + 1;
@@ -3226,14 +3238,50 @@ fn drawPedalCurveLane(packet: *render.Packet, events: []const model.PedalEvent, 
     packet.line(previous_x, previous_y, geometry.music_x + geometry.music_width, previous_y, 1.05, .{ color[0], color[1], color[2], 0.72 });
 }
 
-fn hairpinLaneY(hairpin: model.Hairpin, geometry: ScoreGeometry, system: usize) f32 {
+const max_hairpin_optical_lanes: usize = 6;
+const hairpin_lane_group_count: usize = 256 * 4;
+// MusicXML wedges can open to a 9 px half-height. This keeps concurrent
+// wedges distinct even when both use their maximum authored spread.
+const hairpin_lane_spacing: f32 = 22;
+
+fn hairpinLaneGroup(hairpin: model.Hairpin) usize {
+    const vocal: usize = if ((hairpin.flags & model.hairpin_flag_vocal) != 0) 2 else 0;
+    const above: usize = if ((hairpin.flags & model.hairpin_flag_above) != 0) 1 else 0;
+    return @as(usize, hairpin.staff) * 4 + vocal + above;
+}
+
+/// Assign overlapping wedges on the same staff/side to deterministic optical
+/// lanes. MusicXML numbers pair starts and stops; they are not placement hints.
+/// Imported hairpins are start-beat sorted, so interval partitioning gives the
+/// minimum lane count without per-frame allocation or quadratic collision
+/// scans. A lane becomes reusable exactly when its previous wedge ends.
+fn resolveHairpinOpticalLanes(hairpins: []const model.Hairpin, state: *const model.UiState, lanes: []u8) void {
+    @memset(lanes, 0);
+    var lane_ends: [hairpin_lane_group_count][max_hairpin_optical_lanes]f32 = undefined;
+    for (&lane_ends) |*group| @memset(group, -std.math.inf(f32));
+
+    for (hairpins[0..@min(hairpins.len, lanes.len)], 0..) |hairpin, index| {
+        if (!model.hairpinVisibleInPart(hairpin, state.selected_part, state.vocal_guide_visible != 0)) continue;
+        if (hairpin.kind != model.hairpin_crescendo and hairpin.kind != model.hairpin_diminuendo) continue;
+        const start = @min(hairpin.start_beat, hairpin.end_beat);
+        const ending = @max(hairpin.start_beat, hairpin.end_beat);
+        const group = &lane_ends[hairpinLaneGroup(hairpin)];
+        var lane: usize = 0;
+        while (lane + 1 < group.len and group[lane] > start + 0.0001) : (lane += 1) {}
+        lanes[index] = @intCast(lane);
+        group[lane] = @max(group[lane], ending);
+    }
+}
+
+fn hairpinLaneY(hairpin: model.Hairpin, geometry: ScoreGeometry, system: usize, optical_lane: u8) f32 {
     const above = (hairpin.flags & model.hairpin_flag_above) != 0;
+    const lane_offset = @as(f32, @floatFromInt(optical_lane)) * hairpin_lane_spacing;
     if ((hairpin.flags & model.hairpin_flag_vocal) != 0) {
-        return if (above) geometry.vocal_y[system] - 17 else geometry.lyric_y[system] - 18;
+        return if (above) geometry.vocal_y[system] - 17 - lane_offset else geometry.lyric_y[system] - 18 + lane_offset;
     }
     const bass = (hairpin.staff % model.staff_slots_per_part & 1) != 0;
-    if (bass) return if (above) geometry.bass_y[system] - 17 else geometry.bass_y[system] + 66;
-    return if (above) geometry.treble_y[system] - 17 else geometry.treble_y[system] + 65;
+    if (bass) return if (above) geometry.bass_y[system] - 17 - lane_offset else geometry.bass_y[system] + 66 + lane_offset;
+    return if (above) geometry.treble_y[system] - 17 - lane_offset else geometry.treble_y[system] + 65 + lane_offset;
 }
 
 fn drawStyledHairpinLine(packet: *render.Packet, x1: f32, y1: f32, x2: f32, y2: f32, flags: u8) void {
@@ -3267,7 +3315,9 @@ fn drawStyledHairpinLine(packet: *render.Packet, x1: f32, y1: f32, x2: f32, y2: 
 /// graphics. A wedge that crosses a responsive line/page boundary retains its
 /// global opening at both sides of every continuation segment.
 fn drawHairpins(packet: *render.Packet, hairpins: []const model.Hairpin, geometry: ScoreGeometry, page: ScorePage, measures: []const model.Measure, state: *const model.UiState) void {
-    for (hairpins) |hairpin| {
+    var optical_lanes: [1024]u8 = undefined;
+    resolveHairpinOpticalLanes(hairpins, state, optical_lanes[0..@min(hairpins.len, optical_lanes.len)]);
+    for (hairpins, 0..) |hairpin, hairpin_index| {
         if (!model.hairpinVisibleInPart(hairpin, state.selected_part, state.vocal_guide_visible != 0)) continue;
         if (hairpin.kind != model.hairpin_crescendo and hairpin.kind != model.hairpin_diminuendo) continue;
         const authored_start = @min(hairpin.start_beat, hairpin.end_beat);
@@ -3290,7 +3340,8 @@ fn drawHairpins(packet: *render.Packet, hairpins: []const model.Hairpin, geometr
             const progress_end = std.math.clamp((segment_end - authored_start) / duration, 0, 1);
             const opening_start = if (hairpin.kind == model.hairpin_crescendo) spread * progress_start else spread * (1 - progress_start);
             const opening_end = if (hairpin.kind == model.hairpin_crescendo) spread * progress_end else spread * (1 - progress_end);
-            const lane_y = hairpinLaneY(hairpin, geometry, system_index);
+            const optical_lane = if (hairpin_index < optical_lanes.len) optical_lanes[hairpin_index] else 0;
+            const lane_y = hairpinLaneY(hairpin, geometry, system_index, optical_lane);
             drawStyledHairpinLine(packet, x1, lane_y - opening_start, x2, lane_y - opening_end, hairpin.flags);
             drawStyledHairpinLine(packet, x1, lane_y + opening_start, x2, lane_y + opening_end, hairpin.flags);
 
@@ -3450,7 +3501,7 @@ fn drawKeyboard(packet: *render.Packet, panel: Rect, state: *const model.UiState
     packet.rect(panel.x, panel.y, panel.width, panel.height, .{ 0.055, 0.064, 0.078, 1 });
     packet.rect(panel.x, panel.y, panel.width, 1, palette.border);
     packet.text(panel.x + 24, panel.y + if (compact) @as(f32, 9) else 14, "Guided piano", if (compact) 1.05 else 1.55, palette.text);
-    if (!compact and panel.width >= 560) packet.text(panel.x + 142, panel.y + 17, "Follow the glow / 1 thumb / 5 little finger", 1.0, palette.muted);
+    if (!compact and showKeyboardInstruction(panel.width, state.pedal_guide_visible != 0)) packet.text(panel.x + 142, panel.y + 17, "Follow the glow / 1 thumb / 5 little finger", 1.0, palette.muted);
     if (state.pedal_guide_visible != 0) drawPedalStatus(packet, panel, state, transport, pedals);
     packet.ellipse(panel.x + panel.width - 146, panel.y + if (compact) @as(f32, 12) else 18, 8, 8, palette.amber);
     packet.text(panel.x + panel.width - 133, panel.y + if (compact) @as(f32, 8) else 14, "Left", if (compact) 0.82 else 1.05, palette.muted);
@@ -3483,6 +3534,20 @@ fn drawKeyboard(packet: *render.Packet, panel: Rect, state: *const model.UiState
     }
     drawFingeringGuide(packet, panel, guide.left_current, guide.left_next, true);
     drawFingeringGuide(packet, panel, guide.right_current, guide.right_next, false);
+}
+
+fn showKeyboardInstruction(panel_width: f32, pedal_guide_visible: bool) bool {
+    // The pedal countdown starts 682 px from the right edge. At tablet/browser
+    // widths its variable text otherwise occupies the same lane as the static
+    // fingering hint. Preserve the useful hint when pedals are hidden, and
+    // reserve the whole status lane when the three-pedal guide is active.
+    return panel_width >= (if (pedal_guide_visible) @as(f32, 1120) else 560);
+}
+
+test "guided-piano hint yields its lane to pedal status at browser widths" {
+    try std.testing.expect(!showKeyboardInstruction(904, true));
+    try std.testing.expect(showKeyboardInstruction(904, false));
+    try std.testing.expect(showKeyboardInstruction(1280, true));
 }
 
 fn drawAnnotationsPage(packet: *render.Packet, stage: Rect, page: ScorePage, vocal_visible: bool, measures: []const model.Measure, annotations: *const annotation.Store) void {
@@ -4355,6 +4420,25 @@ test "hairpins retain their optical opening across responsive systems" {
     try std.testing.expect(@abs(line_starts[2] - line_starts[3]) > 3);
     try std.testing.expectEqual(@as(usize, 2), ellipse_count);
     try std.testing.expect(!packet.clipped);
+}
+
+test "overlapping hairpins use independent optical lanes per staff and side" {
+    const hairpins = [_]model.Hairpin{
+        .{ .start_beat = 0, .end_beat = 4, .staff = 0, .kind = model.hairpin_crescendo, .number = 1 },
+        .{ .start_beat = 1, .end_beat = 3, .staff = 0, .kind = model.hairpin_diminuendo, .number = 2 },
+        .{ .start_beat = 4, .end_beat = 6, .staff = 0, .kind = model.hairpin_crescendo, .number = 3 },
+        .{ .start_beat = 1, .end_beat = 3, .staff = 0, .kind = model.hairpin_crescendo, .number = 4, .flags = model.hairpin_flag_above },
+        .{ .start_beat = 1, .end_beat = 3, .staff = 1, .kind = model.hairpin_crescendo, .number = 5 },
+        .{ .start_beat = 1, .end_beat = 3, .staff = 0, .kind = model.hairpin_crescendo, .number = 6, .flags = model.hairpin_flag_vocal },
+    };
+    const state: model.UiState = .{ .vocal_guide_visible = 1 };
+    var lanes: [hairpins.len]u8 = undefined;
+    resolveHairpinOpticalLanes(&hairpins, &state, &lanes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 0, 0 }, &lanes);
+
+    const geometry = ScoreGeometry.calculateForSystems(.{ .x = 0, .y = 0, .width = 900, .height = 760 }, true, 1);
+    try std.testing.expectApproxEqAbs(hairpin_lane_spacing, hairpinLaneY(hairpins[1], geometry, 0, 1) - hairpinLaneY(hairpins[1], geometry, 0, 0), 0.001);
+    try std.testing.expectApproxEqAbs(-hairpin_lane_spacing, hairpinLaneY(hairpins[3], geometry, 0, 1) - hairpinLaneY(hairpins[3], geometry, 0, 0), 0.001);
 }
 
 test "score pedal guide tracks expected controller state and emits analytic marks" {

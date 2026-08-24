@@ -62,10 +62,47 @@
     initialize(canvas) {
       this.canvas = canvas;
       this.installPointerEvents();
-      this.restoreSnapshot();
+      this.restoreInitialDocument();
       this.startDevelopmentReload();
       navigator.storage?.persist?.().catch(() => {});
       if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").catch(error => console.warn("Offline install unavailable", error));
+    },
+
+    scoreImportKind(name) {
+      const extension = name.toLowerCase().split(".").pop();
+      return extension === "mid" || extension === "midi" ? 2 : extension === "score" ? 3 : extension === "mxl" ? 4 : 1;
+    },
+
+    importScoreBytes(bytes, name) {
+      const status = callWithBytes(bytes, (pointer, length) => Module._score_web_import(pointer, length, this.scoreImportKind(name)));
+      Module._score_web_status(status === 0 ? 2 : 3);
+      if (status === 0) Module._score_web_save_now();
+      return status;
+    },
+
+    async restoreInitialDocument() {
+      const parameters = new URLSearchParams(location.search);
+      const requestedScore = parameters.get("score");
+      if (requestedScore) {
+        try {
+          const url = new URL(requestedScore, location.href);
+          if (url.origin !== location.origin) throw new Error("The initial score must be served from the app origin");
+          const response = await fetch(url, {cache:"no-store"});
+          if (!response.ok) throw new Error(`Initial score download failed (${response.status})`);
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          if (bytes.byteLength > 64 * 1024 * 1024) throw new Error("Score exceeds the 64 MB import limit");
+          if (this.importScoreBytes(bytes, url.pathname) !== 0) throw new Error("Initial score import failed");
+          await this.pendingSave;
+          parameters.delete("score");
+          const query = parameters.toString();
+          history.replaceState(null, "", `${location.pathname}${query ? `?${query}` : ""}${location.hash}`);
+          return;
+        } catch (error) {
+          console.error("Initial score restore failed", error);
+          Module._score_web_status(3);
+        }
+      }
+      await this.restoreSnapshot();
     },
 
     installPointerEvents() {
@@ -268,12 +305,8 @@
           const file = input.files?.[0];
           if (!file) return;
           if (file.size > 64 * 1024 * 1024) throw new Error("Score exceeds the 64 MB import limit");
-          const extension = file.name.toLowerCase().split(".").pop();
-          const kind = extension === "mid" || extension === "midi" ? 2 : extension === "score" ? 3 : extension === "mxl" ? 4 : 1;
           const bytes = new Uint8Array(await file.arrayBuffer());
-          const status = callWithBytes(bytes, (pointer, length) => Module._score_web_import(pointer, length, kind));
-          Module._score_web_status(status === 0 ? 2 : 3);
-          if (status === 0) Module._score_web_save_now();
+          this.importScoreBytes(bytes, file.name);
         } catch (error) {
           console.error("Score import failed", error);
           Module._score_web_status(3);

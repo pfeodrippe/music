@@ -281,4 +281,9 @@ pub fn build(b: *std.Build) void {
     const ios_simulator_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-ios-app.sh", "simulator" });
     ios_simulator_cmd.step.dependOn(&portable_pack_run.step);
     ios_simulator_step.dependOn(&ios_simulator_cmd.step);
+
+    const ios_dev_step = b.step("dev-ios", "Run the iOS Simulator and hot-reload last-good Metal shader edits");
+    const ios_dev_cmd = b.addSystemCommand(&.{ "sh", "scripts/dev-ios.sh" });
+    ios_dev_cmd.step.dependOn(&portable_pack_run.step);
+    ios_dev_step.dependOn(&ios_dev_cmd.step);
 }

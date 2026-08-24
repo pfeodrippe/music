@@ -460,20 +460,31 @@ fn runPortableVerify(init: std.process.Init, arguments: *std.process.Args.Iterat
     const bank_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, bank_path, init.gpa, .limited(score.sample_bank.max_bank_bytes));
     defer init.gpa.free(bank_bytes);
     const bank = try score.sample_bank.View.open(bank_bytes);
+    if (bank.format_version != score.sample_bank.version) return error.PortablePackObsoleteFormat;
     var release_region_count: usize = 0;
     var hammer_region_count: usize = 0;
     var resonance_region_count: usize = 0;
     var pedal_down_region_count: usize = 0;
     var pedal_up_region_count: usize = 0;
-    for (0..bank.region_count) |index| switch ((try bank.region(index)).trigger) {
-        .release => release_region_count += 1,
-        .hammer_release => hammer_region_count += 1,
-        .pedal_resonance => resonance_region_count += 1,
-        .pedal_down => pedal_down_region_count += 1,
-        .pedal_up => pedal_up_region_count += 1,
-        .attack => {},
-    };
+    var authored_attack_envelopes: usize = 0;
+    var authored_release_envelopes: usize = 0;
+    var authored_filter_regions: usize = 0;
+    for (0..bank.region_count) |index| {
+        const region = try bank.region(index);
+        switch (region.trigger) {
+            .release => release_region_count += 1,
+            .hammer_release => hammer_region_count += 1,
+            .pedal_resonance => resonance_region_count += 1,
+            .pedal_down => pedal_down_region_count += 1,
+            .pedal_up => pedal_up_region_count += 1,
+            .attack => {},
+        }
+        if (region.amp_attack_millis != score.sample_bank.envelope_millis_legacy) authored_attack_envelopes += 1;
+        if (region.amp_release_millis != score.sample_bank.envelope_millis_legacy) authored_release_envelopes += 1;
+        if (region.filter_type != .none) authored_filter_regions += 1;
+    }
     if (release_region_count < 68 or hammer_region_count < 88 or resonance_region_count < 69 or pedal_down_region_count == 0 or pedal_up_region_count == 0) return error.PortablePackAcousticLayersMissing;
+    if (authored_attack_envelopes < resonance_region_count or authored_release_envelopes < 704) return error.PortablePackEnvelopeDataMissing;
     const release_asset_rms = portableTriggerRms(bank, .release);
     const hammer_asset_rms = portableTriggerRms(bank, .hammer_release);
     const resonance_asset_rms = portableTriggerRms(bank, .pedal_resonance);
@@ -572,8 +583,8 @@ fn runPortableVerify(init: std.process.Init, arguments: *std.process.Args.Iterat
     defer init.gpa.free(wav_bytes);
     if (std.fs.path.dirname(evidence_path)) |directory| try std.Io.Dir.cwd().createDirPath(init.io, directory);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = evidence_path, .data = wav_bytes });
-    std.log.info("portable bank verified: {d} samples / {d} regions ({d} release + {d} hammer + {d} resonance + pedal mechanisms) / layer RMS {d:.5}/{d:.5}/{d:.5} / resonance delta {d:.5} / peak {d:.3} / quiet {d:.2} dBFS / loud {d:.2} dBFS / sustain {d:.2} dBFS / mechanism {d:.2} dBFS / attack {d:.2} ms -> {s}", .{
-        piano.sampleCount(), piano.regionCount(), release_region_count, hammer_region_count, resonance_region_count, release_asset_rms, hammer_asset_rms, resonance_asset_rms, resonance_comparison.normalized_rms_error, overall.peak, low.rmsDbfs(), high.rmsDbfs(), sustained.rmsDbfs(), mechanism.rmsDbfs(), attack.milliseconds, evidence_path,
+    std.log.info("portable bank v{d} verified: {d} samples / {d} regions ({d} release + {d} hammer + {d} resonance + pedal mechanisms; {d} attack + {d} release envelopes; {d} filtered regions) / layer RMS {d:.5}/{d:.5}/{d:.5} / resonance delta {d:.5} / peak {d:.3} / quiet {d:.2} dBFS / loud {d:.2} dBFS / sustain {d:.2} dBFS / mechanism {d:.2} dBFS / attack {d:.2} ms -> {s}", .{
+        bank.format_version, piano.sampleCount(), piano.regionCount(), release_region_count, hammer_region_count, resonance_region_count, authored_attack_envelopes, authored_release_envelopes, authored_filter_regions, release_asset_rms, hammer_asset_rms, resonance_asset_rms, resonance_comparison.normalized_rms_error, overall.peak, low.rmsDbfs(), high.rmsDbfs(), sustained.rmsDbfs(), mechanism.rmsDbfs(), attack.milliseconds, evidence_path,
     });
 }
 
@@ -654,7 +665,48 @@ fn appendPortableZone(
         .gain_centibels = @intFromFloat(std.math.clamp((source_zone.gain_db + gain_adjust_db) * 100.0, -32768, 32767)),
         .pan_milli = @intFromFloat(std.math.clamp(source_zone.pan * 10.0, -1000, 1000)),
         .flags = velocity_center,
+        .amp_attack_millis = portableEnvelopeMillis(source_zone.amp_attack_seconds),
+        .amp_decay_millis = portableEnvelopeMillis(source_zone.amp_decay_seconds),
+        .amp_release_millis = portableEnvelopeMillis(source_zone.amp_release_seconds),
+        .amp_sustain_permille = portableSustainPermille(source_zone.amp_sustain_percent),
+        .filter_cutoff_millihz = portableFilterCutoff(source_zone.filter_cutoff_hz),
+        .filter_resonance_centibels = @intFromFloat(@round(std.math.clamp(source_zone.filter_resonance_db * 100, 0, 6000))),
+        .filter_keytrack_cents = @intFromFloat(@round(std.math.clamp(source_zone.filter_keytrack_cents, -1200, 1200))),
+        .filter_velocity_track_cents = @intFromFloat(@round(std.math.clamp(source_zone.filter_velocity_track_cents, -9600, 9600))),
+        .filter_keycenter = source_zone.filter_keycenter,
+        // SFZ permits a mode declaration before a later cutoff. A zone with no
+        // actual cutoff remains sonically unfiltered in the portable bank.
+        .filter_type = if (source_zone.filter_cutoff_hz == null) .none else portableFilterType(source_zone.filter_type),
     });
+}
+
+fn portableEnvelopeMillis(seconds: ?f32) u32 {
+    const present = seconds orelse return score.sample_bank.envelope_millis_legacy;
+    return @intFromFloat(@round(std.math.clamp(present * 1000, 0, @as(f32, @floatFromInt(std.math.maxInt(u32) - 1)))));
+}
+
+fn portableSustainPermille(percent: ?f32) u16 {
+    const present = percent orelse return score.sample_bank.envelope_sustain_full;
+    return @intFromFloat(@round(std.math.clamp(present * 10, 0, @as(f32, score.sample_bank.envelope_sustain_full))));
+}
+
+fn portableFilterCutoff(hertz: ?f32) u32 {
+    const present = hertz orelse return score.sample_bank.filter_cutoff_disabled;
+    return @intFromFloat(@round(std.math.clamp(present * 1000, 1, 192_000_000)));
+}
+
+fn portableFilterType(kind: score.instrument.FilterType) score.sample_bank.FilterType {
+    return switch (kind) {
+        .none => .none,
+        .low_pass_1p => .low_pass_1p,
+        .high_pass_1p => .high_pass_1p,
+        .low_pass_2p => .low_pass_2p,
+        .high_pass_2p => .high_pass_2p,
+        .band_pass_2p => .band_pass_2p,
+        .band_reject_2p => .band_reject_2p,
+        .low_pass_4p => .low_pass_4p,
+        .high_pass_4p => .high_pass_4p,
+    };
 }
 
 fn firstAudibleFrame(samples: []const f32) usize {

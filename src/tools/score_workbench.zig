@@ -122,6 +122,21 @@ const Replacement = struct {
     target: BeatRange,
 };
 
+const OverlayNote = struct {
+    beat: f32,
+    staff: u8,
+    pitch: u8,
+    duration: f32,
+    velocity: u8,
+    voice: u8 = 3,
+};
+
+const RemoveNote = struct {
+    beat: f32,
+    staff: u8,
+    pitch: u8,
+};
+
 const AudioAlignment = struct {
     score_instrument_notes: usize = 0,
     compared_notes: usize = 0,
@@ -285,6 +300,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "retune")) {
         try runRetune(init, &arguments);
+        return;
+    }
+    if (std.mem.eql(u8, command, "overlay-notes")) {
+        try runOverlayNotes(init, &arguments);
+        return;
+    }
+    if (std.mem.eql(u8, command, "remove-notes")) {
+        try runRemoveNotes(init, &arguments);
         return;
     }
     if (std.mem.eql(u8, command, "pedalize")) {
@@ -501,6 +524,8 @@ fn usage() error{InvalidArguments} {
         \\  score-workbench dedupe INPUT.mxl OUTPUT.mxl
         \\  score-workbench revoice INPUT.mxl OUTPUT.mxl --beat N [--beat N ...] --pitch MIDI --from-staff N --to-staff N
         \\  score-workbench retune INPUT.mxl OUTPUT.mxl --replace BEAT:STAFF:FROM_MIDI:TO_MIDI [--replace ...]
+        \\  score-workbench overlay-notes INPUT.mxl OUTPUT.mxl --note BEAT:STAFF:MIDI:DURATION:VELOCITY[:VOICE] [--note ...]
+        \\  score-workbench remove-notes INPUT.mxl OUTPUT.mxl --note BEAT:STAFF:MIDI [--note ...]
         \\  score-workbench pedalize INPUT.mxl OUTPUT.mxl [--value 72] [--harmonic-midpoint] [--every-measure] [--preserve-existing] [--max-refresh-beats N | --harmony-refresh-min-beats N | --refresh-measure N ...] [--normalize-restarts]
         \\  score-workbench opening-performance INPUT.mxl OUTPUT.mxl [--repeat-start-measure 4] [--repeat-end-measure 13] [--pedal-value 54]
         \\  score-workbench splice-opening TARGET.mxl FRAGMENT.musicxml|mxl OUTPUT.mxl --target-end-beat N [--repeat-count N]
@@ -1160,6 +1185,134 @@ fn runRetune(init: std.process.Init, arguments: *std.process.Args.Iterator) !voi
     std.mem.sort(score.model.Note, notes.items, {}, noteLessThan);
     try writeMxl(init, output_path, report, notes.items, report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
     std.debug.print("Wrote {s}: retuned={d}; timing, dynamics, articulation, fingering, pedal and lyrics preserved\n", .{ output_path, changed });
+}
+
+fn runOverlayNotes(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const input_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    var overlays: [128]OverlayNote = undefined;
+    var overlay_count: usize = 0;
+    while (arguments.next()) |argument| {
+        if (!std.mem.eql(u8, argument, "--note")) return error.UnknownArgument;
+        if (overlay_count == overlays.len) return error.TooManyOverlayNotes;
+        overlays[overlay_count] = try parseOverlayNote(arguments.next() orelse return error.MissingValue);
+        overlay_count += 1;
+    }
+    if (overlay_count == 0) return error.InvalidArguments;
+
+    const report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(report);
+    try readReportInto(init, input_path, report);
+    var notes: std.ArrayList(score.model.Note) = .empty;
+    defer notes.deinit(init.gpa);
+    try notes.ensureTotalCapacity(init.gpa, report.note_count + overlay_count);
+    try notes.appendSlice(init.gpa, report.notes[0..report.note_count]);
+
+    for (overlays[0..overlay_count]) |overlay| {
+        const measure_index = score.model.measureIndexAt(report.measures[0..report.measure_count], overlay.beat) orelse return error.OverlayOutsideScore;
+        const measure = report.measures[measure_index];
+        if (overlay.beat + overlay.duration > measure.start_beat + measure.duration_beats + 0.0001) return error.OverlayCrossesMeasure;
+        for (notes.items) |existing| {
+            if ((existing.flags & (score.model.note_flag_rest | score.model.note_flag_vocal_guide)) != 0) continue;
+            if (existing.staff == overlay.staff and existing.pitch == overlay.pitch and @abs(existing.start_beat - overlay.beat) < 0.0001) return error.DuplicateOverlayNote;
+        }
+        var note = evidenceNote(overlay.pitch, overlay.beat, overlay.duration, overlay.staff, report.key_fifths, overlay.velocity, 1);
+        note.voice = overlay.voice;
+        try notes.append(init.gpa, note);
+    }
+    std.mem.sort(score.model.Note, notes.items, {}, noteLessThan);
+    for (notes.items, 0..) |*note, index| note.stable_id = index + 1;
+    try writeMxl(init, output_path, report, notes.items, report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
+
+    const output_report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(output_report);
+    try readReportInto(init, output_path, output_report);
+    for (overlays[0..overlay_count]) |overlay| {
+        if (!overlaySurvivesRoundTrip(output_report.notes[0..output_report.note_count], overlay)) {
+            return error.OverlayRoundTripMismatch;
+        }
+    }
+    std.debug.print("Wrote {s}: overlaid={d}; original notes, tempo, dynamics, harmony, pedal and lyrics preserved\n", .{ output_path, overlay_count });
+}
+
+fn runRemoveNotes(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
+    const input_path = arguments.next() orelse return usage();
+    const output_path = arguments.next() orelse return usage();
+    var removals: [128]RemoveNote = undefined;
+    var removal_count: usize = 0;
+    while (arguments.next()) |argument| {
+        if (!std.mem.eql(u8, argument, "--note")) return error.UnknownArgument;
+        if (removal_count == removals.len) return error.TooManyRemoveNotes;
+        removals[removal_count] = try parseRemoveNote(arguments.next() orelse return error.MissingValue);
+        removal_count += 1;
+    }
+    if (removal_count == 0) return error.InvalidArguments;
+
+    const report = try init.gpa.create(score.musicxml.ImportReport);
+    defer init.gpa.destroy(report);
+    try readReportInto(init, input_path, report);
+    var notes: std.ArrayList(score.model.Note) = .empty;
+    defer notes.deinit(init.gpa);
+    try notes.appendSlice(init.gpa, report.notes[0..report.note_count]);
+    const removed = removeNotes(notes.items, removals[0..removal_count]);
+    if (removed != removal_count) return error.RemoveNoteMatchCount;
+    notes.items.len -= removed;
+    std.mem.sort(score.model.Note, notes.items, {}, noteLessThan);
+    for (notes.items, 0..) |*note, index| note.stable_id = index + 1;
+    try writeMxl(init, output_path, report, notes.items, report.lyrics[0..report.lyric_count], report.harmonies[0..report.harmony_count], report.pedals[0..report.pedal_count], report.measures[0..report.measure_count], null, null);
+    std.debug.print("Wrote {s}: removed={d} exact instrumental attacks; all other score/performance data preserved\n", .{ output_path, removed });
+}
+
+fn overlaySurvivesRoundTrip(notes: []const score.model.Note, overlay: OverlayNote) bool {
+    for (notes) |note| {
+        if ((note.flags & (score.model.note_flag_rest | score.model.note_flag_vocal_guide)) != 0) continue;
+        if (note.staff != overlay.staff or note.pitch != overlay.pitch or note.velocity != overlay.velocity) continue;
+        if (@abs(note.start_beat - overlay.beat) >= 0.0001) continue;
+        if (@abs(note.duration_beats - overlay.duration) >= 0.0001) continue;
+        return true;
+    }
+    return false;
+}
+
+fn parseOverlayNote(value: []const u8) !OverlayNote {
+    var fields: [6][]const u8 = undefined;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, value, ':');
+    while (parts.next()) |part| {
+        if (count == fields.len or part.len == 0) return error.InvalidOverlayNote;
+        fields[count] = part;
+        count += 1;
+    }
+    if (count != 5 and count != 6) return error.InvalidOverlayNote;
+    const result: OverlayNote = .{
+        .beat = try parseNonNegativeFloat(fields[0]),
+        .staff = try std.fmt.parseUnsigned(u8, fields[1], 10),
+        .pitch = try std.fmt.parseUnsigned(u8, fields[2], 10),
+        .duration = try parsePositiveFloat(fields[3]),
+        .velocity = try std.fmt.parseUnsigned(u8, fields[4], 10),
+        .voice = if (count == 6) try std.fmt.parseUnsigned(u8, fields[5], 10) else 3,
+    };
+    if (result.pitch > 127 or result.velocity == 0 or result.velocity > 127) return error.InvalidOverlayNote;
+    return result;
+}
+
+fn parseRemoveNote(value: []const u8) !RemoveNote {
+    var fields: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var parts = std.mem.splitScalar(u8, value, ':');
+    while (parts.next()) |part| {
+        if (count == fields.len or part.len == 0) return error.InvalidRemoveNote;
+        fields[count] = part;
+        count += 1;
+    }
+    if (count != fields.len) return error.InvalidRemoveNote;
+    const result: RemoveNote = .{
+        .beat = try parseNonNegativeFloat(fields[0]),
+        .staff = try std.fmt.parseUnsigned(u8, fields[1], 10),
+        .pitch = try std.fmt.parseUnsigned(u8, fields[2], 10),
+    };
+    if (result.pitch > 127) return error.InvalidRemoveNote;
+    return result;
 }
 
 fn runDedupe(init: std.process.Init, arguments: *std.process.Args.Iterator) !void {
@@ -3559,16 +3712,18 @@ fn writeMxl(
 
     const xml = try init.gpa.alloc(u8, max_xml_bytes);
     defer init.gpa.free(xml);
-    const xml_len = try score.musicxml_export.write(
+    const xml_len = try score.musicxml_export.writeWithPartsAndHairpins(
         xml,
         &meta,
         &transport,
         notes,
         lyrics,
         harmonies,
+        target.hairpins[0..target.hairpin_count],
         pedals,
         measures,
         &playback,
+        target.parts[0..target.part_count],
     );
     const package = try init.gpa.alloc(u8, xml_len + 4096);
     defer init.gpa.free(package);
@@ -3878,6 +4033,29 @@ fn revoiceNotes(notes: []score.model.Note, beats: []const f32, pitch: u8, from_s
         }
     }
     return changed;
+}
+
+fn removeNotes(notes: []score.model.Note, removals: []const RemoveNote) usize {
+    var output_count: usize = 0;
+    var removed_count: usize = 0;
+    for (notes) |note| {
+        var remove = false;
+        if ((note.flags & (score.model.note_flag_vocal_guide | score.model.note_flag_rest)) == 0) {
+            for (removals) |candidate| {
+                if (@abs(note.start_beat - candidate.beat) < 0.0001 and note.staff == candidate.staff and note.pitch == candidate.pitch) {
+                    remove = true;
+                    break;
+                }
+            }
+        }
+        if (remove) {
+            removed_count += 1;
+        } else {
+            notes[output_count] = note;
+            output_count += 1;
+        }
+    }
+    return removed_count;
 }
 
 fn retuneNotes(notes: []score.model.Note, edits: []const RetuneEdit, key_fifths: i8) usize {
@@ -4348,6 +4526,20 @@ test "revoice moves only exact instrumental onset matches" {
     try std.testing.expectEqual(@as(u8, 1), notes[2].staff);
 }
 
+test "remove notes filters only exact instrumental attacks" {
+    var notes = [_]score.model.Note{
+        .{ .stable_id = 1, .start_beat = 2.25, .duration_beats = 1, .pitch = 49, .velocity = 44, .staff = 1, .voice = 1 },
+        .{ .stable_id = 2, .start_beat = 2.25, .duration_beats = 1, .pitch = 61, .velocity = 59, .staff = 0, .voice = 0 },
+        .{ .stable_id = 3, .start_beat = 2.25, .duration_beats = 1, .pitch = 49, .velocity = 0, .staff = 1, .voice = 1, .flags = score.model.note_flag_rest },
+        .{ .stable_id = 4, .start_beat = 2.25, .duration_beats = 1, .pitch = 49, .velocity = 48, .staff = 8, .voice = 0, .flags = score.model.note_flag_vocal_guide },
+    };
+    const removed = removeNotes(&notes, &.{.{ .beat = 2.25, .staff = 1, .pitch = 49 }});
+    try std.testing.expectEqual(@as(usize, 1), removed);
+    try std.testing.expectEqual(@as(u64, 2), notes[0].stable_id);
+    try std.testing.expectEqual(@as(u64, 3), notes[1].stable_id);
+    try std.testing.expectEqual(@as(u64, 4), notes[2].stable_id);
+}
+
 test "retune changes only exact instrumental onset matches and respells for key" {
     var notes = [_]score.model.Note{
         .{ .stable_id = 1, .start_beat = 438, .duration_beats = 0.5, .pitch = 48, .velocity = 91, .staff = 1, .voice = 1, .written_step = 'C', .written_octave = 3 },
@@ -4689,4 +4881,28 @@ fn canonicalAtlasFloat(value: f32) f32 {
 
 test "atlas compiler decodes raw RGBA dimensions" {
     try std.testing.expectEqual(@as(u32, 1024), readBigEndianU32(&.{ 0, 0, 4, 0 }));
+}
+
+test "overlay note parser accepts optional voice and rejects invalid performance data" {
+    const basic = try parseOverlayNote("2.5:1:49:1.25:58");
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), basic.beat, 0.0001);
+    try std.testing.expectEqual(@as(u8, 1), basic.staff);
+    try std.testing.expectEqual(@as(u8, 49), basic.pitch);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), basic.duration, 0.0001);
+    try std.testing.expectEqual(@as(u8, 58), basic.velocity);
+    try std.testing.expectEqual(@as(u8, 3), basic.voice);
+
+    const voiced = try parseOverlayNote("4:0:68:0.5:72:5");
+    try std.testing.expectEqual(@as(u8, 5), voiced.voice);
+    try std.testing.expectError(error.InvalidOverlayNote, parseOverlayNote("4:0:128:0.5:72"));
+    try std.testing.expectError(error.InvalidOverlayNote, parseOverlayNote("4:0:68:0.5:0"));
+}
+
+test "overlay round trip match rejects shifted score events" {
+    const overlay = try parseOverlayNote("2.5:1:49:1.25:58");
+    var note = evidenceNote(overlay.pitch, overlay.beat, overlay.duration, overlay.staff, -5, overlay.velocity, 1);
+    try std.testing.expect(overlaySurvivesRoundTrip(&.{note}, overlay));
+
+    note.start_beat += 0.5;
+    try std.testing.expect(!overlaySurvivesRoundTrip(&.{note}, overlay));
 }

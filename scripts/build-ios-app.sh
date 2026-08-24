@@ -22,6 +22,8 @@ else
     score_ios_core="zig-out/lib/libscore-ios-core.a"
 fi
 score_ios_app="$score_ios_build/Score.app"
+score_ios_development="${SCORE_IOS_DEVELOPMENT:-0}"
+score_ios_swift_optimization="-O"
 
 mkdir -p "$score_ios_app"
 xcrun --sdk "$score_ios_sdk_name" metal \
@@ -30,6 +32,16 @@ xcrun --sdk "$score_ios_sdk_name" metal \
 xcrun --sdk "$score_ios_sdk_name" metallib \
     "$score_ios_build/ScoreShaders.air" \
     -o "$score_ios_app/ScoreShaders.metallib"
+
+if [ "$score_ios_development" = "1" ]; then
+    cp src/platform/apple/ios/ScoreShaders.metal "$score_ios_app/ScoreShaders.metal"
+    score_ios_swift_optimization="-Onone"
+fi
+
+set -- "$score_ios_swift_optimization"
+if [ "$score_ios_development" = "1" ]; then
+    set -- "$@" -D DEBUG
+fi
 
 cp src/platform/apple/ios/Info.plist "$score_ios_app/Info.plist"
 cp src/platform/web/icons/score-icon-1024.png "$score_ios_app/AppIcon.png"
@@ -40,7 +52,7 @@ plutil -lint "$score_ios_app/Info.plist"
 xcrun --sdk "$score_ios_sdk_name" swiftc \
     -sdk "$score_ios_sdk" \
     -target "$score_ios_target" \
-    -O \
+    "$@" \
     -parse-as-library \
     -module-name Score \
     -import-objc-header src/platform/apple/score_ios.h \
