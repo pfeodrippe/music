@@ -10,6 +10,22 @@ MIDI/microphone, storage, and document-panel seams.
 
 ## Native + iPad audio acceptance (2026-08-24)
 
+- [x] Fix the physical-iPad Library crash. The attached-device `.ips` report
+  identified a UI-thread stack overflow in `App.rebuildTimeline`; MusicXML and
+  MIDI import reports are now caller-owned heap allocations, shared note
+  workspace lives in the heap-resident Zig `App`, and timeline construction
+  writes directly into persistent storage. The physical iPad subsequently
+  loaded all four Library choices (Bach, Beethoven, tutorial, Holocene) with
+  status 0 and no crash. The macOS app loaded the same four choices through its
+  live Zig control interface; 283/283 regressions pass.
+- [x] Expose the ignored private Holocene MXL as a selectable local Library
+  item without branding the application around one song or committing the
+  score. Both targets report 195 measures, 2,772 events, 75 harmonies, 15
+  pedals, and quarter=147. The iPad acceptance run saved it as the current
+  journal so normal relaunch restores Holocene rather than the tutorial.
+- [x] Add the single Zig `install-ios-device` command. It auto-detects a
+  connected physical iPad, Apple Development certificate, and bundle-matching
+  provisioning profile, then provisions, signs, installs, and launches Score.
 - [x] Load the identical canonical private score on macOS and iPad: 195
   measures, 2,772 note/rest events, 75 harmonies, 15 pedal events, quarter=147.
   The native source import and iPad `.score` recovery journal report the same

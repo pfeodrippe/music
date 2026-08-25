@@ -57,6 +57,7 @@ uint32_t score_ios_glyph_atlas_height(void);
 const ScoreAccessibilityItem *score_ios_accessibility_items(void);
 uint32_t score_ios_accessibility_count(void);
 void score_ios_accessibility_activate(uint32_t id);
+uint32_t score_ios_load_bundled(uint32_t index);
 uint32_t score_ios_host_request(void);
 void score_ios_set_host_status(uint32_t status);
 size_t score_ios_drain_playback(ScorePlaybackEvent *events, size_t capacity);

@@ -291,6 +291,8 @@ release. Release and pedal-mechanism one-shots never loop.
 zig build ios-core
 zig build ios-app
 zig build ios-simulator
+# With one unlocked, paired physical iPad connected:
+zig build install-ios-device
 # With an iOS Simulator already booted:
 zig build dev-ios
 ```
@@ -300,7 +302,11 @@ zig build dev-ios
 CAMetalLayer renderer, AVAudioEngine callback around the shared Zig sampled
 piano, CoreMIDI, Pencil/touch/mouse/keyboard input, system document panels, and
 local recovery under `build/ios/Score.app`; set `SCORE_IOS_SIGN_IDENTITY` to a
-valid identity for device signing. `ios-simulator` creates an ad-hoc signed
+valid identity for direct manual signing. `install-ios-device` auto-detects the
+connected iPad, Apple Development identity, and matching provisioning profile,
+then embeds, signs, installs, and launches the bundle. Its optional overrides
+are `SCORE_IOS_DEVICE`, `SCORE_IOS_PROFILE`, and
+`SCORE_IOS_SIGN_IDENTITY`. `ios-simulator` creates an ad-hoc signed
 arm64 simulator bundle under `build/ios-simulator/Score.app`. UIKit is only the
 lifecycle/device host—the product UI and audio instrument remain shared Zig.
 `dev-ios` builds and launches the Debug simulator app, then watches the Metal

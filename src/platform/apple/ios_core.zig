@@ -209,6 +209,14 @@ pub export fn score_ios_accessibility_activate(id: u32) void {
     if (app) |instance| instance.accessibilityActivate(id);
 }
 
+/// Device acceptance hook: exercises the same shared-core library import path
+/// as a real tap without teaching the UIKit host anything about score data.
+pub export fn score_ios_load_bundled(index: u32) u32 {
+    const instance = app orelse return 1;
+    instance.loadBundledScore(index) catch return 2;
+    return 0;
+}
+
 pub export fn score_ios_host_request() u32 {
     const instance = app orelse return 0;
     return @intFromEnum(instance.takeHostRequest());

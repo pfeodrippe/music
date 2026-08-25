@@ -137,6 +137,14 @@ This document started as the architecture plan and now also records the working 
   importer used by the picker, persists to IndexedDB, and removes the query
   parameter after success. Neither mechanism changes release content or adds a
   second notation implementation.
+- Physical-device Library imports no longer allocate full 4,096-note reports,
+  render scratch, or the 8,192-event playback timeline on the iOS UI-thread
+  stack. Those buffers now live in caller-owned or heap-resident Zig-core
+  storage. An attached iPad loaded Bach, Für Elise, the built-in tutorial, and
+  the ignored private Holocene MXL sequentially with status 0 and no crash.
+  Holocene is a normal private-study Library choice rather than application
+  branding. `zig build install-ios-device` is the one-command Zig-driven
+  physical build/provision/sign/install/launch workflow.
 - Native and iPad audio acceptance is now measured at the platform callback,
   not inferred from a moving transport. A one-host-at-a-time macOS pass loaded
   the 195-measure / 2,772-event / 15-pedal canonical score, found and cleared a

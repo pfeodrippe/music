@@ -9,5 +9,6 @@ tests/fixtures/licensed/*
 !tests/fixtures/licensed/.gitkeep
 captures/
 local-content/
+src/assets/scores/private/
 output/
 tmp/

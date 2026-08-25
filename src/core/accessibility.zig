@@ -30,7 +30,7 @@ pub const Id = struct {
     pub const keyboard: u32 = 12;
     pub const library: u32 = 13;
     pub const library_close: u32 = 14;
-    pub const library_first: u32 = 15;
+    pub const library_first: u32 = 40;
     pub const vocal_guide: u32 = 17;
     pub const pedal_guide: u32 = 18;
     pub const export_take: u32 = 19;
@@ -72,6 +72,7 @@ pub const Snapshot = struct {
             self.add(Id.library_first, .button, layout.library_items[0], "Open Minuet in G major by J. S. Bach", 0);
             self.add(Id.library_first + 1, .button, layout.library_items[1], "Open Fur Elise by Ludwig van Beethoven", 0);
             self.add(Id.library_first + 2, .button, layout.library_items[2], "Open Flowing 6/4 Piano Lab tutorial", 0);
+            self.add(Id.library_first + 3, .button, layout.library_items[3], "Open Holocene private study score", 0);
             return;
         }
         if (layout.library_trigger.width > 0) self.add(Id.library, .button, layout.library_trigger, "Open score library", 0);

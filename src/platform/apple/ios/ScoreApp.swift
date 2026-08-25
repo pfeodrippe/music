@@ -59,7 +59,21 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             score_ios_midi(DispatchTime.now().uptimeNanoseconds, status, data1, data2)
         }
         _ = midi.start()
+        startLibraryAcceptanceIfRequested()
         startAcceptancePlaybackIfRequested()
+    }
+
+    private func startLibraryAcceptanceIfRequested() {
+        guard ProcessInfo.processInfo.environment["SCORE_IOS_LIBRARY_ACCEPTANCE"] == "1" else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            for index: UInt32 in 0..<4 {
+                let status = score_ios_load_bundled(index)
+                NSLog("Score iPad library acceptance index=%u status=%u", index, status)
+            }
+            self.saveAutosave()
+            NSLog("Score iPad library acceptance complete")
+        }
     }
 
     private func startAcceptancePlaybackIfRequested() {

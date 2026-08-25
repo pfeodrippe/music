@@ -18,6 +18,15 @@ pub const Timeline = struct {
 
     pub fn build(notes: []const model.Note) !Timeline {
         var timeline: Timeline = .{};
+        try buildInto(&timeline, notes);
+        return timeline;
+    }
+
+    /// Builds directly into caller-owned storage. Native and iOS keep this
+    /// large fixed-capacity timeline in the heap-resident App so importing a
+    /// full score never materializes it on the platform UI thread's stack.
+    pub fn buildInto(timeline: *Timeline, notes: []const model.Note) !void {
+        timeline.len = 0;
         for (notes) |note| {
             if ((note.flags & (model.note_flag_vocal_guide | model.note_flag_rest)) != 0) continue;
             const performed = model.performedNoteRange(notes, note);
@@ -55,7 +64,6 @@ pub const Timeline = struct {
                 return left.on < right.on; // note-off before note-on at one tick
             }
         }.lessThan);
-        return timeline;
     }
 };
 

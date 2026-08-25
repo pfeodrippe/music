@@ -33,6 +33,14 @@ const RawPedal = struct {
 };
 
 pub fn parse(source: []const u8) Error!MidiReport {
+    var report: MidiReport = undefined;
+    try parseInto(source, &report);
+    return report;
+}
+
+/// Parses into caller-owned storage so native hosts can keep the large report
+/// off the platform UI thread's stack.
+pub fn parseInto(source: []const u8, report: *MidiReport) Error!void {
     if (source.len < 14 or !std.mem.eql(u8, source[0..4], "MThd")) return error.InvalidMidi;
     const header_length = readU32(source, 4) orelse return error.InvalidMidi;
     if (header_length < 6 or 8 + header_length > source.len) return error.InvalidMidi;
@@ -40,7 +48,7 @@ pub fn parse(source: []const u8) Error!MidiReport {
     const division = readU16(source, 12) orelse return error.InvalidMidi;
     if ((division & 0x8000) != 0) return error.UnsupportedTimeDivision;
 
-    var report: MidiReport = .{ .ticks_per_quarter = division };
+    report.* = .{ .ticks_per_quarter = division };
     var raw_pedals: [musicxml.max_import_pedals]RawPedal = undefined;
     var raw_pedal_count: usize = 0;
     var event_sequence: u32 = 0;
@@ -209,7 +217,6 @@ pub fn parse(source: []const u8) Error!MidiReport {
         report.pedal_count += 1;
         previous[raw.pedal] = raw.value;
     }
-    return report;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {

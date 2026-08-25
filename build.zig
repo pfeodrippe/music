@@ -277,6 +277,20 @@ pub fn build(b: *std.Build) void {
     ios_app_cmd.step.dependOn(ios_step);
     ios_app_step.dependOn(&ios_app_cmd.step);
 
+    const ios_device_installer = b.addExecutable(.{
+        .name = "score-ios-device-install",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/ios_device_install.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const ios_device_install_run = b.addRunArtifact(ios_device_installer);
+    ios_device_install_run.step.dependOn(&ios_app_cmd.step);
+    if (b.args) |args| ios_device_install_run.addArgs(args);
+    const ios_device_install_step = b.step("install-ios-device", "Build, provision, install, and launch Score on a connected physical iPad");
+    ios_device_install_step.dependOn(&ios_device_install_run.step);
+
     const ios_simulator_step = b.step("ios-simulator", "Build an ad-hoc signed arm64 iOS Simulator application");
     const ios_simulator_cmd = b.addSystemCommand(&.{ "sh", "scripts/build-ios-app.sh", "simulator" });
     ios_simulator_cmd.step.dependOn(&portable_pack_run.step);

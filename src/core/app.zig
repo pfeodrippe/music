@@ -22,6 +22,7 @@ const playback = @import("playback/timeline.zig");
 const bundled_bach_minuet = @embedFile("../assets/scores/bach-minuet-in-g.mxl");
 const bundled_beethoven_fur_elise = @embedFile("../assets/scores/beethoven-fur-elise.musicxml");
 const bundled_flowing_six_four_lab = @embedFile("../assets/scores/flowing-six-four-piano-lab.mxl");
+const bundled_holocene_private_study = @embedFile("../assets/scores/private/holocene-private-study.mxl");
 
 pub const c = @cImport({
     @cDefine("FLECS_CUSTOM_BUILD", "1");
@@ -86,6 +87,10 @@ pub const App = struct {
     session: c.ecs_entity_t,
     note_entities: [musicxml.max_import_notes]c.ecs_entity_t = undefined,
     note_count: usize = 0,
+    /// Shared heap-resident workspace for frame building, playback, editing,
+    /// and development commands. App itself is allocator-owned, so this keeps
+    /// full-score scratch data off the smaller iOS UI-thread stack.
+    note_scratch: [musicxml.max_import_notes]model.Note = undefined,
     lyrics: [musicxml.max_import_lyrics]model.Lyric = undefined,
     lyric_count: usize = 0,
     harmonies: [musicxml.max_import_harmonies]model.Harmony = undefined,
@@ -597,7 +602,8 @@ pub const App = struct {
         const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return error.MissingUiState;
         const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        const notes = try std.heap.c_allocator.alloc(model.Note, self.note_count);
+        defer std.heap.c_allocator.free(notes);
         var len: usize = 0;
         for (self.note_entities[0..self.note_count]) |entity| {
             if (self.getConst(model.Note, entity, self.ids.note)) |note| {
@@ -704,7 +710,9 @@ pub const App = struct {
     }
 
     pub fn importMusicXml(self: *App, source: []const u8) !void {
-        const report = try musicxml.parse(source);
+        const report = try std.heap.c_allocator.create(musicxml.ImportReport);
+        defer std.heap.c_allocator.destroy(report);
+        try musicxml.parseInto(source, report);
         try self.replaceNotes(report.notes[0..report.note_count]);
         self.resetDocumentExtras();
         @memcpy(self.lyrics[0..report.lyric_count], report.lyrics[0..report.lyric_count]);
@@ -744,7 +752,9 @@ pub const App = struct {
     }
 
     pub fn importMidi(self: *App, source: []const u8) !void {
-        const report = try midi.parse(source);
+        const report = try std.heap.c_allocator.create(midi.MidiReport);
+        defer std.heap.c_allocator.destroy(report);
+        try midi.parseInto(source, report);
         try self.replaceNotes(report.notes[0..report.note_count]);
         self.resetDocumentExtras();
         @memcpy(self.pedals[0..report.pedal_count], report.pedals[0..report.pedal_count]);
@@ -779,6 +789,7 @@ pub const App = struct {
             0 => try self.importMxl(bundled_bach_minuet),
             1 => try self.importMusicXml(bundled_beethoven_fur_elise),
             2 => try self.importMxl(bundled_flowing_six_four_lab),
+            3 => try self.importMxl(bundled_holocene_private_study),
             else => return error.UnknownBundledScore,
         }
         if (self.getMut(model.DocumentMeta, self.session, self.ids.document_meta)) |meta| meta.source_kind = 0;
@@ -980,7 +991,8 @@ pub const App = struct {
     pub fn exportMusicXml(self: *const App, output: []u8) !usize {
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
         const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        const notes = try std.heap.c_allocator.alloc(model.Note, self.note_count);
+        defer std.heap.c_allocator.free(notes);
         var count: usize = 0;
         for (self.note_entities[0..self.note_count]) |entity| {
             notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
@@ -1004,7 +1016,8 @@ pub const App = struct {
     pub fn exportMidi(self: *const App, output: []u8) !usize {
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return error.MissingDocumentMeta;
         const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return error.MissingTransport;
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        const notes = try std.heap.c_allocator.alloc(model.Note, self.note_count);
+        defer std.heap.c_allocator.free(notes);
         var count: usize = 0;
         for (self.note_entities[0..self.note_count]) |entity| {
             notes[count] = (self.getConst(model.Note, entity, self.ids.note) orelse return error.MissingNote).*;
@@ -1150,14 +1163,14 @@ pub const App = struct {
                 ui_state.library_open = if (ui_state.library_open == 0) 1 else 0;
                 result_len = devResponse(response, "ok library={d}", .{ui_state.library_open});
             } else if (std.mem.startsWith(u8, argument, "load ")) {
-                const index = std.fmt.parseUnsigned(u32, std.mem.trim(u8, argument["load ".len..], " \t"), 10) catch return devResponse(response, "error library load expects 0..2", .{});
+                const index = std.fmt.parseUnsigned(u32, std.mem.trim(u8, argument["load ".len..], " \t"), 10) catch return devResponse(response, "error library load expects 0..3", .{});
                 self.loadBundledScore(index) catch return devResponse(response, "error unknown bundled score {d}", .{index});
                 result_len = devResponse(response, "ok library={d} title={s}", .{ index, (self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse meta).titleSlice() });
             } else {
-                return devResponse(response, "error library expects open, close, toggle, or load 0..2", .{});
+                return devResponse(response, "error library expects open, close, toggle, or load 0..3", .{});
             }
         } else if (std.mem.eql(u8, input, "fingering state") or std.mem.eql(u8, input, "fingering chord")) {
-            var notes: [musicxml.max_import_notes]model.Note = undefined;
+            const notes = &self.note_scratch;
             for (self.note_entities[0..self.note_count], 0..) |entity, index| notes[index] = (self.getConst(model.Note, entity, self.ids.note) orelse return devResponse(response, "error missing note", .{})).*;
             if (std.mem.eql(u8, input, "fingering chord")) {
                 result_len = chordFingeringResponse(response, ui.chordFingeringSnapshot(notes[0..self.note_count], @max(0, transport_state.cursor_beat)));
@@ -1408,7 +1421,7 @@ pub const App = struct {
             result_len = devResponse(response, "ok tool={s}", .{argument});
         } else if (commandArgument(input, "plugin")) |argument| {
             const callback = self.dev_command_callback orelse return devResponse(response, "error hot plugin has no command hook", .{});
-            var notes: [musicxml.max_import_notes]model.Note = undefined;
+            const notes = &self.note_scratch;
             for (self.note_entities[0..self.note_count], 0..) |entity, index| {
                 notes[index] = (self.getConst(model.Note, entity, self.ids.note) orelse continue).*;
             }
@@ -1423,7 +1436,7 @@ pub const App = struct {
                 .practice = practice_state,
                 .document_meta = meta,
                 .playback_bounds = bounds,
-                .notes = &notes,
+                .notes = notes,
                 .note_count = @intCast(self.note_count),
             };
             callback(&context);
@@ -1768,8 +1781,8 @@ pub const App = struct {
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return false;
         const hit = self.scoreHitContext(state, meta, stage, x, y);
         const geometry = ui.ScoreGeometry.calculateForSystems(hit.stage, self.vocalStaffVisible(state), hit.layout_system_count);
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
-        const note_count = self.collectNotes(&notes);
+        const notes = &self.note_scratch;
+        const note_count = self.collectNotes(notes);
         const curve = ui.pedalCurveHitAt(self.pedals[0..self.pedal_count], notes[0..note_count], geometry, hit.page, self.measures[0..self.measure_count], hit.x, hit.y, true) orelse return false;
 
         var event: model.PedalEvent = undefined;
@@ -1803,8 +1816,8 @@ pub const App = struct {
         const hit = self.scoreHitContext(state, meta, stage, x, y);
         if (self.pedal_drag.system >= hit.page.system_count) return;
         const geometry = ui.ScoreGeometry.calculateForSystems(hit.stage, self.vocalStaffVisible(state), hit.layout_system_count);
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
-        const note_count = self.collectNotes(&notes);
+        const notes = &self.note_scratch;
+        const note_count = self.collectNotes(notes);
         const curve = ui.pedalCurveEditPosition(
             self.pedals[0..self.pedal_count],
             notes[0..note_count],
@@ -2412,7 +2425,7 @@ pub const App = struct {
         const transport = self.getConst(model.Transport, self.session, self.ids.transport) orelse return;
         const practice = self.getConst(model.PracticeState, self.session, self.ids.practice) orelse return;
         const meta = self.getConst(model.DocumentMeta, self.session, self.ids.document_meta) orelse return;
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
+        const notes = &self.note_scratch;
         var len: usize = 0;
         for (self.note_entities[0..self.note_count]) |entity| {
             if (self.getConst(model.Note, entity, self.ids.note)) |note| {
@@ -2469,15 +2482,10 @@ pub const App = struct {
     }
 
     fn rebuildTimeline(self: *App) void {
-        var notes: [musicxml.max_import_notes]model.Note = undefined;
-        var len: usize = 0;
-        for (self.note_entities[0..self.note_count]) |entity| {
-            if (self.getConst(model.Note, entity, self.ids.note)) |note| {
-                notes[len] = note.*;
-                len += 1;
-            }
-        }
-        self.timeline = playback.Timeline.build(notes[0..len]) catch .{};
+        const len = self.collectNotes(&self.note_scratch);
+        playback.Timeline.buildInto(&self.timeline, self.note_scratch[0..len]) catch {
+            self.timeline.len = 0;
+        };
         const bounds = self.getMut(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
         bounds.end_beat = self.scoreEndBeat();
         c.ecs_modified_id(self.world, self.session, self.ids.playback_bounds);
@@ -3881,6 +3889,12 @@ test "bundled public-domain score library imports offline" {
     try std.testing.expect(app.pedal_count >= 10);
     meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
     try std.testing.expectEqualStrings("Flowing 6/4 Piano Lab", meta.titleSlice());
+    try std.testing.expectEqual(@as(u32, 0), meta.source_kind);
+    try app.loadBundledScore(3);
+    try std.testing.expect(app.note_count > 1000);
+    try std.testing.expect(app.pedal_count > 0);
+    meta = app.getConst(model.DocumentMeta, app.session, app.ids.document_meta) orelse return error.MissingDocumentMeta;
+    try std.testing.expectEqualStrings("Holocene", meta.titleSlice());
     try std.testing.expectEqual(@as(u32, 0), meta.source_kind);
 }
 

@@ -72,7 +72,7 @@ pub const Layout = struct {
     library_trigger: Rect,
     library_modal: Rect,
     library_close: Rect,
-    library_items: [3]Rect,
+    library_items: [4]Rect,
     tool_buttons: [4]Rect,
 
     pub fn calculate(width: f32, height: f32, keyboard_visible: bool) Layout {
@@ -123,7 +123,7 @@ pub const Layout = struct {
         const library_modal_x = stage_x + (stage_width - library_modal_width) * 0.5;
         const library_modal_y = top_height + 46;
         const library_modal = Rect{ .x = library_modal_x, .y = library_modal_y, .width = library_modal_width, .height = @min(430, content_height - 70) };
-        const library_item_height = @min(76, @max(54, (library_modal.height - 148 - 24) / 3));
+        const library_item_height = @min(70, @max(48, (library_modal.height - 148 - 36) / 4));
         const library_item_gap: f32 = 12;
         const page_button_width: f32 = if (stage_width < 640) 34 else 40;
         const page_button_height: f32 = if (stage_height < 520) 52 else 68;
@@ -179,6 +179,7 @@ pub const Layout = struct {
                 .{ .x = library_modal.x + 28, .y = library_modal.y + 92, .width = library_modal.width - 56, .height = library_item_height },
                 .{ .x = library_modal.x + 28, .y = library_modal.y + 92 + library_item_height + library_item_gap, .width = library_modal.width - 56, .height = library_item_height },
                 .{ .x = library_modal.x + 28, .y = library_modal.y + 92 + (library_item_height + library_item_gap) * 2, .width = library_modal.width - 56, .height = library_item_height },
+                .{ .x = library_modal.x + 28, .y = library_modal.y + 92 + (library_item_height + library_item_gap) * 3, .width = library_modal.width - 56, .height = library_item_height },
             },
             .tool_buttons = tool_buttons,
         };
@@ -3726,9 +3727,9 @@ fn drawLibrary(packet: *render.Packet, layout: Layout, state: *const model.UiSta
     packet.rounded(layout.library_close.x, layout.library_close.y, layout.library_close.width, layout.library_close.height, 11, palette.panel_raised);
     packet.text(layout.library_close.x + 11, layout.library_close.y + 9, "X", 1.25, palette.muted);
 
-    const titles = [_][]const u8{ "Minuet in G major", "Fur Elise", "Flowing 6/4 Piano Lab" };
-    const creators = [_][]const u8{ "J. S. Bach / BWV Anh. 114", "L. van Beethoven / WoO 59", "Original progressive tutorial" };
-    const badges = [_][]const u8{ "PUBLIC DOMAIN", "OPENSCORE CC0", "BUILT-IN LESSON" };
+    const titles = [_][]const u8{ "Minuet in G major", "Fur Elise", "Flowing 6/4 Piano Lab", "Holocene" };
+    const creators = [_][]const u8{ "J. S. Bach / BWV Anh. 114", "L. van Beethoven / WoO 59", "Original progressive tutorial", "Bon Iver / authorized local study" };
+    const badges = [_][]const u8{ "PUBLIC DOMAIN", "OPENSCORE CC0", "BUILT-IN LESSON", "PRIVATE STUDY" };
     for (layout.library_items, 0..) |item, index| {
         const hovered = item.contains(state.pointer_x, state.pointer_y);
         packet.rounded(item.x, item.y, item.width, item.height, 14, if (hovered) palette.cyan_dim else palette.panel_raised);
