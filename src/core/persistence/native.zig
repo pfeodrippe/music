@@ -80,8 +80,12 @@ pub fn encode(snapshot: *const Snapshot, output: []u8) Error!usize {
     try writer.f32(snapshot.transport.tempo_bpm);
     try writer.f32(snapshot.transport.loop_start);
     try writer.f32(snapshot.transport.loop_end);
-    try writer.u32(snapshot.transport.playing);
-    try writer.u32(snapshot.transport.recording);
+    // Playback and live recording are process state, never document state.
+    // Keep their legacy wire slots for backward compatibility, but persist
+    // them stopped so browser reload cannot advance silently before Web Audio
+    // receives a user gesture.
+    try writer.u32(0);
+    try writer.u32(0);
     try writer.u32(snapshot.transport.loop_enabled);
     try writer.u32(snapshot.transport.count_in_bars);
     try writer.u32(@intCast(snapshot.note_count));
@@ -227,8 +231,10 @@ pub fn decode(source: []const u8, snapshot: *Snapshot) Error!void {
     snapshot.transport.tempo_bpm = try reader.f32();
     snapshot.transport.loop_start = try reader.f32();
     snapshot.transport.loop_end = try reader.f32();
-    snapshot.transport.playing = try reader.u32();
-    snapshot.transport.recording = try reader.u32();
+    _ = try reader.u32();
+    _ = try reader.u32();
+    snapshot.transport.playing = 0;
+    snapshot.transport.recording = 0;
     snapshot.transport.loop_enabled = try reader.u32();
     snapshot.transport.count_in_bars = try reader.u32();
     snapshot.note_count = try reader.u32();
@@ -570,6 +576,8 @@ test "native document round trips notes, transport and anchored ink" {
     snapshot.meta.tempo_beat_unit = 8;
     snapshot.transport.tempo_bpm = 84;
     snapshot.transport.metronome_enabled = 0;
+    snapshot.transport.playing = 1;
+    snapshot.transport.recording = 1;
     snapshot.notes[0] = .{ .stable_id = 9, .start_beat = 1.5, .duration_beats = 0.75, .pitch = 63, .velocity = 90, .staff = 0, .voice = 0, .written_step = 'E', .written_alter = -1, .written_octave = 4, .dots = 1, .flags = model.note_flag_beam_begin | model.note_flag_tie_start | model.note_flag_slur_start, .fingering = 4, .slur_start_mask = model.slurNumberBit(2) | model.slurNumberBit(4), .notations = model.withSingleTremolo(model.note_notation_trill | model.note_notation_arpeggiate_up, 4) };
     snapshot.note_count = 1;
     snapshot.lyrics[0] = .{ .start_beat = 1.5 };
@@ -660,6 +668,8 @@ test "native document round trips notes, transport and anchored ink" {
     try std.testing.expectEqual(@as(u32, 1), annotation.pageIndex(decoded.annotations.strokes[0]));
     try std.testing.expectApproxEqAbs(@as(f32, 12.5), decoded.annotations.points[0].u, 0.001);
     try std.testing.expectEqual(@as(u32, 0), decoded.transport.metronome_enabled);
+    try std.testing.expectEqual(@as(u32, 0), decoded.transport.playing);
+    try std.testing.expectEqual(@as(u32, 0), decoded.transport.recording);
     try std.testing.expectApproxEqAbs(@as(f32, 18), decoded.view.view_start_beat, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.65), decoded.view.zoom, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.375), decoded.view.continuous_pan_fraction, 0.001);

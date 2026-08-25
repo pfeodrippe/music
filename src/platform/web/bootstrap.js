@@ -46,6 +46,9 @@
     audioContext: null,
     audioNode: null,
     audioPromise: null,
+    audioBankReady: false,
+    audioRegions: 0,
+    audioSamples: 0,
     microphoneStream: null,
     microphoneSource: null,
     midiAccess: null,
@@ -63,6 +66,9 @@
       this.canvas = canvas;
       this.installPointerEvents();
       this.restoreInitialDocument();
+      // Decode and install the sampled grand while the player reads the first
+      // page. The context remains suspended until a real user gesture.
+      this.prepareAudio().catch(() => {});
       this.startDevelopmentReload();
       navigator.storage?.persist?.().catch(() => {});
       if ("serviceWorker" in navigator) navigator.serviceWorker.register("service-worker.js").catch(error => console.warn("Offline install unavailable", error));
@@ -194,15 +200,30 @@
     },
 
     async ensureAudio() {
+      const audio = this.prepareAudio();
       if (this.audioContext) {
-        if (this.audioContext.state !== "running") await this.audioContext.resume();
-        return this.audioNode;
+        const resume = this.audioContext.state === "running"
+          ? Promise.resolve()
+          : this.audioContext.resume();
+        resume.then(() => this.reportAudioReady()).catch(error => this.failAudio(error));
+        if (this.audioContext.state !== "running") {
+          const context = this.audioContext;
+          setTimeout(() => {
+            if (context === this.audioContext && context.state !== "running") Module._score_web_status(17);
+          }, 350);
+        }
       }
+      return audio;
+    },
+
+    prepareAudio() {
+      if (this.audioNode) return Promise.resolve(this.audioNode);
       if (this.audioPromise) return this.audioPromise;
       this.audioPromise = (async () => {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         if (!AudioContext) throw new Error("Web Audio unavailable");
         const context = new AudioContext({latencyHint:"interactive"});
+        this.audioContext = context;
         const [module, _, pianoBank] = await Promise.all([
           fetch("audio_dsp.wasm").then(response => {
             if (!response.ok) throw new Error("Audio DSP download failed");
@@ -222,7 +243,11 @@
         });
         node.port.onmessage = ({data}) => {
           if (data.type === "bank-status") {
-            Module._score_web_sampler_status(data.status === 0 ? 1 : 2, data.regions || 0, data.samples || 0);
+            this.audioBankReady = data.status === 0;
+            this.audioRegions = data.regions || 0;
+            this.audioSamples = data.samples || 0;
+            if (data.status === 0) this.reportAudioReady();
+            else Module._score_web_sampler_status(2, 0, 0);
             return;
           }
           if (data.type === "pitch") {
@@ -234,17 +259,30 @@
         };
         node.port.postMessage({type:"bank", bytes:pianoBank}, [pianoBank]);
         node.connect(context.destination);
-        this.audioContext = context;
         this.audioNode = node;
-        await context.resume();
         return node;
       })().catch(error => {
+        const failedContext = this.audioContext;
         this.audioPromise = null;
-        console.error("Audio startup failed", error);
-        Module._score_web_status(5);
+        this.audioContext = null;
+        this.audioNode = null;
+        this.audioBankReady = false;
+        failedContext?.close?.().catch(() => {});
+        this.failAudio(error);
         throw error;
       });
       return this.audioPromise;
+    },
+
+    reportAudioReady() {
+      if (this.audioContext?.state !== "running" || !this.audioBankReady) return;
+      Module._score_web_sampler_status(1, this.audioRegions || 0, this.audioSamples || 0);
+    },
+
+    failAudio(error) {
+      console.error("Audio startup failed", error);
+      Module._score_web_sampler_status(2, 0, 0);
+      Module._score_web_status(5);
     },
 
     sendAudioMidi(status, data1, data2) {

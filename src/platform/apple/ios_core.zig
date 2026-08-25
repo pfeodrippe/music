@@ -4,6 +4,12 @@ const score = @import("score");
 var app: ?*score.App = null;
 var audio_piano: score.sample_bank.Piano = .{};
 var audio_bank_storage: ?[]u8 = null;
+var audio_diagnostics_enabled = std.atomic.Value(bool).init(false);
+var audio_event_count = std.atomic.Value(u64).init(0);
+var audio_sustain_event_count = std.atomic.Value(u64).init(0);
+var audio_last_sustain_value = std.atomic.Value(u32).init(0);
+var audio_nonzero_sample_count = std.atomic.Value(u64).init(0);
+var audio_peak_bits = std.atomic.Value(u32).init(0);
 
 pub export fn score_ios_api_version() u32 {
     return 3;
@@ -33,6 +39,13 @@ pub export fn score_ios_audio_load_bank(bytes: [*]const u8, length: usize) u32 {
 }
 
 pub export fn score_ios_audio_event(pitch: u8, velocity: u8, channel: u8, on: u8) void {
+    if (audio_diagnostics_enabled.load(.monotonic)) {
+        _ = audio_event_count.fetchAdd(1, .monotonic);
+        if (on == 4 and pitch == 64) {
+            _ = audio_sustain_event_count.fetchAdd(1, .monotonic);
+            audio_last_sustain_value.store(velocity, .release);
+        }
+    }
     switch (on) {
         0 => audio_piano.noteOff(channel, pitch),
         1 => audio_piano.noteOn(channel, pitch, velocity),
@@ -57,6 +70,57 @@ pub export fn score_ios_audio_midi(status: u8, data1: u8, data2: u8) void {
 
 pub export fn score_ios_audio_render(left: [*]f32, right: [*]f32, frame_count: usize, sample_rate: f32) void {
     audio_piano.renderStereo(left[0..frame_count], right[0..frame_count], sample_rate);
+    if (!audio_diagnostics_enabled.load(.monotonic)) return;
+    var nonzero: u64 = 0;
+    var peak: f32 = 0;
+    for (left[0..frame_count], right[0..frame_count]) |left_sample, right_sample| {
+        const left_magnitude = @abs(left_sample);
+        const right_magnitude = @abs(right_sample);
+        if (left_magnitude > 0.000001) nonzero += 1;
+        if (right_magnitude > 0.000001) nonzero += 1;
+        peak = @max(peak, @max(left_magnitude, right_magnitude));
+    }
+    if (nonzero != 0) _ = audio_nonzero_sample_count.fetchAdd(nonzero, .monotonic);
+    const peak_bits: u32 = @bitCast(peak);
+    var previous = audio_peak_bits.load(.monotonic);
+    while (peak_bits > previous) {
+        if (audio_peak_bits.cmpxchgWeak(previous, peak_bits, .release, .monotonic)) |observed| {
+            previous = observed;
+        } else break;
+    }
+}
+
+pub export fn score_ios_audio_reset_diagnostics() void {
+    audio_event_count.store(0, .release);
+    audio_sustain_event_count.store(0, .release);
+    audio_last_sustain_value.store(0, .release);
+    audio_nonzero_sample_count.store(0, .release);
+    audio_peak_bits.store(0, .release);
+    audio_diagnostics_enabled.store(true, .release);
+}
+
+pub export fn score_ios_audio_finish_diagnostics() void {
+    audio_diagnostics_enabled.store(false, .release);
+}
+
+pub export fn score_ios_audio_event_count() u64 {
+    return audio_event_count.load(.acquire);
+}
+
+pub export fn score_ios_audio_sustain_event_count() u64 {
+    return audio_sustain_event_count.load(.acquire);
+}
+
+pub export fn score_ios_audio_last_sustain_value() u32 {
+    return audio_last_sustain_value.load(.acquire);
+}
+
+pub export fn score_ios_audio_nonzero_samples() u64 {
+    return audio_nonzero_sample_count.load(.acquire);
+}
+
+pub export fn score_ios_audio_peak() f32 {
+    return @bitCast(audio_peak_bits.load(.acquire));
 }
 
 pub export fn score_ios_destroy() void {

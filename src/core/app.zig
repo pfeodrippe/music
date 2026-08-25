@@ -106,6 +106,7 @@ pub const App = struct {
     annotations: annotation.Store = .{},
     accessibility: accessibility.Snapshot = .{},
     host_request: platform.HostRequest = .none,
+    pending_audio_playback: bool = false,
     timeline: playback.Timeline = .{},
     playback_events: [256]playback.ScheduledHostEvent = undefined,
     playback_event_count: usize = 0,
@@ -663,6 +664,16 @@ pub const App = struct {
         state.sampler_region_count = regions;
         state.sampler_sample_count = @intCast(@min(samples, std.math.maxInt(u32)));
         state.setSamplerLabel(label);
+        if (self.pending_audio_playback and status != 0) {
+            self.pending_audio_playback = false;
+            if (status == 1) {
+                if (self.getMut(model.Transport, self.session, self.ids.transport)) |transport| self.toggleTransport(transport);
+                state.notice = 13;
+            } else {
+                state.notice = 16;
+            }
+            self.notice_deadline_seconds = self.time_seconds + 4;
+        }
         c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
         self.buildFrame();
     }
@@ -2171,6 +2182,28 @@ pub const App = struct {
             transport.playing = 0;
             return;
         }
+        const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
+        if (self.pending_audio_playback) {
+            // A click used only to focus an inactive browser window may not
+            // satisfy autoplay policy. Keep the requested playback pending so
+            // a second explicit Play gesture retries audio unlock instead of
+            // silently cancelling the user's request.
+            self.host_request = .ensure_audio;
+            state.notice = 15;
+            return;
+        }
+        if (state.sampler_status == 0) {
+            self.pending_audio_playback = true;
+            self.host_request = .ensure_audio;
+            state.notice = 15;
+            self.notice_deadline_seconds = 0;
+            return;
+        }
+        if (state.sampler_status != 1) {
+            state.notice = 16;
+            self.notice_deadline_seconds = self.time_seconds + 4;
+            return;
+        }
         const bounds = self.getConst(model.PlaybackBounds, self.session, self.ids.playback_bounds) orelse return;
         if (transport.cursor_beat >= bounds.end_beat - 0.001) transport.cursor_beat = 0;
         if (transport.cursor_beat <= 0.001 and transport.count_in_bars != 0) {
@@ -2985,6 +3018,7 @@ fn sameQuery(runtime: *const RuntimeSystem, descriptor: *const hot.SystemDescrip
 test "Flecs world advances playback and produces a GPU packet" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
+    app.setSamplerStatus(1, "Test piano", 1, 1);
     app.key(.{ .key = 32, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
     for (0..300) |_| app.tick(1.0 / 60.0);
     try std.testing.expect(app.transportSnapshot().cursor_beat > 0);
@@ -2994,6 +3028,7 @@ test "Flecs world advances playback and produces a GPU packet" {
 test "hot-reloadable transport stops at score end and replay starts over" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
+    app.setSamplerStatus(1, "Test piano", 1, 1);
     const bounds = app.getConst(model.PlaybackBounds, app.session, app.ids.playback_bounds) orelse return error.MissingPlaybackBounds;
     const expected_end = bounds.end_beat;
     const transport = app.getMut(model.Transport, app.session, app.ids.transport) orelse return error.MissingTransport;
@@ -3048,6 +3083,28 @@ test "GPU instrument control exposes sampler diagnostics and requests native SFZ
     app.accessibilityActivate(accessibility.Id.sampler_instrument);
     try std.testing.expectEqual(platform.HostRequest.open_instrument, app.takeHostRequest());
     try std.testing.expectEqual(@as(u32, 12), state.notice);
+}
+
+test "browser transport waits for sampled piano readiness before advancing" {
+    const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
+    defer app.destroy(std.heap.c_allocator);
+
+    app.key(.{ .key = 32, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u32, 0), app.transportSnapshot().playing);
+    try std.testing.expect(app.pending_audio_playback);
+    try std.testing.expectEqual(platform.HostRequest.ensure_audio, app.takeHostRequest());
+    const loading = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    try std.testing.expectEqual(@as(u32, 15), loading.notice);
+
+    app.key(.{ .key = 32, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
+    try std.testing.expectEqual(@as(u32, 0), app.transportSnapshot().playing);
+    try std.testing.expect(app.pending_audio_playback);
+    try std.testing.expectEqual(platform.HostRequest.ensure_audio, app.takeHostRequest());
+
+    app.setSamplerStatus(1, "Portable grand", 931, 353);
+    try std.testing.expectEqual(@as(u32, 1), app.transportSnapshot().playing);
+    try std.testing.expect(!app.pending_audio_playback);
+    try std.testing.expectEqual(@as(u32, 13), loading.notice);
 }
 
 test "native input routing identity survives live MIDI and microphone observations" {
@@ -3756,6 +3813,7 @@ test "recorded take replay sends pedal controllers instead of false note-offs" {
 test "count-in produces accented metronome host events before notation" {
     const app = try App.create(std.heap.c_allocator, 1280, 800, 2);
     defer app.destroy(std.heap.c_allocator);
+    app.setSamplerStatus(1, "Test piano", 1, 1);
     app.key(.{ .key = 32, .scancode = 0, .modifiers = 0, .pressed = 1, .repeat = 0 });
     app.tick(1.0 / 60.0);
     var events: [16]playback.HostEvent = undefined;

@@ -1378,9 +1378,12 @@ pub fn draw(
             12 => "CHOOSE AN SFZ INSTRUMENT",
             13 => "INSTRUMENT LOADED + AUDIO READY",
             14 => "INSTRUMENT LOAD FAILED - PREVIOUS KEPT",
+            15 => "LOADING SAMPLED GRAND PIANO...",
+            16 => "AUDIO COULD NOT START",
+            17 => "CLICK PLAY AGAIN TO ENABLE SOUND",
             else => "SCORE IS READY",
         };
-        packet.text(x + 18, 101, message, 1.75, if (state.notice == 3 or state.notice == 5 or state.notice == 9 or state.notice == 14) palette.rose else palette.text);
+        packet.text(x + 18, 101, message, 1.75, if (state.notice == 3 or state.notice == 5 or state.notice == 9 or state.notice == 14 or state.notice == 16) palette.rose else palette.text);
     }
 }
 

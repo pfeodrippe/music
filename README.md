@@ -258,6 +258,13 @@ python3 -m http.server 8080 --directory build/web
 
 Open `http://localhost:8080/` (or `score.html`). `zig build dev-web` rebuilds and serves the export, autosaving the world before a development refresh and restoring it afterward. The generated shell contains only the presentation canvas and launch metadata. A browser without WebGPU receives a diagnostic page; it never enters an alternate renderer.
 
+The browser prepares the sampled grand in the background. Press **Play** to
+unlock Web Audio; transport waits at the current beat until the worklet and
+sample bank are ready. If the first click only focuses an inactive browser
+window, the app asks you to press **Play** again instead of advancing silently.
+Reloaded sessions always start stopped even though their reading position is
+restored.
+
 For a local development fixture, copy an authorized MusicXML/MXL/MIDI/`.score`
 file under `build/web` and open
 `http://localhost:8080/score.html?score=relative-file.mxl`. The same semantic
@@ -300,6 +307,13 @@ lifecycle/device host—the product UI and audio instrument remain shared Zig.
 source. A changed shader is compiled into a candidate pipeline without pausing
 the render loop; invalid source retains the last-good pipeline and live
 Zig/Flecs state, while a valid edit swaps at a main-thread frame boundary.
+
+For an automated Simulator audio-path check, launch the installed Debug app
+with `SIMCTL_CHILD_SCORE_IOS_ACCEPTANCE=1`. This opt-in test starts transport
+after journal restoration and logs the AVAudioEngine running state, received
+event count, CC64 sustain count/value, rendered nonzero-sample count, and peak
+after six seconds. Normal launches never autoplay and skip the realtime
+diagnostic counters entirely.
 
 ## Controls
 

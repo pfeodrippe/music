@@ -122,6 +122,7 @@ void processHostRequest() {
         case 7: webStopRecording(); break;
         case 8: webReplayAudio(); break;
         case 9: webOpenInstrument(); break;
+        case 10: webEnsureAudio(); break;
         default: break;
     }
 }

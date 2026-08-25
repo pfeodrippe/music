@@ -59,6 +59,26 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             score_ios_midi(DispatchTime.now().uptimeNanoseconds, status, data1, data2)
         }
         _ = midi.start()
+        startAcceptancePlaybackIfRequested()
+    }
+
+    private func startAcceptancePlaybackIfRequested() {
+        guard ProcessInfo.processInfo.environment["SCORE_IOS_ACCEPTANCE"] == "1" else { return }
+        score_ios_audio_reset_diagnostics()
+        score_ios_key(32, 0, 1, 0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self else { return }
+            NSLog(
+                "Score iPad audio acceptance engine=%d events=%llu sustain_events=%llu sustain=%u nonzero_samples=%llu peak=%.6f",
+                self.audio.isOutputRunning ? 1 : 0,
+                score_ios_audio_event_count(),
+                score_ios_audio_sustain_event_count(),
+                score_ios_audio_last_sustain_value(),
+                score_ios_audio_nonzero_samples(),
+                score_ios_audio_peak()
+            )
+            score_ios_audio_finish_diagnostics()
+        }
     }
 
     override var keyCommands: [UIKeyCommand]? {

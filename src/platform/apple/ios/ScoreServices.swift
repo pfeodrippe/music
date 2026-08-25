@@ -10,6 +10,8 @@ final class ScoreAudioService {
     private var recordingFile: AVAudioFile?
     private var replayPlayer: AVAudioPlayer?
 
+    var isOutputRunning: Bool { engine.isRunning }
+
     init() {
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: false)!
         sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList in

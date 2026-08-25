@@ -3,11 +3,32 @@
 This file is the durable hand-off checklist for the project. Keep it current as
 work lands; do not infer completion from a prototype screenshot.
 
-Current goal and release gate: finish and verify the native macOS application.
-The shared Zig/Flecs core already builds and runs on WebGPU/Wasm and
-iPadOS/Metal, but browser and iPad product acceptance are explicitly deferred
-and do not block this desktop goal. Platform code remains limited to window,
-GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
+Current goal and release gate: finish and verify the native macOS and iPad
+applications. Browser work is explicitly deferred and does not block this
+goal. Platform code remains limited to window, GPU-surface, audio-device,
+MIDI/microphone, storage, and document-panel seams.
+
+## Native + iPad audio acceptance (2026-08-24)
+
+- [x] Load the identical canonical private score on macOS and iPad: 195
+  measures, 2,772 note/rest events, 75 harmonies, 15 pedal events, quarter=147.
+  The native source import and iPad `.score` recovery journal report the same
+  semantic counts. Responsive pagination differs by viewport, as intended.
+- [x] Fix the immediate native silence by diagnosing the selected CoreAudio
+  route rather than changing the sampler: `MacBook Pro Speakers` was muted.
+  After unmuting, the native output produced 1,712,314 nonzero samples at peak
+  0.108410. The Accurate Salamander grand loaded 1,704 regions / 641 samples
+  with studio release, hammer, pedal-noise, and resonance values all at 64 and
+  zero dropped, late, overloaded, limited, or invalid frames.
+- [x] Add an opt-in iPad audio acceptance probe gated by
+  `SCORE_IOS_ACCEPTANCE=1`; ordinary launches pay no diagnostic work and never
+  autoplay. On the iPad Air 11-inch (M2) Simulator, AVAudioEngine ran, received
+  55 score events including four CC64 sustain events (value 72), and rendered
+  603,086 nonzero samples at peak 0.255432. The probe disables its realtime
+  counters after reporting.
+- [x] Pass `zig build test` (283/283), `zig build macos-release
+  -Doptimize=ReleaseSafe` (21/21 including the full concert-grand gate and exact
+  MIDI replay), and `zig build ios-simulator` (5/5).
 
 ## Deferred portability evidence (2026-08-24)
 
@@ -39,6 +60,18 @@ GPU-surface, audio-device, MIDI/microphone, storage, and document-panel seams.
   samples, plays, pages, reflows zoomed sheets, enters continuous mode, exports
   MusicXML, and recovers the tutorial/tempo from IndexedDB. No Canvas 2D,
   WebGL, or software-rendering path exists.
+- [x] Repair browser playback startup after live testing exposed silent score
+  advancement. The WebGPU host now prepares the 135.3 MiB sampled grand while
+  the score is being read, requests AudioContext resume synchronously from the
+  Play gesture, and holds transport at its current beat until both the context
+  is running and the worklet confirms all 931 regions / 353 samples. A focused
+  browser-autoplay retry keeps Play pending instead of cancelling it and shows
+  `CLICK PLAY AGAIN TO ENABLE SOUND` when an inactive-window focus click is not
+  accepted as audio activation. Durable `.score` journals retain cursor and
+  reading layout but always restore playback and recording stopped. A real
+  WebGPU reload remains stopped, the first focus-only click stays stationary,
+  and the explicit retry changes the semantic control to `Pause score` with no
+  console diagnostics. The shared DSP quality gate and 283/283 Zig tests pass.
 - [x] Build, install, launch, and visually exercise the arm64 iPad simulator
   app with the bundled sampled bank. Metal score rendering, keyboard guidance,
   72-QPM transport, count-in/playback, and adaptive portrait layout pass with

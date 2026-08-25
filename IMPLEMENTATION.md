@@ -137,6 +137,26 @@ This document started as the architecture plan and now also records the working 
   importer used by the picker, persists to IndexedDB, and removes the query
   parameter after success. Neither mechanism changes release content or adds a
   second notation implementation.
+- Native and iPad audio acceptance is now measured at the platform callback,
+  not inferred from a moving transport. A one-host-at-a-time macOS pass loaded
+  the 195-measure / 2,772-event / 15-pedal canonical score, found and cleared a
+  muted `MacBook Pro Speakers` CoreAudio route, and produced 1,712,314 nonzero
+  samples at peak 0.108410 with no sampler faults. The matching iPad recovery
+  journal drove AVAudioEngine through 55 events, including four CC64 sustain
+  changes at value 72, and produced 603,086 nonzero samples at peak 0.255432.
+  The iPad counters and autoplay are enabled only by the explicit
+  `SCORE_IOS_ACCEPTANCE=1` test environment and are dormant in normal builds.
+- Browser audio startup is a readiness handshake rather than a fire-and-forget
+  side effect. The host prepares the portable 135.3 MiB grand bank in a
+  suspended AudioContext, resumes that existing context directly from a Play
+  gesture, and reports sampler-ready only after the worklet has committed all
+  931 regions / 353 samples and the context is actually running. Core transport
+  remains stationary while that handshake is pending, so the opening cannot be
+  consumed as silent note-on/note-off bursts. If an inactive browser window
+  consumes the first click only for focus, repeated Play retries activation
+  without cancelling the pending request and the UI explains what is needed.
+  Portable journals now write and restore the legacy playing/recording slots as
+  stopped process state while preserving the score cursor and view preferences.
 - MusicXML performance dynamics retain exact per-onset velocity rather than
   being flattened to `p`/`mf`/`f`: export writes standard `<sound dynamics>`
   percentages and import gives those values precedence over the visible

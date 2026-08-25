@@ -1,4 +1,4 @@
-const cacheName = "score-webgpu-v15";
+const cacheName = "score-webgpu-v18";
 const applicationFiles = [
   "./score.html",
   "./index.html",
