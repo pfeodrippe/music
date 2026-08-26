@@ -14,7 +14,7 @@ builds use the shared Zig/Flecs UI and sampled-piano core and pass browser/iPad
 simulator smoke tests. Physical MIDI/microphone, VoiceOver, listening, and
 120-Hz iPad hardware acceptance remain device-lab work.
 
-Updated: 2026-08-24
+Updated: 2026-08-25
 
 Working name: **Score** (replace before public release)
 
@@ -42,6 +42,34 @@ This document started as the architecture plan and now also records the working 
   retains the current pipeline and live Zig/Flecs world with exact Metal
   diagnostics; `zig build dev-ios` launches the simulator and mirrors edits.
 - A signed macOS `.app` using Dawn/Metal, CoreAudio/AudioUnit, CoreMIDI, AudioQueue microphone capture, native import/export panels, app-support autosave, and WAV take replay.
+- A separate shared-Zig/Flecs performance-controller workspace rendered by the
+  same GPU packet pipeline: responsive 4×4 multitouch note/clip/action pads,
+  eight transport squares, octave/bank/protocol controls, a persistent custom
+  User bank, and an explicit GPU editor for message kind/value/channel,
+  momentary/toggle behavior, and color. Editing selects mappings without
+  emitting controller output; the compact versioned mapping blob remains
+  separate from score documents. The workspace has semantic
+  accessibility, Debug live-control commands, and a bounded core output queue.
+  The core encodes complete OSC 1.0 datagrams or MIDI 1.0 channel messages;
+  platform facades only deliver them. macOS and iPadOS publish a `Score
+  Controller` virtual CoreMIDI source; iPadOS additionally enables Network
+  MIDI. Direct UDP OSC implements current DrivenByMoss note, poly-aftertouch,
+  clip-launch, action, and transport paths. Apple Pencil force drives the
+  velocity response and per-note aftertouch, while non-pressure finger input
+  truthfully uses a configured fixed velocity.
+- Multi-controller identity is a platform-facade concern, not shared UI state.
+  Each Apple CoreMIDI source has a device-qualified endpoint name and native
+  name collisions receive deterministic suffixes. The development Bitwig
+  bridge owns one UDP socket, keys sources by sender IP/port, and reserves one
+  Bitwig `NoteInput` plus per-channel held-note table for each of 16 concurrent
+  sources. Capacity exhaustion rejects the new source; it never wraps onto an
+  existing controller. This was verified live with native Score and iPad
+  Simulator sending the same C3 through two stable source ports, including an
+  overlapping hold/release pass, followed by a 17-source saturation pass.
+  Bitwig requires a declared MIDI port to own recordable `NoteInput` objects,
+  so Debug `score-devctl bitwig-bootstrap` supplies a headless, message-free
+  CoreMIDI endpoint. It is independent of Score app lifecycles: iPad input
+  continued before, during, and after a native Score instance joined slot 2.
 - A shared path-free version-4 `.scorebank` (with version-2 and version-3 read compatibility)
   and allocation-free 128-layer-voice Zig piano
   callback used by the browser AudioWorklet and iOS AVAudioSourceNode. The

@@ -18,6 +18,7 @@ pub const command = @import("core/command.zig");
 pub const annotation = @import("core/annotation.zig");
 pub const accessibility = @import("core/accessibility.zig");
 pub const native_format = @import("core/persistence/native.zig");
+pub const controller = @import("core/controller.zig");
 pub const synth = @import("audio/synth.zig");
 pub const pitch = @import("audio/pitch.zig");
 pub const wav = @import("audio/wav.zig");
@@ -48,6 +49,7 @@ test {
     _ = @import("core/annotation.zig");
     _ = @import("core/accessibility.zig");
     _ = @import("core/persistence/native.zig");
+    _ = @import("core/controller.zig");
     _ = @import("audio/synth.zig");
     _ = @import("audio/pitch.zig");
     _ = @import("audio/wav.zig");

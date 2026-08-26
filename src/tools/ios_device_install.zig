@@ -93,7 +93,11 @@ fn detectDevice(init: std.process.Init) ![]u8 {
     defer freeResult(init.gpa, result);
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "connected") == null) continue;
+        // Current CoreDevice reports a paired iPad as `available (paired)`
+        // even when its developer tunnel is connected. Older Xcode releases
+        // printed `connected`, so accept both spellings.
+        if (std.mem.indexOf(u8, line, "connected") == null and
+            std.mem.indexOf(u8, line, "available (paired)") == null) continue;
         var tokens = std.mem.tokenizeAny(u8, line, " \t");
         while (tokens.next()) |token| {
             if (looksLikeUuid(token)) return init.gpa.dupe(u8, token);

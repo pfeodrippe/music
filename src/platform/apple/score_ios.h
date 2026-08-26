@@ -28,6 +28,12 @@ typedef struct ScoreAccessibilityItem {
     uint8_t label[48];
 } ScoreAccessibilityItem;
 
+typedef struct ScoreControllerOutput {
+    uint32_t kind;
+    uint32_t length;
+    uint8_t bytes[128];
+} ScoreControllerOutput;
+
 uint32_t score_ios_api_version(void);
 uint32_t score_ios_audio_load_bank(const uint8_t *bytes, size_t length);
 void score_ios_audio_event(uint8_t pitch, uint8_t velocity, uint8_t channel, uint8_t on);
@@ -61,6 +67,10 @@ uint32_t score_ios_load_bundled(uint32_t index);
 uint32_t score_ios_host_request(void);
 void score_ios_set_host_status(uint32_t status);
 size_t score_ios_drain_playback(ScorePlaybackEvent *events, size_t capacity);
+size_t score_ios_drain_controller(ScoreControllerOutput *outputs, size_t capacity);
+void score_ios_set_controller_target(uint32_t status, const uint8_t *bytes, size_t length);
+size_t score_ios_serialize_controller(uint8_t *bytes, size_t capacity);
+uint32_t score_ios_restore_controller(const uint8_t *bytes, size_t length);
 uint32_t score_ios_import(const uint8_t *bytes, size_t length, uint32_t kind);
 size_t score_ios_serialize(uint8_t *bytes, size_t capacity);
 size_t score_ios_export_musicxml(uint8_t *bytes, size_t capacity);

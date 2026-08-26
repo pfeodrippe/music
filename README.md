@@ -321,6 +321,76 @@ event count, CC64 sustain count/value, rendered nonzero-sample count, and peak
 after six seconds. Normal launches never autoplay and skip the realtime
 diagnostic counters entirely.
 
+## Performance controller
+
+`CONTROLLER` opens an independent, GPU-rendered performance surface shared by
+macOS and iPadOS. Its 4×4 square pads are true multitouch controls; the Pads,
+Clips, and Actions banks send musical notes, launch a 4×4 track/scene matrix,
+or execute 16 mapped actions. Eight additional squares provide stop, play,
+record, loop, click, undo, redo, and save. Score, sampler, and practice state
+remain untouched when entering or leaving this view.
+
+The `USER` bank is a persistent custom surface. Press `EDIT`, tap a pad, then
+use the eight on-screen inspector cells to choose Note, Drum, CC, Clip, or
+Action; set its message number, MIDI channel/clip track, momentary or toggle
+behavior, and color. `DONE` returns the pads to performance input. Edit mode
+never emits a musical/control message, so selecting a mapping cannot trigger a
+DAW action. Native preferences are stored independently at
+`~/Library/Application Support/Score/controller-preferences.bin`; iPadOS keeps
+the same 144-byte versioned mapping blob in application preferences. These
+mappings never modify a score, MusicXML document, or captured performance.
+
+Pads can control any instrument hosted by the receiving DAW—drum rack, piano,
+guitar sampler, synth, or another plug-in—because the selected/armed DAW track
+owns the sound. MIDI mode publishes a device-qualified virtual CoreMIDI source
+(`Score Controller — Mac` or `Score Controller — <device> [<id>]`) and also
+sends to connected MIDI destinations. A second native process receives a
+numeric suffix rather than colliding with the first endpoint. On iPadOS it
+enables the system Network MIDI session, so a Mac can connect through Audio
+MIDI Setup.
+OSC mode sends directly to a configured UDP host and defaults to port 8000.
+For the native host, override `127.0.0.1:8000` with `SCORE_OSC_HOST` and
+`SCORE_OSC_PORT`.
+
+For Bitwig, the maintained route is the community
+[DrivenByMoss Open Sound Control extension](https://github.com/git-moss/DrivenByMoss-Documentation/blob/master/Generic-Tools-Protocols/Open-Sound-Control-%28OSC%29.md): add its **Open Sound Control** controller, then enter the Mac's IP/hostname and receive port in Score's `SETUP` panel. The Pads bank sends DrivenByMoss virtual-keyboard note messages, Clips sends track/scene launch messages, Actions sends its 1…20 action slots, and transport uses the documented global commands. Bitwig also supports ordinary MIDI controllers through its
+[generic MIDI controller workflow](https://www.bitwig.com/userguide/latest/midi_controllers/), so selecting `Score Controller` as the input is the extension-free route.
+To map a custom CC/note to a Bitwig parameter, finish editing in Score, open
+Bitwig's Mapping Panel, select the target parameter, then press the pad. This
+is DAW MIDI Learn: Score defines the message the pad sends, while Bitwig owns
+the link from that message to its instrument, effect, mixer, or command.
+
+For local integration and debugging, `tools/bitwig-score-bridge` builds a
+Bitwig controller extension that decodes Score's OSC vocabulary and exposes 16
+independent `Score OSC` note inputs. Controllers are identified by sender
+IP/port, so matching notes from multiple Macs/iPads keep separate note-off,
+channel, aftertouch, and CC state. Once all 16 slots are occupied the bridge
+logs and rejects another source rather than sharing a slot. See the bridge
+README for its build/install command and probe-log path.
+Debug builds also install `score-devctl bitwig-bootstrap`, a headless CoreMIDI
+endpoint used only to keep those Bitwig note inputs recordable. It has no app
+window and carries no controller data, so opening or quitting any Score app
+instance cannot disable the other controllers.
+
+Apple Pencil force sets note-on velocity and continues as polyphonic
+aftertouch per held pad in both OSC and MIDI modes. Ordinary iPad finger
+touches do not expose real pressure, so they use the fixed velocity instead of
+fabricated force; an external velocity-sensitive MIDI device keeps its
+hardware velocity. Octave controls move the note grid while retaining the same
+DAW routing.
+
+In a hot-reload Debug session, the surface can be exercised without restarting:
+
+```sh
+zig-out/bin/score-devctl controller open
+zig-out/bin/score-devctl controller protocol osc
+zig-out/bin/score-devctl controller bank pads
+zig-out/bin/score-devctl controller bank user
+zig-out/bin/score-devctl controller edit on
+zig-out/bin/score-devctl controller tap 1
+zig-out/bin/score-devctl controller state
+```
+
 ## Controls
 
 - Space or the center transport button: play/pause with count-in

@@ -15,6 +15,9 @@ const native_c = @cImport({
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
     @cInclude("unistd.h");
+    @cInclude("sys/socket.h");
+    @cInclude("netinet/in.h");
+    @cInclude("arpa/inet.h");
     @cInclude("open_panel.h");
     @cInclude("music_devices.h");
 });
@@ -57,6 +60,66 @@ const InputSelection = struct {
     /// the platform facade to resolve the current system default.
     audio_device: u32 = std.math.maxInt(u32),
 };
+
+const NativeControllerOutput = struct {
+    socket: c_int = -1,
+    target: native_c.sockaddr_in = std.mem.zeroes(native_c.sockaddr_in),
+    label: [64]u8 = [_]u8{0} ** 64,
+    label_len: usize = 0,
+
+    fn init() NativeControllerOutput {
+        var result = NativeControllerOutput{};
+        const configured_host = if (native_c.getenv("SCORE_OSC_HOST")) |value| if (value[0] != 0) std.mem.span(value) else "127.0.0.1" else "127.0.0.1";
+        const configured_port: u16 = if (native_c.getenv("SCORE_OSC_PORT")) |value|
+            std.fmt.parseUnsigned(u16, std.mem.span(value), 10) catch 8000
+        else
+            8000;
+        result.socket = native_c.socket(native_c.AF_INET, native_c.SOCK_DGRAM, 0);
+        result.target.sin_family = native_c.AF_INET;
+        result.target.sin_port = native_c.htons(configured_port);
+        var host_buffer: [64:0]u8 = [_:0]u8{0} ** 64;
+        const host_len = @min(configured_host.len, host_buffer.len - 1);
+        @memcpy(host_buffer[0..host_len], configured_host[0..host_len]);
+        if (native_c.inet_pton(native_c.AF_INET, &host_buffer, &result.target.sin_addr) != 1) {
+            if (result.socket >= 0) _ = native_c.close(result.socket);
+            result.socket = -1;
+        }
+        const label = std.fmt.bufPrint(&result.label, "{s}:{d}", .{ configured_host, configured_port }) catch "OSC TARGET";
+        result.label_len = label.len;
+        return result;
+    }
+
+    fn deinit(self: *NativeControllerOutput) void {
+        if (self.socket >= 0) _ = native_c.close(self.socket);
+        self.socket = -1;
+    }
+
+    fn send(self: *NativeControllerOutput, payload: []const u8) bool {
+        if (self.socket < 0 or payload.len == 0) return false;
+        const sent = native_c.sendto(
+            self.socket,
+            payload.ptr,
+            payload.len,
+            0,
+            @ptrCast(&self.target),
+            @sizeOf(native_c.sockaddr_in),
+        );
+        return sent == @as(isize, @intCast(payload.len));
+    }
+
+    fn labelSlice(self: *const NativeControllerOutput) []const u8 {
+        return self.label[0..self.label_len];
+    }
+};
+
+fn pumpControllerOutput(app: *score.App, output: *NativeControllerOutput, midi_service: ?*native_c.ScoreMidiService) void {
+    var messages: [64]score.controller.Output = undefined;
+    const count = app.drainControllerOutputs(&messages);
+    for (messages[0..count]) |*message| switch (message.kind) {
+        .osc => if (!output.send(message.payload())) app.setControllerTarget(2, output.labelSlice()),
+        .midi => if (message.length >= 3) native_c.score_midi_send(midi_service, message.bytes[0], message.bytes[1], message.bytes[2]),
+    };
+}
 
 /// CoreAudio can spend seconds resolving a sleeping wireless input. Keep that
 /// work off the render/event thread while preserving a single callback owner
@@ -1061,8 +1124,15 @@ pub fn main(init: std.process.Init) !void {
         sampler.destroy();
     }
     app.setSamplerStatus(if (audio_output != null) 1 else 2, instrumentDisplayName(active_instrument_path), sampler.region_count, sampler.preloaded_sample_count);
-    const midi_service = native_c.score_midi_create();
+    const midi_endpoint_name: [*c]const u8 = if (native_c.getenv("SCORE_MIDI_ENDPOINT_NAME")) |value|
+        if (value[0] != 0) value else "Score Controller — Mac"
+    else
+        "Score Controller — Mac";
+    const midi_service = native_c.score_midi_create_named(midi_endpoint_name);
     defer native_c.score_midi_destroy(midi_service);
+    var controller_output = NativeControllerOutput.init();
+    defer controller_output.deinit();
+    app.setControllerTarget(if (controller_output.socket >= 0) 1 else 2, controller_output.labelSlice());
     std.log.info("music devices: {d} MIDI inputs, {d} MIDI outputs, audio {d:.0} Hz; SFZ {d} regions / {d} preloaded samples; instrument {s}", .{
         native_c.score_midi_source_count(midi_service),
         native_c.score_midi_destination_count(midi_service),
@@ -1103,6 +1173,8 @@ pub fn main(init: std.process.Init) !void {
     _ = window.setScrollCallback(scrollCallback);
     _ = window.setKeyCallback(keyCallback);
     _ = window.setDropCallback(dropCallback);
+
+    loadControllerPreferences(app, allocator);
 
     if (initial_score_path) |path| {
         loadScorePath(app, allocator, path.ptr) catch |err| {
@@ -1220,6 +1292,7 @@ pub fn main(init: std.process.Init) !void {
                 var audio_path_buffer: [4096]u8 = undefined;
                 if (appDataPath(&audio_path_buffer, "latest-take.wav")) |audio_path| native_c.score_replay_audio_file(audio_path.ptr) else |_| {}
             },
+            .configure_controller => app.setControllerTarget(if (controller_output.socket >= 0) 1 else 2, controller_output.labelSlice()),
             else => {},
         }
         const delta: f32 = @floatCast(now - previous_time);
@@ -1231,6 +1304,7 @@ pub fn main(init: std.process.Init) !void {
         pumpMidiInput(app, sampler, midi_service);
         if (input_selection.microphone) pumpMicrophone(app, &microphone_monitor);
         pumpPlayback(app, sampler, midi_service);
+        pumpControllerOutput(app, &controller_output, midi_service);
         const draw_item_count = app.drawItems().len;
         const before_draw = zglfw.getTime();
         const draw_timing = renderer.draw(app, logical_size, scale, @floatCast(now));
@@ -1238,10 +1312,12 @@ pub fn main(init: std.process.Init) !void {
         performance.record(delta, work_seconds, draw_timing.acquire_wait_seconds, draw_timing.present_seconds, draw_item_count);
         if (autosave_writer and now >= next_autosave) {
             saveAutosave(app, allocator) catch |err| std.log.warn("autosave failed: {s}", .{@errorName(err)});
+            saveControllerPreferences(app) catch |err| std.log.warn("controller preferences save failed: {s}", .{@errorName(err)});
             next_autosave = now + 2;
         }
     }
     try saveAutosave(app, allocator);
+    try saveControllerPreferences(app);
 }
 
 fn readableFile(path: [*:0]const u8) bool {
@@ -2147,6 +2223,40 @@ fn autosaveBasename() []const u8 {
     // hot-reload watcher restarts this process. Keep their recovery journals
     // independent so those windows cannot overwrite the score under test.
     return if (build_options.hot_reload) "autosave-dev.score" else "autosave.score";
+}
+
+fn loadControllerPreferences(app: *score.App, allocator: std.mem.Allocator) void {
+    var path_buffer: [4096]u8 = undefined;
+    const path = appDataPath(&path_buffer, "controller-preferences.bin") catch return;
+    const bytes = readWholeFile(allocator, path.ptr) catch return;
+    defer allocator.free(bytes);
+    app.deserializeControllerPreferences(bytes) catch |err| {
+        std.log.warn("controller preferences recovery skipped: {s}", .{@errorName(err)});
+        return;
+    };
+    std.log.info("recovered controller preferences", .{});
+}
+
+fn saveControllerPreferences(app: *const score.App) !void {
+    var bytes: [256]u8 = undefined;
+    const len = try app.serializeControllerPreferences(&bytes);
+    var temporary_buffer: [4096]u8 = undefined;
+    var destination_buffer: [4096]u8 = undefined;
+    const temporary = try appDataPath(&temporary_buffer, "controller-preferences.tmp");
+    const destination = try appDataPath(&destination_buffer, "controller-preferences.bin");
+    errdefer _ = native_c.unlink(temporary.ptr);
+    const file = native_c.fopen(temporary.ptr, "wb") orelse return error.OpenFailed;
+    if (native_c.fwrite(&bytes, 1, len, file) != len) {
+        _ = native_c.fclose(file);
+        return error.WriteFailed;
+    }
+    if (native_c.fflush(file) != 0) {
+        _ = native_c.fclose(file);
+        return error.FlushFailed;
+    }
+    _ = native_c.fsync(native_c.fileno(file));
+    if (native_c.fclose(file) != 0) return error.CloseFailed;
+    if (native_c.rename(temporary.ptr, destination.ptr) != 0) return error.RenameFailed;
 }
 
 const ScoreSource = struct {

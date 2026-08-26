@@ -18,6 +18,7 @@ pub const HostRequest = enum(u32) {
     replay_take = 8,
     open_instrument = 9,
     ensure_audio = 10,
+    configure_controller = 11,
 };
 
 test "portable host request ABI stays stable" {
@@ -26,6 +27,7 @@ test "portable host request ABI stays stable" {
     try testing.expectEqual(@as(u32, 6), @intFromEnum(HostRequest.start_recording));
     try testing.expectEqual(@as(u32, 9), @intFromEnum(HostRequest.open_instrument));
     try testing.expectEqual(@as(u32, 10), @intFromEnum(HostRequest.ensure_audio));
+    try testing.expectEqual(@as(u32, 11), @intFromEnum(HostRequest.configure_controller));
 }
 
 pub const PointerKind = enum(u32) { move, down, up, cancel, scroll };

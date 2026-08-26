@@ -231,6 +231,26 @@ pub export fn score_ios_drain_playback(events: [*]score.playback.HostEvent, capa
     return instance.drainPlaybackEvents(events[0..capacity]);
 }
 
+pub export fn score_ios_drain_controller(outputs: [*]score.controller.Output, capacity: usize) usize {
+    const instance = app orelse return 0;
+    return instance.drainControllerOutputs(outputs[0..capacity]);
+}
+
+pub export fn score_ios_set_controller_target(status: u32, bytes: [*]const u8, length: usize) void {
+    if (app) |instance| instance.setControllerTarget(status, bytes[0..length]);
+}
+
+pub export fn score_ios_serialize_controller(bytes: [*]u8, capacity: usize) usize {
+    const instance = app orelse return 0;
+    return instance.serializeControllerPreferences(bytes[0..capacity]) catch 0;
+}
+
+pub export fn score_ios_restore_controller(bytes: [*]const u8, length: usize) u32 {
+    const instance = app orelse return 1;
+    instance.deserializeControllerPreferences(bytes[0..length]) catch return 2;
+    return 0;
+}
+
 pub export fn score_ios_import(bytes: [*]const u8, length: usize, kind: u32) u32 {
     const instance = app orelse return 1;
     const source = bytes[0..length];

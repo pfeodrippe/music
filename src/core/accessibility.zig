@@ -1,7 +1,8 @@
 const model = @import("model.zig");
 const ui = @import("ui.zig");
+const std = @import("std");
 
-pub const max_items = 32;
+pub const max_items = 64;
 
 pub const Role = enum(u32) {
     document = 0,
@@ -44,6 +45,16 @@ pub const Id = struct {
     pub const focus_score: u32 = 30;
     pub const instrument_part: u32 = 31;
     pub const sampler_instrument: u32 = 32;
+    pub const controller_view: u32 = 33;
+    pub const controller_score_view: u32 = 60;
+    pub const controller_protocol: u32 = 61;
+    pub const controller_setup: u32 = 62;
+    pub const controller_edit: u32 = 63;
+    pub const controller_bank_first: u32 = 64;
+    pub const controller_octave_down: u32 = 68;
+    pub const controller_octave_up: u32 = 69;
+    pub const controller_pad_first: u32 = 70;
+    pub const controller_transport_first: u32 = 90;
 };
 
 pub const Item = extern struct {
@@ -65,6 +76,10 @@ pub const Snapshot = struct {
 
     pub fn build(self: *Snapshot, state: *const model.UiState, transport: *const model.Transport, meta: *const model.DocumentMeta) void {
         self.len = 0;
+        if (state.app_view == .controller) {
+            self.buildController(state);
+            return;
+        }
         const layout = ui.Layout.calculateForState(state);
         self.add(Id.document, .document, layout.stage, meta.titleSlice(), 0);
         if (state.library_open != 0) {
@@ -76,6 +91,7 @@ pub const Snapshot = struct {
             return;
         }
         if (layout.library_trigger.width > 0) self.add(Id.library, .button, layout.library_trigger, "Open score library", 0);
+        if (layout.app_view_toggle.width > 0) self.add(Id.controller_view, .tab, layout.app_view_toggle, "Open performance controller", 0);
         if (layout.part_selector.width > 0 and @popCount(state.instrument_part_mask) > 1) {
             var label_buffer: [48]u8 = undefined;
             const label = @import("std").fmt.bufPrint(&label_buffer, "Show next part; {s}, {d} of {d} selected", .{ state.selectedPartLabel(), model.instrumentPartOrdinal(state.instrument_part_mask, state.selected_part), @popCount(state.instrument_part_mask) }) catch "Show next instrumental part";
@@ -123,6 +139,55 @@ pub const Snapshot = struct {
         for (layout.tool_buttons, 0..) |button, index| {
             const flags = if (index == @intFromEnum(state.tool)) Flag.selected else 0;
             self.add(Id.tool_first + @as(u32, @intCast(index)), .tab, button, tool_labels[index], flags);
+        }
+    }
+
+    fn buildController(self: *Snapshot, state: *const model.UiState) void {
+        const layout = ui.ControllerLayout.calculate(state.viewport_width, state.viewport_height);
+        self.add(Id.document, .document, .{ .x = 0, .y = 0, .width = state.viewport_width, .height = state.viewport_height }, "Performance controller", 0);
+        self.add(Id.controller_score_view, .tab, layout.score_view, "Return to score", 0);
+        self.add(Id.controller_protocol, .button, layout.protocol, if (state.controller_protocol == .osc) "Use MIDI output; currently OSC" else "Use OSC output; currently MIDI", Flag.toggle);
+        self.add(Id.controller_setup, .button, layout.setup, "Configure controller connection", 0);
+        self.add(Id.controller_edit, .button, layout.edit, if (state.controller_editing == 0) "Edit custom pad mappings" else "Finish editing custom pad mappings", Flag.toggle | (if (state.controller_editing != 0) Flag.selected else 0));
+        const bank_labels = [_][]const u8{ "Musical pads", "Clip launcher", "Mapped actions", "Custom user mappings" };
+        for (layout.banks, 0..) |button, index| self.add(Id.controller_bank_first + @as(u32, @intCast(index)), .tab, button, bank_labels[index], if (index == @intFromEnum(state.controller_bank)) Flag.selected else 0);
+        self.add(Id.controller_octave_down, .button, layout.octave_down, "Move pads down one octave", 0);
+        self.add(Id.controller_octave_up, .button, layout.octave_up, "Move pads up one octave", 0);
+        for (layout.pads, 0..) |pad, index| {
+            var label_buffer: [48]u8 = undefined;
+            const label = switch (state.controller_bank) {
+                .pads => blk: {
+                    const note: i32 = @intCast(std.math.clamp(state.controller_octave * 12 + 12 + @as(i32, @intCast(index)), 0, 127));
+                    break :blk std.fmt.bufPrint(&label_buffer, "Play MIDI note {d}", .{note}) catch "Play pad";
+                },
+                .clips => std.fmt.bufPrint(&label_buffer, "Launch track {d}, scene {d}", .{ index % 4 + 1, index / 4 + 1 }) catch "Launch clip",
+                .actions => std.fmt.bufPrint(&label_buffer, "Trigger mapped action {d}", .{index + 1}) catch "Trigger action",
+                .user => blk: {
+                    const assignment = state.controller_assignments[index];
+                    if (state.controller_editing != 0) break :blk std.fmt.bufPrint(&label_buffer, "Select custom pad {d} for editing", .{index + 1}) catch "Select custom pad";
+                    break :blk switch (assignment.kind) {
+                        .note => std.fmt.bufPrint(&label_buffer, "Play custom MIDI note {d} on channel {d}", .{ assignment.value, assignment.channel + 1 }) catch "Play custom note",
+                        .drum => std.fmt.bufPrint(&label_buffer, "Play custom drum note {d} on channel {d}", .{ assignment.value, assignment.channel + 1 }) catch "Play custom drum",
+                        .cc => std.fmt.bufPrint(&label_buffer, "Send custom MIDI CC {d} on channel {d}", .{ assignment.value, assignment.channel + 1 }) catch "Send custom control",
+                        .clip => std.fmt.bufPrint(&label_buffer, "Launch custom track {d}, scene {d}", .{ assignment.channel + 1, assignment.value + 1 }) catch "Launch custom clip",
+                        .action => std.fmt.bufPrint(&label_buffer, "Trigger custom mapped action {d}", .{assignment.value + 1}) catch "Trigger custom action",
+                    };
+                },
+            };
+            const mask = @as(u32, 1) << @intCast(index);
+            const pressed = (state.controller_pressed_pads & mask) != 0 or (state.controller_bank == .user and (state.controller_toggled_pads & mask) != 0);
+            const selected = state.controller_editing != 0 and state.controller_bank == .user and state.controller_selected_pad == index;
+            self.add(Id.controller_pad_first + @as(u32, @intCast(index)), .button, pad, label, Flag.toggle | (if (pressed) Flag.pressed else 0) | (if (selected) Flag.selected else 0));
+        }
+        const transport_labels = [_][]const u8{ "Stop", "Play", "Record", "Loop", "Metronome", "Undo", "Redo", "Save project" };
+        for (layout.transport, 0..) |button, index| {
+            if (state.controller_editing != 0 and state.controller_bank == .user) {
+                const edit_labels = [_][]const u8{ "Previous message type", "Next message type", "Decrease message number", "Increase message number", "Decrease MIDI channel or clip track", "Increase MIDI channel or clip track", "Toggle momentary or latch behavior", "Cycle pad color" };
+                self.add(Id.controller_transport_first + @as(u32, @intCast(index)), .button, button, edit_labels[index], 0);
+                continue;
+            }
+            const pressed = (state.controller_pressed_transport & (@as(u32, 1) << @intCast(index))) != 0;
+            self.add(Id.controller_transport_first + @as(u32, @intCast(index)), .button, button, transport_labels[index], Flag.toggle | (if (pressed) Flag.pressed else 0));
         }
     }
 

@@ -12,3 +12,4 @@ local-content/
 src/assets/scores/private/
 output/
 tmp/
+tools/bitwig-score-bridge/target/

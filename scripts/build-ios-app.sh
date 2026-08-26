@@ -65,6 +65,7 @@ xcrun --sdk "$score_ios_sdk_name" swiftc \
     -framework QuartzCore \
     -framework AVFoundation \
     -framework CoreMIDI \
+    -framework Network \
     -framework UniformTypeIdentifiers \
     -o "$score_ios_app/Score"
 

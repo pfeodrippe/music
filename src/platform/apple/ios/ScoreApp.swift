@@ -20,6 +20,7 @@ final class ScoreAppDelegate: UIResponder, UIApplicationDelegate {
 final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     private let audio = ScoreAudioService()
     private let midi = ScoreMIDIService()
+    private let osc = ScoreOSCService()
     private lazy var supportDirectory: URL = {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let directory = root.appendingPathComponent("Score", isDirectory: true)
@@ -29,6 +30,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     private var autosaveURL: URL { supportDirectory.appendingPathComponent("autosave.score") }
     private var takeURL: URL { supportDirectory.appendingPathComponent("latest-take.caf") }
     private var serializationBuffer = Data(count: 4 * 1024 * 1024)
+    private var lastControllerPreferences: Data?
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -42,6 +44,8 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             guard let self else { return }
             self.audio.consume(events)
         }
+        scoreView.onController = { [weak self] messages in self?.sendController(messages) }
+        scoreView.onControllerPreferencesChanged = { [weak self] in self?.saveControllerPreferencesIfChanged() }
         // Autosave is armed only after the existing journal has been restored
         // in viewDidAppear. CADisplayLink can render before that callback; an
         // eagerly installed closure would overwrite a valid score with the
@@ -53,14 +57,17 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         super.viewDidAppear(animated)
         becomeFirstResponder()
         restoreAutosave()
+        restoreControllerPreferences()
         (view as? ScoreMetalView)?.onAutosave = { [weak self] in self?.saveAutosave() }
         midi.onMessage = { [weak self] status, data1, data2 in
             self?.audio.monitor(status: status, data1: data1, data2: data2)
             score_ios_midi(DispatchTime.now().uptimeNanoseconds, status, data1, data2)
         }
         _ = midi.start()
+        restoreControllerTarget()
         startLibraryAcceptanceIfRequested()
         startAcceptancePlaybackIfRequested()
+        startControllerAcceptanceIfRequested()
     }
 
     private func startLibraryAcceptanceIfRequested() {
@@ -92,6 +99,45 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
                 score_ios_audio_peak()
             )
             score_ios_audio_finish_diagnostics()
+        }
+    }
+
+    /// Physical-device acceptance uses the same accessibility activation path
+    /// as VoiceOver and Switch Control. That path resolves the GPU-owned pad
+    /// rectangles, feeds their down/up events through the shared Zig core, and
+    /// finally drains the resulting OSC packets through `sendController`.
+    /// Nothing runs during a normal launch.
+    private func startControllerAcceptanceIfRequested() {
+        guard ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_ACCEPTANCE"] == "1" else { return }
+
+        let controllerView: UInt32 = 33
+        let customBank: UInt32 = 67
+        let firstPad: UInt32 = 70
+        let pattern: [UInt32] = [
+            firstPad + 0,  // kick, MIDI 36
+            firstPad + 6,  // closed hi-hat, MIDI 42
+            firstPad + 2,  // snare, MIDI 38
+            firstPad + 6,
+            firstPad + 0,
+            firstPad + 6,
+            firstPad + 2,
+            firstPad + 10, // open hi-hat, MIDI 46
+        ]
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            score_ios_accessibility_activate(controllerView)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            score_ios_accessibility_activate(customBank)
+        }
+        for (index, pad) in pattern.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.35 + Double(index) * 0.28) {
+                score_ios_accessibility_activate(pad)
+                NSLog("Score iPad controller acceptance pad=%u", pad - firstPad + 1)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.35 + Double(pattern.count) * 0.28) {
+            NSLog("Score iPad controller acceptance complete")
         }
     }
 
@@ -138,8 +184,118 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             score_ios_set_host_status(6)
         case 8: audio.replay(takeURL)
         case 9: presentInstrumentImporter()
+        case 11: presentControllerSetup()
         default: break
         }
+    }
+
+    private func sendController(_ messages: [ScoreControllerMessage]) {
+        for message in messages {
+            if message.kind == 1 {
+                osc.send(message.payload)
+            } else if message.kind == 2, message.payload.count >= 3 {
+                midi.send(status: message.payload[0], data1: message.payload[1], data2: message.payload[2])
+            }
+        }
+    }
+
+    private func restoreControllerTarget() {
+        osc.onState = { [weak self] status, label in
+            guard self != nil else { return }
+            Self.publishControllerTarget(status: status, label: label)
+        }
+        let defaults = UserDefaults.standard
+        let environment = ProcessInfo.processInfo.environment
+        if let host = environment["SCORE_OSC_HOST"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !host.isEmpty {
+            let configuredPort = UInt16(environment["SCORE_OSC_PORT"] ?? "") ?? 8000
+            // A devicectl-configured physical device should remain usable on
+            // its next ordinary launch, without requiring the setup dialog.
+            defaults.set(host, forKey: "ScoreOSC.host")
+            defaults.set(Int(configuredPort), forKey: "ScoreOSC.port")
+            osc.configure(host: host, port: configuredPort)
+            return
+        }
+        guard let host = defaults.string(forKey: "ScoreOSC.host"), !host.isEmpty else {
+            Self.publishControllerTarget(status: 0, label: "TAP SETUP / PORT 8000")
+            return
+        }
+        let storedPort = defaults.integer(forKey: "ScoreOSC.port")
+        osc.configure(host: host, port: UInt16(storedPort == 0 ? 8000 : storedPort))
+    }
+
+    private func presentControllerSetup() {
+        let defaults = UserDefaults.standard
+        let alert = UIAlertController(
+            title: "Controller Output",
+            message: "For Bitwig, install DrivenByMoss → add Open Sound Control. Enter this Mac’s IP or .local name; its default receive port is 8000. MIDI mode uses CoreMIDI or a configured Network MIDI session.",
+            preferredStyle: .alert
+        )
+        alert.addTextField { field in
+            field.placeholder = "Mac IP or hostname, e.g. 192.168.1.20"
+            field.text = defaults.string(forKey: "ScoreOSC.host")
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+            field.keyboardType = .URL
+        }
+        alert.addTextField { field in
+            field.placeholder = "8000"
+            let stored = defaults.integer(forKey: "ScoreOSC.port")
+            field.text = String(stored == 0 ? 8000 : stored)
+            field.keyboardType = .numberPad
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Save & Test", style: .default) { [weak self, weak alert] _ in
+            guard let self, let fields = alert?.textFields, fields.count == 2 else { return }
+            let host = fields[0].text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let portValue = UInt16(fields[1].text ?? "") ?? 8000
+            guard !host.isEmpty else {
+                Self.publishControllerTarget(status: 2, label: "OSC HOST REQUIRED")
+                return
+            }
+            defaults.set(host, forKey: "ScoreOSC.host")
+            defaults.set(Int(portValue), forKey: "ScoreOSC.port")
+            self.osc.configure(host: host, port: portValue)
+            self.osc.sendRefreshWhenReady()
+        })
+        present(alert, animated: true)
+    }
+
+    private static func publishControllerTarget(status: UInt32, label: String) {
+        let bytes = Array(label.utf8.prefix(48))
+        bytes.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            score_ios_set_controller_target(status, base, buffer.count)
+        }
+    }
+
+    private func controllerPreferences() -> Data? {
+        var data = Data(count: 256)
+        let length = data.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return score_ios_serialize_controller(base, raw.count)
+        }
+        guard length > 0 else { return nil }
+        data.count = length
+        return data
+    }
+
+    private func saveControllerPreferencesIfChanged() {
+        guard let data = controllerPreferences(), data != lastControllerPreferences else { return }
+        lastControllerPreferences = data
+        UserDefaults.standard.set(data, forKey: "ScoreController.preferences")
+    }
+
+    private func restoreControllerPreferences() {
+        guard let data = UserDefaults.standard.data(forKey: "ScoreController.preferences") else {
+            lastControllerPreferences = controllerPreferences()
+            return
+        }
+        let status = data.withUnsafeBytes { raw -> UInt32 in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 1 }
+            return score_ios_restore_controller(base, raw.count)
+        }
+        lastControllerPreferences = status == 0 ? data : controllerPreferences()
     }
 
     private func presentImporter() {

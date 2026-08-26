@@ -15,7 +15,7 @@ const development_plugin = hot.PluginDescriptor{
     // Bump whenever the reloadable systems/screen-composition module changes;
     // the host logs and validates the newly loaded descriptor without moving
     // the Flecs world or GPU resources out of the long-lived executable.
-    .generation = 22,
+    .generation = 24,
     .glyph_atlas_hash = glyph_atlas.content_hash,
     .systems = &all_systems,
     .system_count = all_systems.len,

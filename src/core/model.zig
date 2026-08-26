@@ -181,6 +181,58 @@ pub const ScoreViewMode = enum(u32) {
     continuous,
 };
 
+pub const AppView = enum(u32) {
+    score,
+    controller,
+};
+
+pub const ControllerProtocol = enum(u32) {
+    midi,
+    osc,
+};
+
+pub const ControllerBank = enum(u32) {
+    pads,
+    clips,
+    actions,
+    user,
+};
+
+pub const ControllerAssignmentKind = enum(u8) {
+    note,
+    drum,
+    cc,
+    clip,
+    action,
+};
+
+pub const ControllerBehavior = enum(u8) {
+    momentary,
+    toggle,
+};
+
+/// Compact, platform-independent description of one programmable controller
+/// pad. `value` is a note/CC/action number or clip scene; `channel` is a MIDI
+/// channel or clip track. Keeping this data in the Flecs UI component lets the
+/// exact same editor and mappings run on macOS and iPad.
+pub const ControllerAssignment = extern struct {
+    kind: ControllerAssignmentKind = .note,
+    behavior: ControllerBehavior = .momentary,
+    channel: u8 = 0,
+    value: u8 = 36,
+    color: u8 = 0,
+    reserved: [3]u8 = [_]u8{0} ** 3,
+};
+
+pub fn defaultControllerAssignments() [16]ControllerAssignment {
+    var assignments = [_]ControllerAssignment{.{}} ** 16;
+    for (&assignments, 0..) |*assignment, index| {
+        assignment.value = @intCast(36 + index);
+        assignment.color = @intCast(index / 4);
+    }
+    return assignments;
+}
+
 /// Imported MusicXML keeps the source part index in the high portion of the
 /// compact staff byte. Eight local staff slots are available per part, which
 /// is enough for the MusicXML staff-number range accepted by the importer and
@@ -700,6 +752,29 @@ pub const UiState = extern struct {
     input_device_count: u32 = 0,
     input_label_len: u32 = 0,
     input_label: [48]u8 = [_]u8{0} ** 48,
+    /// Independent performance-controller workspace. These values live in the
+    /// Flecs UI component so the GPU view and all hot-reloaded systems keep the
+    /// same controller state across platform hosts.
+    app_view: AppView = .score,
+    controller_protocol: ControllerProtocol = .osc,
+    controller_bank: ControllerBank = .pads,
+    controller_octave: i32 = 3,
+    controller_channel: u32 = 0,
+    controller_velocity: u32 = 104,
+    controller_pressed_pads: u32 = 0,
+    controller_pressed_transport: u32 = 0,
+    controller_status: u32 = 0,
+    controller_target_len: u32 = 0,
+    controller_target: [48]u8 = [_]u8{0} ** 48,
+    /// Explicit editing mode prevents a sustained musical press from ever
+    /// being interpreted as configuration. In edit mode, a pad tap selects it
+    /// and the eight inspector cells mutate this mapping without emitting
+    /// MIDI or OSC.
+    controller_editing: u32 = 0,
+    controller_selected_pad: u32 = 0,
+    controller_toggled_pads: u32 = 0,
+    controller_mapping_revision: u32 = 1,
+    controller_assignments: [16]ControllerAssignment = defaultControllerAssignments(),
 
     pub fn setSelectedPartLabel(self: *UiState, value: []const u8) void {
         self.selected_part_label_len = @intCast(@min(value.len, self.selected_part_label.len));
@@ -728,6 +803,17 @@ pub const UiState = extern struct {
 
     pub fn inputLabel(self: *const UiState) []const u8 {
         return self.input_label[0..self.input_label_len];
+    }
+
+    pub fn setControllerTarget(self: *UiState, status: u32, value: []const u8) void {
+        self.controller_status = status;
+        self.controller_target_len = @intCast(@min(value.len, self.controller_target.len));
+        @memset(&self.controller_target, 0);
+        @memcpy(self.controller_target[0..self.controller_target_len], value[0..self.controller_target_len]);
+    }
+
+    pub fn controllerTarget(self: *const UiState) []const u8 {
+        return self.controller_target[0..self.controller_target_len];
     }
 };
 
@@ -889,7 +975,7 @@ test "portable score components have deterministic layouts" {
     try std.testing.expectEqual(@as(usize, 68), @sizeOf(Harmony));
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Transport));
     try std.testing.expectEqual(@as(usize, 4112), @sizeOf(PlaybackBounds));
-    try std.testing.expectEqual(@as(usize, 284), @sizeOf(UiState));
+    try std.testing.expectEqual(@as(usize, 516), @sizeOf(UiState));
     try std.testing.expectEqual(@as(usize, 52), @sizeOf(PracticeState));
     try std.testing.expectEqual(@as(usize, 20), @sizeOf(Measure));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(ScorePart));

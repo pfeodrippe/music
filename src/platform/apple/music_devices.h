@@ -15,6 +15,7 @@ typedef struct ScoreMidiEvent {
 typedef struct ScoreMidiService ScoreMidiService;
 
 ScoreMidiService *score_midi_create(void);
+ScoreMidiService *score_midi_create_named(const char *endpoint_name);
 void score_midi_destroy(ScoreMidiService *service);
 size_t score_midi_poll(ScoreMidiService *service, ScoreMidiEvent *events, size_t capacity);
 void score_midi_send(ScoreMidiService *service, uint8_t status, uint8_t data1, uint8_t data2);

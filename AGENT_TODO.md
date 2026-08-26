@@ -8,6 +8,58 @@ applications. Browser work is explicitly deferred and does not block this
 goal. Platform code remains limited to window, GPU-surface, audio-device,
 MIDI/microphone, storage, and document-panel seams.
 
+## Independent performance controller (2026-08-25)
+
+- [x] Add a responsive full-window GPU controller view to the shared Zig/Flecs
+  core, not a UIKit/AppKit screen: 16 square multitouch pads, eight square
+  transport/action controls, Pads/Clips/Actions banks, octave controls, OSC/MIDI
+  selection, connection status, score return, and complete semantic
+  accessibility on macOS and iPadOS.
+- [x] Keep protocol meaning in Zig. The bounded output queue emits complete,
+  byte-tested OSC datagrams or standard MIDI messages for notes, clip launch,
+  mapped actions, transport, and polyphonic aftertouch. Native/iPad hosts only
+  deliver those bytes through UDP or CoreMIDI.
+- [x] Support arbitrary DAW instruments through note routing rather than
+  hard-coding sounds. macOS/iPadOS expose a `Score Controller` virtual MIDI
+  source, iPadOS enables Network MIDI, and direct OSC targets DrivenByMoss's
+  documented Bitwig endpoint. The DAW's selected track determines whether the
+  pads play drums, piano, guitar, synths, or another device.
+- [x] Preserve real expression where hardware supplies it: Apple Pencil force
+  maps to a curved note velocity and streams per-note aftertouch; finger taps
+  use an explicit fixed velocity because iPad capacitive fingers do not provide
+  trustworthy pressure. Multitouch note-on/off and cancel paths are regression
+  tested so stuck notes cannot survive a view, bank, or protocol change.
+- [x] Add a persistent `USER` bank with an explicit GPU `EDIT`/`DONE` workflow:
+  tap a pad to select it, then set Note/Drum/CC/Clip/Action, message number,
+  MIDI channel or clip track, momentary/toggle behavior, and color. Edit-mode
+  pad selection emits no output. The versioned 144-byte preference blob stays
+  independent of score documents and round-trips through native app support
+  storage and iPad application preferences.
+- [x] Reproduce and fix the native Edit crash from the user report. The color
+  swatch label performed `u8 + 1` in a Debug render path; it now widens before
+  addition. A hostile-state renderer regression, full Zig suite, signed macOS
+  rebuild, exact Controller → Edit UI pass, mapping mutation, quit/relaunch,
+  and persistence pass cover the failure.
+- [x] Add `score-devctl controller ...` commands for state/open/score,
+  protocol, bank, edit mode, octave, pad taps, and transport. The full Zig suite, native
+  build, signed macOS bundle, iOS Simulator bundle, live Debug command path,
+  accessibility tree, and native visual pass succeed.
+- [x] Isolate simultaneous controller instances end to end. CoreMIDI sources
+  have device-specific names (and collision suffixes for multiple native
+  processes), while the development Bitwig bridge keys OSC clients by their
+  real source address/port and gives each one independent note, channel,
+  aftertouch, CC, and held-note state. Sixteen sources are supported; a 17th
+  source is rejected instead of aliasing an occupied slot. A live Bitwig pass
+  routed matching C3 note-on/off pairs from native Score and the iPad Simulator
+  to stable slots 1 and 2, and the Acoustic Drums track produced audio. The
+  overlap pass held native C3 while iPad C3 completed its own press/release,
+  then released native C3; Bitwig retained the exact per-slot event order. The
+  stress pass filled slots 3–16 and logged three explicit rejections without
+  disturbing the two real app instances. The existing Zig `score-devctl` now
+  has a headless `bitwig-bootstrap` mode so Bitwig's recordable `NoteInput`
+  owner is independent of every Score window; an iPad-only pass, native join,
+  native exit, and second iPad pass all succeeded without restarting Bitwig.
+
 ## Native + iPad audio acceptance (2026-08-24)
 
 - [x] Fix the physical-iPad Library crash. The attached-device `.ips` report

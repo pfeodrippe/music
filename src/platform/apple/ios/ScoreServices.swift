@@ -1,6 +1,75 @@
 import Foundation
 import AVFoundation
 import CoreMIDI
+import Network
+import UIKit
+
+final class ScoreOSCService {
+    var onState: ((UInt32, String) -> Void)?
+    private let queue = DispatchQueue(label: "app.score.practice.osc", qos: .userInteractive)
+    private var connection: NWConnection?
+    private var targetLabel = ""
+    private var refreshPending = false
+
+    deinit { connection?.cancel() }
+
+    func configure(host: String, port: UInt16) {
+        connection?.cancel()
+        guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            onState?(2, "INVALID OSC PORT")
+            return
+        }
+        targetLabel = "\(host):\(port)"
+        let candidate = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .udp)
+        candidate.stateUpdateHandler = { [weak self, weak candidate] state in
+            guard let self, let candidate, candidate === self.connection else { return }
+            switch state {
+            case .ready:
+                DispatchQueue.main.async { self.onState?(1, self.targetLabel) }
+                if self.refreshPending {
+                    self.refreshPending = false
+                    self.send(Self.oscMessage(address: "/refresh"))
+                }
+            case .failed(let error):
+                DispatchQueue.main.async { self.onState?(2, "OSC ERROR: \(error.localizedDescription)") }
+            case .waiting(let error):
+                DispatchQueue.main.async { self.onState?(2, "OSC WAITING: \(error.localizedDescription)") }
+            default: break
+            }
+        }
+        connection = candidate
+        onState?(0, "CONNECTING \(targetLabel)")
+        candidate.start(queue: queue)
+    }
+
+    func send(_ payload: Data) {
+        guard let connection else {
+            onState?(2, "TAP SETUP / PORT 8000")
+            return
+        }
+        connection.send(content: payload, completion: .contentProcessed { [weak self] error in
+            guard let error else { return }
+            DispatchQueue.main.async { self?.onState?(2, "OSC SEND ERROR: \(error.localizedDescription)") }
+        })
+    }
+
+    func sendRefreshWhenReady() {
+        refreshPending = true
+        if case .ready? = connection?.state {
+            refreshPending = false
+            send(Self.oscMessage(address: "/refresh"))
+        }
+    }
+
+    private static func oscMessage(address: String) -> Data {
+        func padded(_ string: String) -> [UInt8] {
+            var bytes = Array(string.utf8) + [0]
+            while bytes.count % 4 != 0 { bytes.append(0) }
+            return bytes
+        }
+        return Data(padded(address) + padded(","))
+    }
+}
 
 final class ScoreAudioService {
     private let engine = AVAudioEngine()
@@ -180,23 +249,36 @@ final class ScoreMIDIService {
     private var client = MIDIClientRef()
     private var inputPort = MIDIPortRef()
     private var outputPort = MIDIPortRef()
+    private var virtualSource = MIDIEndpointRef()
     private var started = false
+
+    private static func endpointName() -> String {
+        let device = UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stableID = UIDevice.current.identifierForVendor?.uuidString.replacingOccurrences(of: "-", with: "").prefix(8) ?? "UNKNOWN"
+        return "Score Controller — \(device.isEmpty ? "iPad" : device) [\(stableID)]"
+    }
 
     deinit {
         if inputPort != 0 { MIDIPortDispose(inputPort) }
         if outputPort != 0 { MIDIPortDispose(outputPort) }
+        if virtualSource != 0 { MIDIEndpointDispose(virtualSource) }
         if client != 0 { MIDIClientDispose(client) }
     }
 
     @discardableResult
     func start() -> Bool {
         if started { return true }
-        guard MIDIClientCreate("Score" as CFString, nil, nil, &client) == noErr,
+        let endpointName = Self.endpointName()
+        guard MIDIClientCreate("Score \(endpointName)" as CFString, nil, nil, &client) == noErr,
+              MIDISourceCreate(client, endpointName as CFString, &virtualSource) == noErr,
               MIDIInputPortCreate(client, "Score Input" as CFString, scoreMIDIRead, Unmanaged.passUnretained(self).toOpaque(), &inputPort) == noErr,
               MIDIOutputPortCreate(client, "Score Output" as CFString, &outputPort) == noErr else { return false }
+        let network = MIDINetworkSession.default()
+        network.connectionPolicy = .anyone
+        network.isEnabled = true
         for index in 0..<MIDIGetNumberOfSources() {
             let source = MIDIGetSource(index)
-            if source != 0 { MIDIPortConnectSource(inputPort, source, nil) }
+            if source != 0 && source != virtualSource { MIDIPortConnectSource(inputPort, source, nil) }
         }
         started = true
         return true
@@ -210,6 +292,7 @@ final class ScoreMIDIService {
         bytes.withUnsafeBufferPointer { buffer in
             _ = MIDIPacketListAdd(&packetList, MemoryLayout<MIDIPacketList>.size, packet, 0, buffer.count, buffer.baseAddress!)
         }
+        if virtualSource != 0 { MIDIReceived(virtualSource, &packetList) }
         for index in 0..<MIDIGetNumberOfDestinations() {
             let destination = MIDIGetDestination(index)
             if destination != 0 { MIDISend(outputPort, destination, &packetList) }

@@ -2,6 +2,11 @@ import UIKit
 import Metal
 import QuartzCore
 
+struct ScoreControllerMessage {
+    let kind: UInt32
+    let payload: Data
+}
+
 private struct ScoreGPUUniforms {
     var viewport: SIMD2<Float>
     var time: Float
@@ -10,14 +15,17 @@ private struct ScoreGPUUniforms {
 
 private final class ScoreSemanticElement: UIAccessibilityElement {
     let scoreID: UInt32
+    let onActivated: () -> Void
 
-    init(container: Any, scoreID: UInt32) {
+    init(container: Any, scoreID: UInt32, onActivated: @escaping () -> Void) {
         self.scoreID = scoreID
+        self.onActivated = onActivated
         super.init(accessibilityContainer: container)
     }
 
     override func accessibilityActivate() -> Bool {
         score_ios_accessibility_activate(scoreID)
+        onActivated()
         return true
     }
 }
@@ -27,6 +35,8 @@ final class ScoreMetalView: UIView {
 
     var onHostRequest: ((UInt32) -> Void)?
     var onPlayback: (([ScorePlaybackEvent]) -> Void)?
+    var onController: (([ScoreControllerMessage]) -> Void)?
+    var onControllerPreferencesChanged: (() -> Void)?
     var onAutosave: (() -> Void)?
 
     private let metalDevice: MTLDevice
@@ -138,6 +148,7 @@ final class ScoreMetalView: UIView {
         let request = score_ios_host_request()
         if request != 0 { onHostRequest?(request) }
         drainPlayback()
+        drainController()
         if nextAutosaveTimestamp == 0 || link.timestamp >= nextAutosaveTimestamp {
             onAutosave?()
             nextAutosaveTimestamp = link.timestamp + 2
@@ -271,6 +282,23 @@ final class ScoreMetalView: UIView {
         if count > 0 { onPlayback?(Array(events.prefix(count))) }
     }
 
+    private func drainController() {
+        var outputs = Array(repeating: ScoreControllerOutput(), count: 64)
+        let count = outputs.withUnsafeMutableBufferPointer { buffer in
+            score_ios_drain_controller(buffer.baseAddress, buffer.count)
+        }
+        guard count > 0 else { return }
+        var messages: [ScoreControllerMessage] = []
+        messages.reserveCapacity(count)
+        for index in 0..<count {
+            var output = outputs[index]
+            let length = min(Int(output.length), 128)
+            let payload = withUnsafeBytes(of: &output.bytes) { Data($0.prefix(length)) }
+            messages.append(ScoreControllerMessage(kind: output.kind, payload: payload))
+        }
+        onController?(messages)
+    }
+
     private func updateAccessibility() {
         let count = Int(score_ios_accessibility_count())
         guard count > 0, let pointer = score_ios_accessibility_items() else { return }
@@ -288,7 +316,9 @@ final class ScoreMetalView: UIView {
         if signature == accessibilitySignature { return }
         accessibilitySignature = signature
         accessibilityElements = entries.map { item, rect, label in
-            let element = ScoreSemanticElement(container: self, scoreID: item.id)
+            let element = ScoreSemanticElement(container: self, scoreID: item.id) { [weak self] in
+                self?.onControllerPreferencesChanged?()
+            }
             element.accessibilityLabel = label
             element.accessibilityFrameInContainerSpace = rect
             if item.role == 0 {
@@ -311,9 +341,15 @@ final class ScoreMetalView: UIView {
         for touch in touches {
             let point = touch.location(in: self)
             let pointerType: UInt32 = touch.type == .pencil ? 1 : (touch.type == .indirectPointer ? 0 : 2)
-            let pressure = touch.maximumPossibleForce > 0 ? touch.force / touch.maximumPossibleForce : (kind == 2 ? 0 : 1)
+            // Apple Pencil exposes real force. Ordinary iPad finger touches do
+            // not, so send zero and let the shared core use its explicit fixed
+            // velocity instead of pretending contact area is pressure.
+            let pressure = touch.type == .pencil && touch.maximumPossibleForce > 0 && kind != 2 && kind != 3
+                ? touch.force / touch.maximumPossibleForce
+                : 0
             score_ios_pointer(kind, pointerType, UInt32(truncatingIfNeeded: ObjectIdentifier(touch).hashValue), Float(point.x), Float(point.y), kind == 2 ? 0 : 1, Float(pressure), 0, 0)
         }
+        if kind == 2 || kind == 3 { onControllerPreferencesChanged?() }
     }
 
     @objc private func hovered(_ recognizer: UIHoverGestureRecognizer) {

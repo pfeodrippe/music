@@ -5,8 +5,10 @@
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define SCORE_MIDI_QUEUE_CAPACITY 4096u
 #define SCORE_MIDI_RUNNING_STATUS_SLOTS 64u
@@ -17,6 +19,7 @@ struct ScoreMidiService {
     MIDIClientRef client;
     MIDIPortRef input_port;
     MIDIPortRef output_port;
+    MIDIEndpointRef virtual_source;
     _Atomic uint32_t write_index;
     _Atomic uint32_t read_index;
     uint8_t running_status[SCORE_MIDI_RUNNING_STATUS_SLOTS];
@@ -82,15 +85,69 @@ static void score_midi_read(const MIDIPacketList *packet_list, void *context, vo
     }
 }
 
-ScoreMidiService *score_midi_create(void) {
-    ScoreMidiService *service = (ScoreMidiService *)calloc(1, sizeof(ScoreMidiService));
-    if (service == NULL) return NULL;
-    if (MIDIClientCreate(CFSTR("Score"), NULL, NULL, &service->client) != noErr) goto fail;
-    if (MIDIInputPortCreate(service->client, CFSTR("Score Input"), score_midi_read, service, &service->input_port) != noErr) goto fail;
-    if (MIDIOutputPortCreate(service->client, CFSTR("Score Output"), &service->output_port) != noErr) goto fail;
+static ItemCount score_midi_external_source_count(const ScoreMidiService *service) {
+    ItemCount count = 0;
     ItemCount sources = MIDIGetNumberOfSources();
     for (ItemCount index = 0; index < sources; ++index) {
         MIDIEndpointRef source = MIDIGetSource(index);
+        if (source != 0 && (service == NULL || source != service->virtual_source)) count += 1;
+    }
+    return count;
+}
+
+static MIDIEndpointRef score_midi_external_source_at(const ScoreMidiService *service, ItemCount requested) {
+    ItemCount logical_index = 0;
+    ItemCount sources = MIDIGetNumberOfSources();
+    for (ItemCount index = 0; index < sources; ++index) {
+        MIDIEndpointRef source = MIDIGetSource(index);
+        if (source == 0 || (service != NULL && source == service->virtual_source)) continue;
+        if (logical_index == requested) return source;
+        logical_index += 1;
+    }
+    return 0;
+}
+
+static bool score_midi_source_name_exists(const char *candidate) {
+    if (candidate == NULL || candidate[0] == '\0') return false;
+    const ItemCount sources = MIDIGetNumberOfSources();
+    for (ItemCount index = 0; index < sources; ++index) {
+        const MIDIEndpointRef source = MIDIGetSource(index);
+        CFStringRef name = NULL;
+        if (source == 0 || MIDIObjectGetStringProperty(source, kMIDIPropertyDisplayName, &name) != noErr || name == NULL) continue;
+        char existing[256] = {0};
+        const bool equal = CFStringGetCString(name, existing, sizeof(existing), kCFStringEncodingUTF8) && strcmp(existing, candidate) == 0;
+        CFRelease(name);
+        if (equal) return true;
+    }
+    return false;
+}
+
+static CFStringRef score_midi_unique_endpoint_name(const char *requested_name) {
+    const char *base = requested_name == NULL || requested_name[0] == '\0' ? "Score Controller — Mac" : requested_name;
+    char candidate[256] = {0};
+    for (unsigned int instance = 1; instance < 1000; ++instance) {
+        if (instance == 1) snprintf(candidate, sizeof(candidate), "%s", base);
+        else snprintf(candidate, sizeof(candidate), "%s #%u", base, instance);
+        if (!score_midi_source_name_exists(candidate)) return CFStringCreateWithCString(kCFAllocatorDefault, candidate, kCFStringEncodingUTF8);
+    }
+    snprintf(candidate, sizeof(candidate), "%s (%d)", base, getpid());
+    return CFStringCreateWithCString(kCFAllocatorDefault, candidate, kCFStringEncodingUTF8);
+}
+
+ScoreMidiService *score_midi_create_named(const char *endpoint_name) {
+    ScoreMidiService *service = (ScoreMidiService *)calloc(1, sizeof(ScoreMidiService));
+    if (service == NULL) return NULL;
+    if (MIDIClientCreate(CFSTR("Score"), NULL, NULL, &service->client) != noErr) goto fail;
+    CFStringRef unique_name = score_midi_unique_endpoint_name(endpoint_name);
+    if (unique_name == NULL) goto fail;
+    const OSStatus source_status = MIDISourceCreate(service->client, unique_name, &service->virtual_source);
+    CFRelease(unique_name);
+    if (source_status != noErr) goto fail;
+    if (MIDIInputPortCreate(service->client, CFSTR("Score Input"), score_midi_read, service, &service->input_port) != noErr) goto fail;
+    if (MIDIOutputPortCreate(service->client, CFSTR("Score Output"), &service->output_port) != noErr) goto fail;
+    ItemCount sources = score_midi_external_source_count(service);
+    for (ItemCount index = 0; index < sources; ++index) {
+        MIDIEndpointRef source = score_midi_external_source_at(service, index);
         if (source != 0) MIDIPortConnectSource(service->input_port, source, (void *)(uintptr_t)(index + 1));
     }
     service->selected_source = SCORE_MIDI_ALL_SOURCES;
@@ -100,10 +157,15 @@ fail:
     return NULL;
 }
 
+ScoreMidiService *score_midi_create(void) {
+    return score_midi_create_named("Score Controller — Mac");
+}
+
 void score_midi_destroy(ScoreMidiService *service) {
     if (service == NULL) return;
     if (service->input_port != 0) MIDIPortDispose(service->input_port);
     if (service->output_port != 0) MIDIPortDispose(service->output_port);
+    if (service->virtual_source != 0) MIDIEndpointDispose(service->virtual_source);
     if (service->client != 0) MIDIClientDispose(service->client);
     free(service);
 }
@@ -129,6 +191,7 @@ void score_midi_send(ScoreMidiService *service, uint8_t status, uint8_t data1, u
     Byte data[3] = {status, data1, data2};
     packet = MIDIPacketListAdd(packets, sizeof(storage), packet, 0, 3, data);
     if (packet == NULL) return;
+    if (service->virtual_source != 0) MIDIReceived(service->virtual_source, packets);
     ItemCount destinations = MIDIGetNumberOfDestinations();
     for (ItemCount index = 0; index < destinations; ++index) {
         MIDIEndpointRef destination = MIDIGetDestination(index);
@@ -137,7 +200,7 @@ void score_midi_send(ScoreMidiService *service, uint8_t status, uint8_t data1, u
 }
 
 uint32_t score_midi_source_count(const ScoreMidiService *service) {
-    return service == NULL ? 0 : (uint32_t)MIDIGetNumberOfSources();
+    return service == NULL ? 0 : (uint32_t)score_midi_external_source_count(service);
 }
 
 uint32_t score_midi_destination_count(const ScoreMidiService *service) {
@@ -153,8 +216,8 @@ static size_t score_copy_cfstring(CFStringRef value, char *buffer, size_t capaci
 
 size_t score_midi_source_name(const ScoreMidiService *service, uint32_t index, char *buffer, size_t capacity) {
     (void)service;
-    if (buffer == NULL || capacity == 0 || index >= MIDIGetNumberOfSources()) return 0;
-    MIDIEndpointRef source = MIDIGetSource((ItemCount)index);
+    if (buffer == NULL || capacity == 0 || service == NULL || index >= score_midi_external_source_count(service)) return 0;
+    MIDIEndpointRef source = score_midi_external_source_at(service, (ItemCount)index);
     if (source == 0) return 0;
     CFStringRef name = NULL;
     if (MIDIObjectGetStringProperty(source, kMIDIPropertyDisplayName, &name) != noErr || name == NULL) {
@@ -171,18 +234,19 @@ uint32_t score_midi_selected_source(const ScoreMidiService *service) {
 
 int score_midi_select_source(ScoreMidiService *service, uint32_t index) {
     if (service == NULL || service->input_port == 0) return 0;
-    ItemCount sources = MIDIGetNumberOfSources();
+    ItemCount sources = score_midi_external_source_count(service);
     if (index != SCORE_MIDI_ALL_SOURCES && index >= sources) return 0;
-    for (ItemCount source_index = 0; source_index < sources; ++source_index) {
+    ItemCount all_sources = MIDIGetNumberOfSources();
+    for (ItemCount source_index = 0; source_index < all_sources; ++source_index) {
         MIDIEndpointRef source = MIDIGetSource(source_index);
-        if (source != 0) MIDIPortDisconnectSource(service->input_port, source);
+        if (source != 0 && source != service->virtual_source) MIDIPortDisconnectSource(service->input_port, source);
     }
     memset(service->running_status, 0, sizeof(service->running_status));
     uint32_t write = atomic_load_explicit(&service->write_index, memory_order_acquire);
     atomic_store_explicit(&service->read_index, write, memory_order_release);
     for (ItemCount source_index = 0; source_index < sources; ++source_index) {
         if (index != SCORE_MIDI_ALL_SOURCES && source_index != index) continue;
-        MIDIEndpointRef source = MIDIGetSource(source_index);
+        MIDIEndpointRef source = score_midi_external_source_at(service, source_index);
         if (source != 0 && MIDIPortConnectSource(service->input_port, source, (void *)(uintptr_t)(source_index + 1)) != noErr) return 0;
     }
     service->selected_source = index;

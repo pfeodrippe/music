@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const c = @cImport({
+    @cInclude("music_devices.h");
     @cInclude("sys/socket.h");
     @cInclude("sys/un.h");
     @cInclude("sys/time.h");
@@ -8,11 +9,28 @@ const c = @cImport({
     @cInclude("unistd.h");
 });
 
+fn runBitwigBootstrap() !void {
+    const service = c.score_midi_create_named("Score Bridge Bootstrap") orelse return error.BootstrapSourceCreateFailed;
+    defer c.score_midi_destroy(service);
+
+    std.debug.print("Score Bridge Bootstrap is active; keep this process running while Bitwig uses the OSC bridge.\n", .{});
+    while (true) _ = c.sleep(1);
+}
+
 pub fn main(init: std.process.Init) !void {
     var command_buffer: [4096]u8 = undefined;
     var command_len: usize = 0;
     var arguments = std.process.Args.Iterator.init(init.minimal.args);
     _ = arguments.next();
+    if (arguments.next()) |first| {
+        if (std.mem.eql(u8, first, "bitwig-bootstrap")) {
+            if (arguments.next() != null) return error.UnexpectedBootstrapArgument;
+            return runBitwigBootstrap();
+        }
+        if (first.len > command_buffer.len) return error.CommandTooLong;
+        @memcpy(command_buffer[0..first.len], first);
+        command_len = first.len;
+    }
     while (arguments.next()) |argument| {
         if (command_len != 0) {
             command_buffer[command_len] = ' ';

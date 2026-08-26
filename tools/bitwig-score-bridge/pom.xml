@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>app.score</groupId>
+  <artifactId>bitwig-score-bridge</artifactId>
+  <version>0.1.0</version>
+  <name>Score OSC Bridge + Probe</name>
+
+  <repositories>
+    <repository>
+      <id>bitwig</id>
+      <url>https://maven.bitwig.com/</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.bitwig</groupId>
+      <artifactId>extension-api</artifactId>
+      <version>22</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.clojure</groupId>
+      <artifactId>clojure</artifactId>
+      <version>1.11.1</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>ScoreBridge</finalName>
+    <resources>
+      <resource><directory>src/main/resources</directory></resource>
+      <resource><directory>src/main/clojure</directory></resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration><release>21</release></configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <outputFile>${project.build.directory}/ScoreBridge.bwextension</outputFile>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

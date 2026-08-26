@@ -52,6 +52,16 @@ pub fn build(b: *std.Build) void {
             }),
         });
         dev_controller.root_module.link_libc = true;
+        dev_controller.root_module.addIncludePath(b.path("src/platform/apple"));
+        dev_controller.root_module.addCSourceFile(.{
+            .file = b.path("src/platform/apple/music_devices.c"),
+            .flags = &.{"-std=c11"},
+        });
+        dev_controller.root_module.linkFramework("AudioToolbox", .{});
+        dev_controller.root_module.linkFramework("AudioUnit", .{});
+        dev_controller.root_module.linkFramework("CoreAudio", .{});
+        dev_controller.root_module.linkFramework("CoreFoundation", .{});
+        dev_controller.root_module.linkFramework("CoreMIDI", .{});
         b.installArtifact(dev_controller);
     }
 
