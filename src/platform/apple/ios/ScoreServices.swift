@@ -235,7 +235,7 @@ private func scoreMIDIRead(
                 if offset + byteCount > length { break }
                 let data1 = byteCount > 1 ? raw[offset + 1] : 0
                 let data2 = byteCount > 2 ? raw[offset + 2] : 0
-                DispatchQueue.main.async { service.onMessage?(status, data1, data2) }
+                DispatchQueue.main.async { service.receive(status: status, data1: data1, data2: data2) }
                 offset += byteCount
             }
         }
@@ -269,6 +269,37 @@ final class ScoreMIDIService {
         ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_ACCEPTANCE"] == "1"
     }
 
+    fileprivate func receive(status: UInt8, data1: UInt8, data2: UInt8) {
+        if Self.acceptanceDiagnosticsEnabled {
+            NSLog(
+                "Score iPad MIDI received status=%02X data1=%u data2=%u",
+                status,
+                data1,
+                data2
+            )
+        }
+        onMessage?(status, data1, data2)
+    }
+
+    /// Prefer direct CoreMIDI endpoints (USB IDAM, hardware, Bluetooth) over
+    /// the network session. Sending the same event through both paths makes a
+    /// DAW produce doubled notes when it has both endpoints connected.
+    private func outputDestinations() -> [MIDIEndpointRef] {
+        let networkDestination = MIDINetworkSession.default().destinationEndpoint()
+        var direct: [MIDIEndpointRef] = []
+        var network: [MIDIEndpointRef] = []
+        for index in 0..<MIDIGetNumberOfDestinations() {
+            let destination = MIDIGetDestination(index)
+            guard destination != 0 else { continue }
+            if destination == networkDestination {
+                network.append(destination)
+            } else {
+                direct.append(destination)
+            }
+        }
+        return direct.isEmpty ? network : direct
+    }
+
     deinit {
         if inputPort != 0 { MIDIPortDispose(inputPort) }
         if outputPort != 0 { MIDIPortDispose(outputPort) }
@@ -282,7 +313,7 @@ final class ScoreMIDIService {
         let endpointName = Self.endpointName()
         let clientStatus = MIDIClientCreate("Score \(endpointName)" as CFString, nil, nil, &client)
         let sourceStatus = clientStatus == noErr
-            ? MIDISourceCreate(client, endpointName as CFString, &virtualSource)
+            ? MIDISourceCreateWithProtocol(client, endpointName as CFString, ._1_0, &virtualSource)
             : OSStatus(-1)
         // iPadOS may reject app-created virtual sources with
         // kMIDINotPermitted.  That source is only a convenience for hosts
@@ -334,35 +365,64 @@ final class ScoreMIDIService {
 
     func send(status: UInt8, data1: UInt8, data2: UInt8) {
         guard started else { return }
-        var packetList = MIDIPacketList()
-        let packet = MIDIPacketListInit(&packetList)
-        let bytes = [status, data1, data2]
-        bytes.withUnsafeBufferPointer { buffer in
-            _ = MIDIPacketListAdd(&packetList, MemoryLayout<MIDIPacketList>.size, packet, 0, buffer.count, buffer.baseAddress!)
-        }
-        let receivedStatus = virtualSource == 0 ? OSStatus(-1) : MIDIReceived(virtualSource, &packetList)
+        let timestamp: MIDITimeStamp = 0
+
+        // Keep both representations available. Apple's IDAM endpoint is a
+        // MIDI 1.0 destination and has proven more reliable with its native
+        // MIDIPacketList path, while MIDI 2 endpoints require UMP events.
+        var legacyPacket = MIDIPacket()
+        legacyPacket.timeStamp = timestamp
+        legacyPacket.length = 3
+        legacyPacket.data.0 = status
+        legacyPacket.data.1 = data1
+        legacyPacket.data.2 = data2
+        var packetList = MIDIPacketList(numPackets: 1, packet: legacyPacket)
+
+        var eventList = MIDIEventList()
+        let packet = MIDIEventListInit(&eventList, ._1_0)
+        // MIDI 1.0 channel voice messages use a 32-bit Universal MIDI Packet:
+        // message type 0x2, group 0, followed by the original three bytes.
+        var word = UInt32(0x2) << 28
+            | UInt32(status) << 16
+            | UInt32(data1) << 8
+            | UInt32(data2)
+        _ = MIDIEventListAdd(
+            &eventList,
+            MemoryLayout<MIDIEventList>.size,
+            packet,
+            timestamp,
+            1,
+            &word
+        )
+        let receivedStatus = virtualSource == 0 ? OSStatus(-1) : MIDIReceivedEventList(virtualSource, &eventList)
+        let destinations = outputDestinations()
         if Self.acceptanceDiagnosticsEnabled {
             NSLog(
-                "Score iPad MIDI send status=%02X data1=%u data2=%u virtual=%d destinations=%u",
+                "Score iPad MIDI send status=%02X data1=%u data2=%u virtual=%d targets=%u",
                 status,
                 data1,
                 data2,
                 receivedStatus,
-                MIDIGetNumberOfDestinations()
+                destinations.count
             )
         }
-        for index in 0..<MIDIGetNumberOfDestinations() {
-            let destination = MIDIGetDestination(index)
-            if destination != 0 {
-                let sendStatus = MIDISend(outputPort, destination, &packetList)
-                if Self.acceptanceDiagnosticsEnabled {
-                    NSLog(
-                        "Score iPad MIDI sent destination[%u]=%@ status=%d",
-                        index,
-                        Self.objectName(destination),
-                        sendStatus
-                    )
-                }
+        for (index, destination) in destinations.enumerated() {
+            var protocolID: Int32 = 0
+            let protocolStatus = MIDIObjectGetIntegerProperty(destination, kMIDIPropertyProtocolID, &protocolID)
+            let usesMIDI2 = protocolStatus == noErr && protocolID == MIDIProtocolID._2_0.rawValue
+            let sendStatus = usesMIDI2
+                ? MIDISendEventList(outputPort, destination, &eventList)
+                : MIDISend(outputPort, destination, &packetList)
+            if Self.acceptanceDiagnosticsEnabled {
+                NSLog(
+                    "Score iPad MIDI sent target[%u]=%@ transport=%@ protocol=%d property_status=%d status=%d",
+                    index,
+                    Self.objectName(destination),
+                    usesMIDI2 ? "UMP" : "MIDI1",
+                    protocolID,
+                    protocolStatus,
+                    sendStatus
+                )
             }
         }
     }

@@ -54,7 +54,11 @@ pub const Id = struct {
     pub const controller_octave_down: u32 = 68;
     pub const controller_octave_up: u32 = 69;
     pub const controller_pad_first: u32 = 70;
-    pub const controller_transport_first: u32 = 90;
+    pub const controller_velocity_mode: u32 = 94;
+    pub const controller_velocity_curve: u32 = 95;
+    pub const controller_density_down: u32 = 96;
+    pub const controller_density_up: u32 = 97;
+    pub const controller_transport_first: u32 = 100;
 };
 
 pub const Item = extern struct {
@@ -143,17 +147,37 @@ pub const Snapshot = struct {
     }
 
     fn buildController(self: *Snapshot, state: *const model.UiState) void {
-        const layout = ui.ControllerLayout.calculate(state.viewport_width, state.viewport_height);
+        const layout = ui.ControllerLayout.calculateForState(state);
         self.add(Id.document, .document, .{ .x = 0, .y = 0, .width = state.viewport_width, .height = state.viewport_height }, "Performance controller", 0);
         self.add(Id.controller_score_view, .tab, layout.score_view, "Return to score", 0);
         self.add(Id.controller_protocol, .button, layout.protocol, if (state.controller_protocol == .osc) "Use MIDI output; currently OSC" else "Use OSC output; currently MIDI", Flag.toggle);
         self.add(Id.controller_setup, .button, layout.setup, "Configure controller connection", 0);
         self.add(Id.controller_edit, .button, layout.edit, if (state.controller_editing == 0) "Edit custom pad mappings" else "Finish editing custom pad mappings", Flag.toggle | (if (state.controller_editing != 0) Flag.selected else 0));
+        var velocity_label_buffer: [96]u8 = undefined;
+        const velocity_label = std.fmt.bufPrint(&velocity_label_buffer, "Cycle velocity mode; currently {s}", .{switch (state.controller_velocity_mode) {
+            .fixed => "Fixed",
+            .dynamic => "Dynamic contact impact",
+            .y_position => "Y Position",
+            .pencil_force => "Pencil Force",
+            .diagonal_position => "Diagonal Position",
+        }}) catch "Cycle velocity mode";
+        self.add(Id.controller_velocity_mode, .button, layout.velocity_mode, velocity_label, 0);
+        var response_label_buffer: [96]u8 = undefined;
+        const response_label = if (state.controller_velocity_mode == .fixed)
+            std.fmt.bufPrint(&response_label_buffer, "Cycle fixed velocity; currently {d}", .{state.controller_velocity}) catch "Cycle fixed velocity"
+        else if (state.controller_last_velocity > 0)
+            std.fmt.bufPrint(&response_label_buffer, "Cycle velocity response curve; last emitted velocity {d}", .{state.controller_last_velocity}) catch "Cycle velocity response curve"
+        else
+            "Cycle velocity response curve";
+        self.add(Id.controller_velocity_curve, .button, layout.velocity_curve, response_label, 0);
         const bank_labels = [_][]const u8{ "Musical pads", "Clip launcher", "Mapped actions", "Custom user mappings" };
         for (layout.banks, 0..) |button, index| self.add(Id.controller_bank_first + @as(u32, @intCast(index)), .tab, button, bank_labels[index], if (index == @intFromEnum(state.controller_bank)) Flag.selected else 0);
         self.add(Id.controller_octave_down, .button, layout.octave_down, "Move pads down one octave", 0);
         self.add(Id.controller_octave_up, .button, layout.octave_up, "Move pads up one octave", 0);
+        self.add(Id.controller_density_down, .button, layout.density_down, "Show fewer, larger controls", 0);
+        self.add(Id.controller_density_up, .button, layout.density_up, "Show more, smaller controls", 0);
         for (layout.pads, 0..) |pad, index| {
+            if (pad.width <= 0 or pad.height <= 0) continue;
             var label_buffer: [48]u8 = undefined;
             const label = switch (state.controller_bank) {
                 .pads => blk: {
@@ -164,7 +188,8 @@ pub const Snapshot = struct {
                 .actions => std.fmt.bufPrint(&label_buffer, "Trigger mapped action {d}", .{index + 1}) catch "Trigger action",
                 .user => blk: {
                     const assignment = state.controller_assignments[index];
-                    if (state.controller_editing != 0) break :blk std.fmt.bufPrint(&label_buffer, "Select custom pad {d} for editing", .{index + 1}) catch "Select custom pad";
+                    if (state.controller_editing != 0) break :blk std.fmt.bufPrint(&label_buffer, "Select custom control {d} for editing", .{index + 1}) catch "Select custom control";
+                    if (assignment.control == .label) break :blk "Controller label or spacer";
                     break :blk switch (assignment.kind) {
                         .note => std.fmt.bufPrint(&label_buffer, "Play custom MIDI note {d} on channel {d}", .{ assignment.value, assignment.channel + 1 }) catch "Play custom note",
                         .drum => std.fmt.bufPrint(&label_buffer, "Play custom drum note {d} on channel {d}", .{ assignment.value, assignment.channel + 1 }) catch "Play custom drum",
@@ -182,7 +207,11 @@ pub const Snapshot = struct {
         const transport_labels = [_][]const u8{ "Stop", "Play", "Record", "Loop", "Metronome", "Undo", "Redo", "Save project" };
         for (layout.transport, 0..) |button, index| {
             if (state.controller_editing != 0 and state.controller_bank == .user) {
-                const edit_labels = [_][]const u8{ "Previous message type", "Next message type", "Decrease message number", "Increase message number", "Decrease MIDI channel or clip track", "Increase MIDI channel or clip track", "Toggle momentary or latch behavior", "Cycle pad color" };
+                const edit_labels = switch (state.controller_inspector_page % 3) {
+                    0 => [_][]const u8{ "Previous control shape", "Next control shape", "Decrease control width", "Increase control width", "Decrease control height", "Increase control height", "Open routing inspector", "Reset control layout" },
+                    1 => [_][]const u8{ "Previous message type", "Next message type", "Decrease message number", "Increase message number", "Decrease MIDI channel or clip track", "Increase MIDI channel or clip track", "Open style inspector", "Increase secondary XY controller number" },
+                    else => [_][]const u8{ "Toggle momentary or latch behavior", "Cycle control color", "Decrease secondary XY controller number", "Increase secondary XY controller number", "Decrease starting value", "Increase starting value", "Return to routing inspector", "Return to layout inspector" },
+                };
                 self.add(Id.controller_transport_first + @as(u32, @intCast(index)), .button, button, edit_labels[index], 0);
                 continue;
             }

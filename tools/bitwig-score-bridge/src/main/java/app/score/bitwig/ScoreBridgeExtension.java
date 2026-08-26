@@ -27,6 +27,7 @@ import clojure.lang.IFn;
 import com.bitwig.extension.controller.ControllerExtension;
 import com.bitwig.extension.controller.api.Application;
 import com.bitwig.extension.controller.api.ControllerHost;
+import com.bitwig.extension.controller.api.CursorTrack;
 import com.bitwig.extension.controller.api.MidiIn;
 import com.bitwig.extension.controller.api.NoteInput;
 import com.bitwig.extension.controller.api.Transport;
@@ -45,6 +46,7 @@ public final class ScoreBridgeExtension extends ControllerExtension {
    private IFn decode;
    private IFn describe;
    private ControllerHost host;
+   private CursorTrack targetTrack;
    private Transport transport;
    private Application application;
    private BufferedWriter probeLog;
@@ -62,6 +64,7 @@ public final class ScoreBridgeExtension extends ControllerExtension {
       host = getHost();
       transport = host.createTransport();
       application = host.createApplication();
+      targetTrack = host.createCursorTrack("score-osc-target", "Score OSC Target", 0, 0, true);
 
       // Bitwig runs each controller extension in its own class loader, while
       // Clojure resolves clojure/core.clj through the thread context loader.
@@ -84,11 +87,15 @@ public final class ScoreBridgeExtension extends ControllerExtension {
       for (int slot = 0; slot < noteInputs.length; ++slot) {
          noteInputs[slot] = midiIn.createNoteInput("Score OSC " + (slot + 1), "000000");
          noteInputs[slot].includeInAllInputs().set(true);
+         // A NoteInput by itself is only offered in Bitwig's input chooser.
+         // Route each isolated controller slot to the selected track directly,
+         // independent of the track's monitoring and input-filter settings.
+         targetTrack.addNoteSource(noteInputs[slot]);
       }
 
       openProbeLog();
       startOscServer();
-      log("READY port=" + OSC_PORT + " slots=" + CONTROLLER_SLOTS);
+      log("READY port=" + OSC_PORT + " slots=" + CONTROLLER_SLOTS + " route=selected-track");
       host.showPopupNotification("Score OSC Bridge listening on UDP " + OSC_PORT);
    }
 

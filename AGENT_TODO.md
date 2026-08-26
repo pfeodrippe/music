@@ -8,10 +8,34 @@ applications. Browser work is explicitly deferred and does not block this
 goal. Platform code remains limited to window, GPU-surface, audio-device,
 MIDI/microphone, storage, and document-panel seams.
 
+## Physical iPad wired MIDI controller (2026-08-26)
+
+- [x] Make MIDI—not OSC—the shared Zig default and the fresh-install iPad
+  default. The GPU controller reports `MIDI / USB`; its setup action explains
+  IDAM rather than requesting an OSC host while MIDI is selected.
+- [x] Repair the physical iPad CoreMIDI host. The app now has the audio
+  background capability required for virtual MIDI endpoints, emits native
+  MIDI 1 packet lists to IDAM, retains UMP delivery for MIDI 2 endpoints, and
+  logs received messages in opt-in physical acceptance runs.
+- [x] Configure and verify Lightning/USB IDAM bidirectionally. Audio MIDI Setup
+  exposes `iPad` after **Enable**; a Mac sender reached the physical iPad and a
+  modern host receiver captured the complete eight-note drum pattern plus all
+  eight note-offs from the physical app.
+- [x] Prevent duplicate notes when both wired and Network MIDI exist. Direct
+  CoreMIDI destinations take priority; the network session is used only when
+  no direct destination is available. The final physical run reported only
+  `Hôte IDAM MIDI` with `targets=1` and every send returned status 0.
+- [x] Reconnect Bitwig after the IDAM endpoint was recreated: rescan Controllers,
+  retain Generic iPad input `iPad`, set the Acoustic Drums track input to
+  `iPad - All Channels`, explicitly arm it, and retain the 128-sample / 2.90 ms
+  audio buffer. A fresh launcher clip recorded the physical acceptance pattern
+  and Bitwig reported `NOTES (8)`. The shared suite passes 294/294 and the
+  signed build is installed on the connected physical iPad.
+
 ## Independent performance controller (2026-08-25)
 
 - [x] Add a responsive full-window GPU controller view to the shared Zig/Flecs
-  core, not a UIKit/AppKit screen: 16 square multitouch pads, eight square
+  core, not a UIKit/AppKit screen: up to 24 density-selectable controls, eight square
   transport/action controls, Pads/Clips/Actions banks, octave controls, OSC/MIDI
   selection, connection status, score return, and complete semantic
   accessibility on macOS and iPadOS.
@@ -24,15 +48,20 @@ MIDI/microphone, storage, and document-panel seams.
   source, iPadOS enables Network MIDI, and direct OSC targets DrivenByMoss's
   documented Bitwig endpoint. The DAW's selected track determines whether the
   pads play drums, piano, guitar, synths, or another device.
-- [x] Preserve real expression where hardware supplies it: Apple Pencil force
-  maps to a curved note velocity and streams per-note aftertouch; finger taps
-  use an explicit fixed velocity because iPad capacitive fingers do not provide
-  trustworthy pressure. Multitouch note-on/off and cancel paths are regression
+- [x] Offer Fixed, Dynamic contact-impact, Y-position, bottom-left-to-top-right
+  Diagonal Position, and Pencil Force sensitivity with Soft/Balanced/Hard
+  curves. Pencil Force defers note-on until
+  the first refined high-rate force update, then streams per-note aftertouch;
+  Dynamic uses approximate contact radius without claiming physical pressure.
+  Show the most recently emitted `VEL 1..127` in the GPU header so physical
+  Pencil calibration can be confirmed directly.
+  Multitouch note-on/off and cancel paths are regression
   tested so stuck notes cannot survive a view, bank, or protocol change.
 - [x] Add a persistent `USER` bank with an explicit GPU `EDIT`/`DONE` workflow:
-  tap a pad to select it, then set Note/Drum/CC/Clip/Action, message number,
-  MIDI channel or clip track, momentary/toggle behavior, and color. Edit-mode
-  pad selection emits no output. The versioned 144-byte preference blob stays
+  tap a control to select it, choose pad/button/toggle/fader/encoder/XY/label,
+  resize it up to 2x2, then set Note/Drum/CC/Clip/Action routing, message number,
+  MIDI channel or clip track, behavior, starting value, and color. Edit-mode
+  selection emits no output. The versioned preference blob stays
   independent of score documents and round-trips through native app support
   storage and iPad application preferences.
 - [x] Reproduce and fix the native Edit crash from the user report. The color
@@ -41,7 +70,7 @@ MIDI/microphone, storage, and document-panel seams.
   rebuild, exact Controller → Edit UI pass, mapping mutation, quit/relaunch,
   and persistence pass cover the failure.
 - [x] Add `score-devctl controller ...` commands for state/open/score,
-  protocol, bank, edit mode, octave, pad taps, and transport. The full Zig suite, native
+  protocol, bank, sensitivity, curve, density, edit mode, octave, pad taps, and transport. The full Zig suite, native
   build, signed macOS bundle, iOS Simulator bundle, live Debug command path,
   accessibility tree, and native visual pass succeed.
 - [x] Isolate simultaneous controller instances end to end. CoreMIDI sources

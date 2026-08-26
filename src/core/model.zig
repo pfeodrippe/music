@@ -211,6 +211,38 @@ pub const ControllerBehavior = enum(u8) {
     toggle,
 };
 
+/// Visual/gesture role of a programmable controller cell. Message routing is
+/// intentionally separate (`ControllerAssignmentKind`) so the same CC can be
+/// presented as a fader, encoder, or XY axis without platform-specific UI.
+pub const ControllerControlKind = enum(u8) {
+    pad,
+    button,
+    toggle,
+    fader_vertical,
+    fader_horizontal,
+    encoder,
+    xy,
+    label,
+};
+
+pub const ControllerVelocityMode = enum(u8) {
+    fixed,
+    dynamic,
+    y_position,
+    pencil_force,
+    /// Positional velocity projected from the pad's bottom-left corner to its
+    /// top-right corner. Appended to preserve serialized enum values.
+    diagonal_position,
+};
+
+pub const ControllerVelocityCurve = enum(u8) {
+    soft,
+    balanced,
+    hard,
+};
+
+pub const max_controller_controls: usize = 24;
+
 /// Compact, platform-independent description of one programmable controller
 /// pad. `value` is a note/CC/action number or clip scene; `channel` is a MIDI
 /// channel or clip track. Keeping this data in the Flecs UI component lets the
@@ -221,14 +253,20 @@ pub const ControllerAssignment = extern struct {
     channel: u8 = 0,
     value: u8 = 36,
     color: u8 = 0,
+    control: ControllerControlKind = .pad,
+    width_units: u8 = 1,
+    height_units: u8 = 1,
+    /// Second CC number for an XY cell. Other control kinds preserve this so
+    /// changing visual type is reversible.
+    secondary_value: u8 = 74,
     reserved: [3]u8 = [_]u8{0} ** 3,
 };
 
-pub fn defaultControllerAssignments() [16]ControllerAssignment {
-    var assignments = [_]ControllerAssignment{.{}} ** 16;
+pub fn defaultControllerAssignments() [max_controller_controls]ControllerAssignment {
+    var assignments = [_]ControllerAssignment{.{}} ** max_controller_controls;
     for (&assignments, 0..) |*assignment, index| {
         assignment.value = @intCast(36 + index);
-        assignment.color = @intCast(index / 4);
+        assignment.color = @intCast((index / 4) % 4);
     }
     return assignments;
 }
@@ -756,11 +794,26 @@ pub const UiState = extern struct {
     /// Flecs UI component so the GPU view and all hot-reloaded systems keep the
     /// same controller state across platform hosts.
     app_view: AppView = .score,
-    controller_protocol: ControllerProtocol = .osc,
+    /// Direct MIDI is the controller's primary transport. OSC remains an
+    /// explicit alternative for hosts which need address-based control.
+    controller_protocol: ControllerProtocol = .midi,
     controller_bank: ControllerBank = .pads,
     controller_octave: i32 = 3,
     controller_channel: u32 = 0,
     controller_velocity: u32 = 104,
+    controller_velocity_mode: ControllerVelocityMode = .dynamic,
+    controller_velocity_curve: ControllerVelocityCurve = .balanced,
+    controller_velocity_min: u8 = 15,
+    controller_velocity_max: u8 = 127,
+    /// Most recent emitted note velocity. This transient readout makes Pencil
+    /// force and touch-response calibration visible without changing the
+    /// persisted controller mapping format.
+    controller_last_velocity: u8 = 0,
+    /// 0/1/2 correspond to 4x4, 5x5, and 6x6 grid density. Increasing
+    /// density reveals additional controls instead of magnifying the surface.
+    controller_density: u8 = 0,
+    controller_inspector_page: u8 = 0,
+    controller_reserved: [1]u8 = [_]u8{0} ** 1,
     controller_pressed_pads: u32 = 0,
     controller_pressed_transport: u32 = 0,
     controller_status: u32 = 0,
@@ -774,7 +827,9 @@ pub const UiState = extern struct {
     controller_selected_pad: u32 = 0,
     controller_toggled_pads: u32 = 0,
     controller_mapping_revision: u32 = 1,
-    controller_assignments: [16]ControllerAssignment = defaultControllerAssignments(),
+    controller_values: [max_controller_controls]u8 = [_]u8{64} ** max_controller_controls,
+    controller_secondary_values: [max_controller_controls]u8 = [_]u8{64} ** max_controller_controls,
+    controller_assignments: [max_controller_controls]ControllerAssignment = defaultControllerAssignments(),
 
     pub fn setSelectedPartLabel(self: *UiState, value: []const u8) void {
         self.selected_part_label_len = @intCast(@min(value.len, self.selected_part_label.len));
@@ -975,7 +1030,7 @@ test "portable score components have deterministic layouts" {
     try std.testing.expectEqual(@as(usize, 68), @sizeOf(Harmony));
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Transport));
     try std.testing.expectEqual(@as(usize, 4112), @sizeOf(PlaybackBounds));
-    try std.testing.expectEqual(@as(usize, 516), @sizeOf(UiState));
+    try std.testing.expectEqual(@as(usize, 732), @sizeOf(UiState));
     try std.testing.expectEqual(@as(usize, 52), @sizeOf(PracticeState));
     try std.testing.expectEqual(@as(usize, 20), @sizeOf(Measure));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(ScorePart));

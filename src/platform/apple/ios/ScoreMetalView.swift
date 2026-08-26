@@ -333,22 +333,37 @@ final class ScoreMetalView: UIView {
         }
     }
 
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 1) }
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 0) }
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 2) }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 3) }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        forward(touches, kind: 1, event: event)
+        // Pencil Force mode defers note-on until this first high-rate force
+        // refresh. Six milliseconds is short enough for performance while
+        // avoiding the coarse/estimated force commonly present in began.
+        for touch in touches where touch.type == .pencil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.006) { [weak self, weak touch] in
+                guard let self, let touch, touch.phase == .stationary || touch.phase == .moved else { return }
+                self.forward([touch], kind: 0, event: nil)
+            }
+        }
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 0, event: event) }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 2, event: event) }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { forward(touches, kind: 3, event: event) }
+    override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) { forward(touches, kind: 0, event: nil) }
 
-    private func forward(_ touches: Set<UITouch>, kind: UInt32) {
+    private func forward(_ touches: Set<UITouch>, kind: UInt32, event: UIEvent?) {
         for touch in touches {
-            let point = touch.location(in: self)
-            let pointerType: UInt32 = touch.type == .pencil ? 1 : (touch.type == .indirectPointer ? 0 : 2)
-            // Apple Pencil exposes real force. Ordinary iPad finger touches do
-            // not, so send zero and let the shared core use its explicit fixed
-            // velocity instead of pretending contact area is pressure.
-            let pressure = touch.type == .pencil && touch.maximumPossibleForce > 0 && kind != 2 && kind != 3
-                ? touch.force / touch.maximumPossibleForce
-                : 0
-            score_ios_pointer(kind, pointerType, UInt32(truncatingIfNeeded: ObjectIdentifier(touch).hashValue), Float(point.x), Float(point.y), kind == 2 ? 0 : 1, Float(pressure), 0, 0)
+            let samples = event?.coalescedTouches(for: touch) ?? [touch]
+            for sample in samples {
+                let point = sample.location(in: self)
+                let pointerType: UInt32 = sample.type == .pencil ? 1 : (sample.type == .indirectPointer ? 0 : 2)
+                // Pencil has genuine force. Finger Dynamic mode separately
+                // receives majorRadius, explicitly an approximate contact area.
+                let pressure = sample.type == .pencil && sample.maximumPossibleForce > 0 && kind != 2 && kind != 3
+                    ? sample.force / sample.maximumPossibleForce
+                    : 0
+                let contactRadius = sample.type == .direct && kind != 2 && kind != 3 ? sample.majorRadius : 0
+                score_ios_pointer(kind, pointerType, UInt32(truncatingIfNeeded: ObjectIdentifier(touch).hashValue), Float(point.x), Float(point.y), kind == 2 ? 0 : 1, Float(pressure), Float(contactRadius), 0, 0)
+            }
         }
         // Controller gestures must not wait for the next 60 Hz render tick.
         // Draining here removes up to one full frame of tap-to-MIDI latency;
@@ -359,7 +374,7 @@ final class ScoreMetalView: UIView {
 
     @objc private func hovered(_ recognizer: UIHoverGestureRecognizer) {
         let point = recognizer.location(in: self)
-        score_ios_pointer(0, 0, 0, Float(point.x), Float(point.y), 0, 0, 0, 0)
+        score_ios_pointer(0, 0, 0, Float(point.x), Float(point.y), 0, 0, 0, 0, 0)
     }
 }
 

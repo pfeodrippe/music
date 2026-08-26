@@ -2238,7 +2238,7 @@ fn loadControllerPreferences(app: *score.App, allocator: std.mem.Allocator) void
 }
 
 fn saveControllerPreferences(app: *const score.App) !void {
-    var bytes: [256]u8 = undefined;
+    var bytes: [1024]u8 = undefined;
     const len = try app.serializeControllerPreferences(&bytes);
     var temporary_buffer: [4096]u8 = undefined;
     var destination_buffer: [4096]u8 = undefined;
@@ -2390,6 +2390,7 @@ fn pointerEvent(kind: score.platform.PointerKind, x: f64, y: f64, buttons: u32, 
         .x = @floatCast(x),
         .y = @floatCast(y),
         .pressure = if (buttons == 0) 0 else 1,
+        .contact_radius = 0,
         .tilt_x = 0,
         .tilt_y = 0,
         .scroll_x = @floatCast(scroll_x),

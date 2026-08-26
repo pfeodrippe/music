@@ -13,6 +13,12 @@ never wrapped or shared. Every received message is also flushed to:
 
 `~/Library/Application Support/Score/bitwig-score-bridge.log`
 
+Each isolated note input is routed directly to Bitwig's currently selected
+track through the controller API. This route intentionally does not depend on
+the track's input chooser or monitoring mode: select the instrument track, then
+play the iPad. The input chooser can continue to show a different hardware MIDI
+source without blocking Score's OSC notes.
+
 Build and install:
 
 ```sh

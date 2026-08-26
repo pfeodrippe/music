@@ -43,20 +43,27 @@ This document started as the architecture plan and now also records the working 
   diagnostics; `zig build dev-ios` launches the simulator and mirrors edits.
 - A signed macOS `.app` using Dawn/Metal, CoreAudio/AudioUnit, CoreMIDI, AudioQueue microphone capture, native import/export panels, app-support autosave, and WAV take replay.
 - A separate shared-Zig/Flecs performance-controller workspace rendered by the
-  same GPU packet pipeline: responsive 4×4 multitouch note/clip/action pads,
-  eight transport squares, octave/bank/protocol controls, a persistent custom
-  User bank, and an explicit GPU editor for message kind/value/channel,
-  momentary/toggle behavior, and color. Editing selects mappings without
+  same GPU packet pipeline: a density-selectable 4×4/5×5/6×6 surface with up
+  to 24 multitouch controls, eight transport squares, octave/bank/protocol
+  controls, a persistent custom User bank, and an explicit GPU editor. A cell
+  can be a resizable pad, button, toggle, vertical/horizontal fader, encoder,
+  XY surface, or label while routing Note/Drum/CC/Clip/Action messages. Editing selects mappings without
   emitting controller output; the compact versioned mapping blob remains
   separate from score documents. The workspace has semantic
   accessibility, Debug live-control commands, and a bounded core output queue.
   The core encodes complete OSC 1.0 datagrams or MIDI 1.0 channel messages;
-  platform facades only deliver them. macOS and iPadOS publish a `Score
-  Controller` virtual CoreMIDI source; iPadOS additionally enables Network
-  MIDI. Direct UDP OSC implements current DrivenByMoss note, poly-aftertouch,
-  clip-launch, action, and transport paths. Apple Pencil force drives the
-  velocity response and per-note aftertouch, while non-pressure finger input
-  truthfully uses a configured fixed velocity.
+  platform facades only deliver them, and MIDI is the fresh-install default.
+  macOS and iPadOS publish a `Score Controller` virtual CoreMIDI source. On
+  physical iPad, a direct USB IDAM endpoint takes priority and Network MIDI is
+  used only when no direct destination exists, preventing doubled DAW notes.
+  Direct UDP OSC implements current DrivenByMoss note, poly-aftertouch,
+  clip-launch, action, and transport paths. Fixed, Dynamic contact-impact,
+  Y-position, Pencil Force, and bottom-left-to-top-right Diagonal Position
+  velocity modes share calibrated
+  Soft/Balanced/Hard curves. Pencil note-on waits for the first refined force
+  update before emitting its velocity layer and subsequent force becomes
+  per-note aftertouch; ordinary fingers never masquerade as pressure. The GPU
+  header exposes the most recently emitted MIDI velocity for device calibration.
 - Multi-controller identity is a platform-facade concern, not shared UI state.
   Each Apple CoreMIDI source has a device-qualified endpoint name and native
   name collisions receive deterministic suffixes. The development Bitwig

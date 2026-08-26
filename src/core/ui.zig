@@ -196,59 +196,113 @@ pub const ControllerLayout = struct {
     score_view: Rect,
     protocol: Rect,
     edit: Rect,
+    velocity_mode: Rect,
+    velocity_curve: Rect,
     setup: Rect,
     banks: [4]Rect,
     octave_down: Rect,
     octave_up: Rect,
-    pads: [16]Rect,
+    density_down: Rect,
+    density_up: Rect,
+    pads: [model.max_controller_controls]Rect,
     transport: [8]Rect,
 
     pub fn calculate(width: f32, height: f32) ControllerLayout {
+        return calculateInternal(width, height, null);
+    }
+
+    pub fn calculateForState(state: *const model.UiState) ControllerLayout {
+        return calculateInternal(state.viewport_width, state.viewport_height, state);
+    }
+
+    fn calculateInternal(width: f32, height: f32, state: ?*const model.UiState) ControllerLayout {
         const header_height: f32 = 72;
         const margin: f32 = if (width < 700) 12 else 24;
         const gap: f32 = if (width < 700) 7 else 12;
         const controls_y: f32 = header_height + 16;
         const controls_height: f32 = 44;
         const grid_top = controls_y + controls_height + 22;
-        const available_width = width - margin * 2 - gap * 5;
-        const available_height = height - grid_top - margin - gap * 3;
-        const unit = @max(@as(f32, 38), @min(@as(f32, 158), @min(available_width / 6, available_height / 4)));
-        const total_width = unit * 6 + gap * 5;
-        const total_height = unit * 4 + gap * 3;
+        const density: usize = if (state) |value| @intCast(@min(value.controller_density, 2)) else 0;
+        const dimension: usize = 4 + density;
+        const total_columns = dimension + 2;
+        const available_width = width - margin * 2 - gap * @as(f32, @floatFromInt(total_columns - 1));
+        const available_height = height - grid_top - margin - gap * @as(f32, @floatFromInt(dimension - 1));
+        const unit = @max(@as(f32, 30), @min(@as(f32, 158), @min(available_width / @as(f32, @floatFromInt(total_columns)), available_height / @as(f32, @floatFromInt(dimension)))));
+        const total_width = unit * @as(f32, @floatFromInt(total_columns)) + gap * @as(f32, @floatFromInt(total_columns - 1));
+        const total_height = unit * @as(f32, @floatFromInt(dimension)) + gap * @as(f32, @floatFromInt(dimension - 1));
         const grid_x = (width - total_width) * 0.5;
         const grid_y = grid_top + @max(@as(f32, 0), (height - grid_top - margin - total_height) * 0.5);
-        var pads: [16]Rect = undefined;
+        const empty = Rect{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        var pads = [_]Rect{empty} ** model.max_controller_controls;
         var transport: [8]Rect = undefined;
-        for (0..4) |visual_row| {
-            for (0..4) |column| {
-                const pad_index = (3 - visual_row) * 4 + column;
-                pads[pad_index] = .{
-                    .x = grid_x + @as(f32, @floatFromInt(column)) * (unit + gap),
-                    .y = grid_y + @as(f32, @floatFromInt(visual_row)) * (unit + gap),
-                    .width = unit,
-                    .height = unit,
-                };
+        var occupied = [_]bool{false} ** 36;
+        for (pads, 0..) |_, index| {
+            var width_units: usize = 1;
+            var height_units: usize = 1;
+            if (state) |value| if (value.controller_bank == .user) {
+                width_units = @intCast(std.math.clamp(value.controller_assignments[index].width_units, 1, 2));
+                height_units = @intCast(std.math.clamp(value.controller_assignments[index].height_units, 1, 2));
+            };
+            var placement: ?struct { column: usize, row: usize } = null;
+            var row: usize = 0;
+            while (row + height_units <= dimension and placement == null) : (row += 1) {
+                var column: usize = 0;
+                while (column + width_units <= dimension) : (column += 1) {
+                    var available = true;
+                    for (0..height_units) |dy| {
+                        for (0..width_units) |dx| {
+                            if (occupied[(row + dy) * dimension + column + dx]) available = false;
+                        }
+                    }
+                    if (available) {
+                        placement = .{ .column = column, .row = row };
+                        break;
+                    }
+                }
             }
+            const cell = placement orelse continue;
+            for (0..height_units) |dy| {
+                for (0..width_units) |dx| occupied[(cell.row + dy) * dimension + cell.column + dx] = true;
+            }
+            const visual_row = dimension - cell.row - height_units;
+            pads[index] = .{
+                .x = grid_x + @as(f32, @floatFromInt(cell.column)) * (unit + gap),
+                .y = grid_y + @as(f32, @floatFromInt(visual_row)) * (unit + gap),
+                .width = unit * @as(f32, @floatFromInt(width_units)) + gap * @as(f32, @floatFromInt(width_units - 1)),
+                .height = unit * @as(f32, @floatFromInt(height_units)) + gap * @as(f32, @floatFromInt(height_units - 1)),
+            };
+        }
+        const transport_y = grid_y + @max(@as(f32, 0), (total_height - (unit * 4 + gap * 3)) * 0.5);
+        for (0..4) |visual_row| {
             for (0..2) |column| {
                 const index = visual_row * 2 + column;
                 transport[index] = .{
-                    .x = grid_x + @as(f32, @floatFromInt(column + 4)) * (unit + gap),
-                    .y = grid_y + @as(f32, @floatFromInt(visual_row)) * (unit + gap),
+                    .x = grid_x + @as(f32, @floatFromInt(column + dimension)) * (unit + gap),
+                    .y = transport_y + @as(f32, @floatFromInt(visual_row)) * (unit + gap),
                     .width = unit,
                     .height = unit,
                 };
             }
         }
         const compact = width < 760;
+        const narrow_controls = width < 900;
+        const side_button_width: f32 = if (narrow_controls) 40 else 58;
+        const side_button_step: f32 = if (narrow_controls) 46 else 66;
         const bank_width: f32 = if (compact) 60 else 82;
         const bank_start = width * 0.5 - (bank_width * 4 + gap * 3) * 0.5;
         const header_button_width: f32 = if (compact) 72 else 92;
         const protocol_x = width - margin - header_button_width;
+        const edit_x = protocol_x - gap - header_button_width;
+        const mode_width: f32 = if (compact) 92 else 116;
+        const curve_width: f32 = if (compact) 76 else 94;
+        const mode_x = edit_x - gap - mode_width;
         return .{
             .header = .{ .x = 0, .y = 0, .width = width, .height = header_height },
             .score_view = .{ .x = margin, .y = 15, .width = if (compact) 92 else 118, .height = 42 },
             .protocol = .{ .x = protocol_x, .y = 15, .width = header_button_width, .height = 42 },
-            .edit = .{ .x = protocol_x - gap - header_button_width, .y = 15, .width = header_button_width, .height = 42 },
+            .edit = .{ .x = edit_x, .y = 15, .width = header_button_width, .height = 42 },
+            .velocity_mode = .{ .x = mode_x, .y = 15, .width = mode_width, .height = 42 },
+            .velocity_curve = .{ .x = mode_x - gap - curve_width, .y = 15, .width = curve_width, .height = 42 },
             .setup = .{ .x = width - margin - (if (compact) @as(f32, 72) else 92), .y = controls_y, .width = if (compact) 72 else 92, .height = controls_height },
             .banks = .{
                 .{ .x = bank_start, .y = controls_y, .width = bank_width, .height = controls_height },
@@ -256,8 +310,10 @@ pub const ControllerLayout = struct {
                 .{ .x = bank_start + (bank_width + gap) * 2, .y = controls_y, .width = bank_width, .height = controls_height },
                 .{ .x = bank_start + (bank_width + gap) * 3, .y = controls_y, .width = bank_width, .height = controls_height },
             },
-            .octave_down = .{ .x = margin, .y = controls_y, .width = if (compact) 48 else 58, .height = controls_height },
-            .octave_up = .{ .x = margin + (if (compact) @as(f32, 54) else 66), .y = controls_y, .width = if (compact) 48 else 58, .height = controls_height },
+            .octave_down = .{ .x = margin, .y = controls_y, .width = side_button_width, .height = controls_height },
+            .octave_up = .{ .x = margin + side_button_step, .y = controls_y, .width = side_button_width, .height = controls_height },
+            .density_down = .{ .x = margin + side_button_step * 2, .y = controls_y, .width = side_button_width, .height = controls_height },
+            .density_up = .{ .x = margin + side_button_step * 3, .y = controls_y, .width = side_button_width, .height = controls_height },
             .pads = pads,
             .transport = transport,
         };
@@ -1471,7 +1527,7 @@ pub fn draw(
 }
 
 fn drawController(packet: *render.Packet, state: *const model.UiState, time_seconds: f32) void {
-    const layout = ControllerLayout.calculate(state.viewport_width, state.viewport_height);
+    const layout = ControllerLayout.calculateForState(state);
     packet.rect(0, 0, state.viewport_width, state.viewport_height, palette.background);
     packet.rect(0, 0, state.viewport_width, layout.header.height, palette.panel);
     packet.rect(0, layout.header.height - 1, state.viewport_width, 1, palette.border);
@@ -1479,7 +1535,7 @@ fn drawController(packet: *render.Packet, state: *const model.UiState, time_seco
     const score_hovered = layout.score_view.contains(state.pointer_x, state.pointer_y);
     packet.rounded(layout.score_view.x, layout.score_view.y, layout.score_view.width, layout.score_view.height, 12, if (score_hovered) palette.cyan_dim else palette.panel_raised);
     packet.text(layout.score_view.x + 16, layout.score_view.y + 16, "SCORE", 1.35, if (score_hovered) palette.cyan else palette.text);
-    if (state.viewport_width >= 620) {
+    if (state.viewport_width >= 1080) {
         packet.text(layout.score_view.x + layout.score_view.width + 22, 19, "PERFORMANCE CONTROLLER", 2.15, palette.text);
         packet.text(layout.score_view.x + layout.score_view.width + 24, 45, if (state.controller_editing != 0) "CUSTOM PAD EDITOR / TAP A PAD, THEN SET ITS MESSAGE" else "MULTITOUCH / PENCIL PRESSURE / OSC / MIDI", 0.72, if (state.controller_editing != 0) palette.amber else palette.muted);
     }
@@ -1494,6 +1550,37 @@ fn drawController(packet: *render.Packet, state: *const model.UiState, time_seco
     packet.rounded(layout.edit.x, layout.edit.y, layout.edit.width, layout.edit.height, 12, if (editing) mixColor(palette.panel, palette.amber, 0.24) else if (edit_hovered) palette.panel_raised else palette.panel);
     packet.text(layout.edit.x + 15, layout.edit.y + 15, if (editing) "DONE" else "EDIT", 1.18, if (editing or edit_hovered) palette.amber else palette.text);
 
+    const mode_hovered = layout.velocity_mode.contains(state.pointer_x, state.pointer_y);
+    const mode_label: []const u8 = switch (state.controller_velocity_mode) {
+        .fixed => "FIXED",
+        .dynamic => "DYNAMIC",
+        .y_position => "Y POSITION",
+        .pencil_force => "PENCIL",
+        .diagonal_position => "DIAGONAL",
+    };
+    packet.rounded(layout.velocity_mode.x, layout.velocity_mode.y, layout.velocity_mode.width, layout.velocity_mode.height, 12, if (mode_hovered) palette.cyan_dim else palette.panel_raised);
+    const mode_scale = std.math.clamp((layout.velocity_mode.width - 18) / @max(1, render.Packet.textWidth(mode_label, 1)), 0.68, 1.05);
+    packet.text(layout.velocity_mode.x + (layout.velocity_mode.width - render.Packet.textWidth(mode_label, mode_scale)) * 0.5, layout.velocity_mode.y + 15, mode_label, mode_scale, if (mode_hovered) palette.cyan else palette.text);
+
+    const curve_hovered = layout.velocity_curve.contains(state.pointer_x, state.pointer_y);
+    var curve_buffer: [24]u8 = undefined;
+    const curve_label: []const u8 = if (state.controller_velocity_mode == .fixed)
+        std.fmt.bufPrint(&curve_buffer, "VEL {d}", .{state.controller_velocity}) catch "VELOCITY"
+    else if (state.controller_last_velocity > 0)
+        std.fmt.bufPrint(&curve_buffer, "{s} / VEL {d}", .{ switch (state.controller_velocity_curve) {
+            .soft => "SOFT",
+            .balanced => "BALANCED",
+            .hard => "HARD",
+        }, state.controller_last_velocity }) catch "VELOCITY"
+    else switch (state.controller_velocity_curve) {
+        .soft => "SOFT",
+        .balanced => "BALANCED",
+        .hard => "HARD",
+    };
+    packet.rounded(layout.velocity_curve.x, layout.velocity_curve.y, layout.velocity_curve.width, layout.velocity_curve.height, 12, if (curve_hovered) mixColor(palette.panel_raised, palette.amber, 0.22) else palette.panel_raised);
+    const curve_scale = std.math.clamp((layout.velocity_curve.width - 16) / @max(1, render.Packet.textWidth(curve_label, 1)), 0.62, 0.96);
+    packet.text(layout.velocity_curve.x + (layout.velocity_curve.width - render.Packet.textWidth(curve_label, curve_scale)) * 0.5, layout.velocity_curve.y + 16, curve_label, curve_scale, if (curve_hovered) palette.amber else palette.muted);
+
     for (layout.banks, 0..) |button, index| {
         const selected = index == @intFromEnum(state.controller_bank);
         const hovered = button.contains(state.pointer_x, state.pointer_y);
@@ -1506,6 +1593,8 @@ fn drawController(packet: *render.Packet, state: *const model.UiState, time_seco
 
     drawControllerSmallButton(packet, layout.octave_down, state, "OCT -", palette.amber);
     drawControllerSmallButton(packet, layout.octave_up, state, "OCT +", palette.amber);
+    drawControllerSmallButton(packet, layout.density_down, state, "GRID -", palette.cyan);
+    drawControllerSmallButton(packet, layout.density_up, state, "GRID +", palette.cyan);
     const setup_hovered = layout.setup.contains(state.pointer_x, state.pointer_y);
     packet.rounded(layout.setup.x, layout.setup.y, layout.setup.width, layout.setup.height, 11, if (setup_hovered) palette.cyan_dim else palette.panel_raised);
     packet.text(layout.setup.x + 12, layout.setup.y + 16, "SETUP", if (layout.setup.width < 80) 0.9 else 1.05, if (setup_hovered) palette.cyan else palette.text);
@@ -1524,9 +1613,10 @@ fn drawController(packet: *render.Packet, state: *const model.UiState, time_seco
     }
 
     for (layout.pads, 0..) |pad, index| {
+        if (pad.width <= 0 or pad.height <= 0) continue;
         const mask = @as(u32, 1) << @intCast(index);
         const pressed = (state.controller_pressed_pads & mask) != 0 or (state.controller_bank == .user and (state.controller_toggled_pads & mask) != 0);
-        const selected_for_edit = editing and state.controller_bank == .user and index == @min(state.controller_selected_pad, 15);
+        const selected_for_edit = editing and state.controller_bank == .user and index == @min(state.controller_selected_pad, model.max_controller_controls - 1);
         const hovered = pad.contains(state.pointer_x, state.pointer_y);
         const row: usize = if (state.controller_bank == .user) @intCast(@min(state.controller_assignments[index].color, 3)) else index / 4;
         const accent = switch (row) {
@@ -1542,8 +1632,12 @@ fn drawController(packet: *render.Packet, state: *const model.UiState, time_seco
             else => Color{ 0.28, 0.12, 0.17, 1 },
         };
         if (pressed or selected_for_edit) packet.glow(pad.x - 7, pad.y - 7, pad.width + 14, pad.height + 14, if (pressed) 18 else 10, if (selected_for_edit) palette.amber else accent, time_seconds);
-        packet.rounded(pad.x, pad.y, pad.width, pad.height, @min(18, pad.width * 0.14), if (pressed) accent else if (hovered) mixColor(base, accent, 0.25) else base);
-        drawControllerPadLabel(packet, pad, state, index, if (pressed) palette.background else palette.text);
+        if (state.controller_bank == .user) {
+            drawControllerCustomControl(packet, pad, state, index, pressed, hovered, accent, base);
+        } else {
+            packet.rounded(pad.x, pad.y, pad.width, pad.height, @min(18, pad.width * 0.14), if (pressed) accent else if (hovered) mixColor(base, accent, 0.25) else base);
+            drawControllerPadLabel(packet, pad, state, index, if (pressed) palette.background else palette.text);
+        }
     }
 
     const transport_labels = [_][]const u8{ "STOP", "PLAY", "RECORD", "LOOP", "CLICK", "UNDO", "REDO", "SAVE" };
@@ -1569,6 +1663,82 @@ fn drawController(packet: *render.Packet, state: *const model.UiState, time_seco
     }
 }
 
+fn drawControllerCustomControl(packet: *render.Packet, bounds: Rect, state: *const model.UiState, index: usize, pressed: bool, hovered: bool, accent: Color, base: Color) void {
+    const assignment = state.controller_assignments[index];
+    const value: f32 = @as(f32, @floatFromInt(state.controller_values[index])) / 127;
+    const secondary: f32 = @as(f32, @floatFromInt(state.controller_secondary_values[index])) / 127;
+    const surface = if (pressed) accent else if (hovered) mixColor(base, accent, 0.25) else base;
+    switch (assignment.control) {
+        .pad, .button, .toggle => {
+            packet.rounded(bounds.x, bounds.y, bounds.width, bounds.height, @min(18, bounds.width * 0.14), surface);
+            drawControllerPadLabel(packet, bounds, state, index, if (pressed) palette.background else palette.text);
+            const kind_label = switch (assignment.control) {
+                .pad => "PAD",
+                .button => "BUTTON",
+                .toggle => "TOGGLE",
+                else => unreachable,
+            };
+            packet.text(bounds.x + 9, bounds.y + 9, kind_label, 0.48, if (pressed) palette.background else accent);
+        },
+        .fader_vertical => {
+            packet.rounded(bounds.x, bounds.y, bounds.width, bounds.height, @min(16, bounds.width * 0.12), palette.panel_raised);
+            const track_x = bounds.x + bounds.width * 0.5;
+            const top = bounds.y + 26;
+            const bottom = bounds.y + bounds.height - 26;
+            const thumb_y = bottom - value * @max(@as(f32, 1), bottom - top);
+            packet.line(track_x, top, track_x, bottom, @max(@as(f32, 3), bounds.width * 0.055), palette.border);
+            packet.line(track_x, thumb_y, track_x, bottom, @max(@as(f32, 3), bounds.width * 0.055), accent);
+            packet.rounded(track_x - @min(22, bounds.width * 0.28), thumb_y - 7, @min(44, bounds.width * 0.56), 14, 7, accent);
+            drawControllerValueLabel(packet, bounds, assignment.value, state.controller_values[index], "FADER", accent);
+        },
+        .fader_horizontal => {
+            packet.rounded(bounds.x, bounds.y, bounds.width, bounds.height, @min(16, bounds.height * 0.12), palette.panel_raised);
+            const left = bounds.x + 24;
+            const right = bounds.x + bounds.width - 24;
+            const track_y = bounds.y + bounds.height * 0.54;
+            const thumb_x = left + value * @max(@as(f32, 1), right - left);
+            packet.line(left, track_y, right, track_y, @max(@as(f32, 3), bounds.height * 0.055), palette.border);
+            packet.line(left, track_y, thumb_x, track_y, @max(@as(f32, 3), bounds.height * 0.055), accent);
+            packet.rounded(thumb_x - 7, track_y - @min(22, bounds.height * 0.25), 14, @min(44, bounds.height * 0.5), 7, accent);
+            drawControllerValueLabel(packet, bounds, assignment.value, state.controller_values[index], "FADER", accent);
+        },
+        .encoder => {
+            packet.rounded(bounds.x, bounds.y, bounds.width, bounds.height, @min(16, bounds.width * 0.12), palette.panel_raised);
+            const size = @min(bounds.width, bounds.height) * 0.54;
+            const center_x = bounds.x + bounds.width * 0.5;
+            const center_y = bounds.y + bounds.height * 0.54;
+            packet.rounded(center_x - size * 0.5, center_y - size * 0.5, size, size, size * 0.5, mixColor(palette.panel, accent, 0.22));
+            const angle = -2.35 + value * 4.7;
+            packet.line(center_x, center_y, center_x + @sin(angle) * size * 0.36, center_y - @cos(angle) * size * 0.36, @max(@as(f32, 2), size * 0.055), accent);
+            drawControllerValueLabel(packet, bounds, assignment.value, state.controller_values[index], "ENCODER", accent);
+        },
+        .xy => {
+            packet.rounded(bounds.x, bounds.y, bounds.width, bounds.height, @min(16, bounds.width * 0.1), palette.panel_raised);
+            const left = bounds.x + 20;
+            const right = bounds.x + bounds.width - 20;
+            const top = bounds.y + 24;
+            const bottom = bounds.y + bounds.height - 20;
+            const cursor_x = left + value * @max(@as(f32, 1), right - left);
+            const cursor_y = bottom - secondary * @max(@as(f32, 1), bottom - top);
+            packet.line(left, cursor_y, right, cursor_y, 1.4, mixColor(palette.border, accent, 0.55));
+            packet.line(cursor_x, top, cursor_x, bottom, 1.4, mixColor(palette.border, accent, 0.55));
+            packet.rounded(cursor_x - 7, cursor_y - 7, 14, 14, 7, accent);
+            drawControllerValueLabel(packet, bounds, assignment.value, state.controller_values[index], "XY", accent);
+        },
+        .label => {
+            packet.rounded(bounds.x, bounds.y, bounds.width, bounds.height, @min(14, bounds.width * 0.1), if (hovered) palette.panel_raised else palette.panel);
+            packet.text(bounds.x + 14, bounds.y + bounds.height * 0.48, "LABEL / SPACER", std.math.clamp((bounds.width - 28) / @max(1, render.Packet.textWidth("LABEL / SPACER", 1)), 0.55, 0.9), palette.muted);
+        },
+    }
+}
+
+fn drawControllerValueLabel(packet: *render.Packet, bounds: Rect, cc: u8, value: u8, kind: []const u8, accent: Color) void {
+    var buffer: [32]u8 = undefined;
+    const label = std.fmt.bufPrint(&buffer, "{s}  CC {d}  {d}", .{ kind, cc, value }) catch kind;
+    const scale = std.math.clamp((bounds.width - 16) / @max(1, render.Packet.textWidth(label, 1)), 0.48, 0.7);
+    packet.text(bounds.x + 8, bounds.y + 10, label, scale, accent);
+}
+
 fn drawControllerSmallButton(packet: *render.Packet, button: Rect, state: *const model.UiState, label: []const u8, accent: Color) void {
     const hovered = button.contains(state.pointer_x, state.pointer_y);
     packet.rounded(button.x, button.y, button.width, button.height, 11, if (hovered) mixColor(palette.panel_raised, accent, 0.22) else palette.panel_raised);
@@ -1576,32 +1746,72 @@ fn drawControllerSmallButton(packet: *render.Packet, button: Rect, state: *const
 }
 
 fn drawControllerEditCell(packet: *render.Packet, button: Rect, state: *const model.UiState, index: usize) void {
-    const selected: usize = @intCast(@min(state.controller_selected_pad, 15));
+    const selected: usize = @intCast(@min(state.controller_selected_pad, model.max_controller_controls - 1));
     const assignment = state.controller_assignments[selected];
     const hovered = button.contains(state.pointer_x, state.pointer_y);
     var secondary_buffer: [24]u8 = undefined;
-    const primary = switch (index) {
-        0, 1 => "TYPE",
-        2, 3 => switch (assignment.kind) {
-            .note, .drum => "NOTE",
-            .cc => "CC",
-            .clip => "SCENE",
-            .action => "ACTION",
+    var primary: []const u8 = undefined;
+    var secondary: []const u8 = undefined;
+    switch (state.controller_inspector_page % 3) {
+        0 => {
+            primary = switch (index) {
+                0, 1 => "CONTROL",
+                2, 3 => "WIDTH",
+                4, 5 => "HEIGHT",
+                6 => "ROUTING",
+                else => "LAYOUT",
+            };
+            secondary = switch (index) {
+                0 => "PREVIOUS",
+                1 => "NEXT",
+                2 => "-",
+                3 => "+",
+                4 => "-",
+                5 => "+",
+                6 => "NEXT",
+                else => "RESET",
+            };
         },
-        4, 5 => if (assignment.kind == .clip) "TRACK" else "CHANNEL",
-        6 => "BEHAVIOR",
-        else => "COLOR",
-    };
-    const secondary: []const u8 = switch (index) {
-        0 => "PREVIOUS",
-        1 => "NEXT",
-        2 => "-",
-        3 => "+",
-        4 => "-",
-        5 => "+",
-        6 => if (assignment.behavior == .momentary) "MOMENTARY" else "TOGGLE",
-        else => std.fmt.bufPrint(&secondary_buffer, "SWATCH {d}", .{@as(u16, @min(assignment.color, 3)) + 1}) catch "SWATCH",
-    };
+        1 => {
+            primary = switch (index) {
+                0, 1 => "MESSAGE",
+                2, 3 => "VALUE",
+                4, 5 => "CHANNEL",
+                6 => "STYLE",
+                else => "XY Y-CC",
+            };
+            secondary = switch (index) {
+                0 => "PREVIOUS",
+                1 => "NEXT",
+                2 => "-",
+                3 => "+",
+                4 => "-",
+                5 => "+",
+                6 => "NEXT",
+                else => std.fmt.bufPrint(&secondary_buffer, "{d} +", .{assignment.secondary_value}) catch "+",
+            };
+        },
+        else => {
+            primary = switch (index) {
+                0 => "BEHAVIOR",
+                1 => "COLOR",
+                2, 3 => "XY Y-CC",
+                4, 5 => "START",
+                6 => "ROUTING",
+                else => "LAYOUT",
+            };
+            secondary = switch (index) {
+                0 => if (assignment.behavior == .momentary) "MOMENTARY" else "TOGGLE",
+                1 => std.fmt.bufPrint(&secondary_buffer, "SWATCH {d}", .{@as(u16, @min(assignment.color, 3)) + 1}) catch "SWATCH",
+                2 => "-",
+                3 => "+",
+                4 => "-",
+                5 => "+",
+                6 => "BACK",
+                else => "FIRST",
+            };
+        },
+    }
     const accent = switch (index) {
         0, 1 => palette.cyan,
         2, 3 => palette.green,
@@ -4145,6 +4355,32 @@ test "controller editor safely formats every persisted color value" {
     drawController(&packet, &state, 0);
     try std.testing.expect(packet.len > 0);
     try std.testing.expect(!packet.clipped);
+}
+
+test "controller density reveals more controls and custom spans reflow" {
+    var state: model.UiState = .{
+        .viewport_width = 1024,
+        .viewport_height = 768,
+        .app_view = .controller,
+        .controller_bank = .user,
+    };
+    const large = ControllerLayout.calculateForState(&state);
+    var large_count: usize = 0;
+    for (large.pads) |pad| if (pad.width > 0) {
+        large_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 16), large_count);
+
+    state.controller_density = 1;
+    state.controller_assignments[0].control = .fader_vertical;
+    state.controller_assignments[0].height_units = 2;
+    const medium = ControllerLayout.calculateForState(&state);
+    var medium_count: usize = 0;
+    for (medium.pads) |pad| if (pad.width > 0) {
+        medium_count += 1;
+    };
+    try std.testing.expect(medium_count > large_count);
+    try std.testing.expect(medium.pads[0].height > medium.pads[1].height);
 }
 
 test "engraving honors D-flat spelling and emits analytic beams and ties" {

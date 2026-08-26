@@ -31,6 +31,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     private var takeURL: URL { supportDirectory.appendingPathComponent("latest-take.caf") }
     private var serializationBuffer = Data(count: 4 * 1024 * 1024)
     private var lastControllerPreferences: Data?
+    private var controllerTargetProtocol: UInt32?
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -65,7 +66,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         }
         _ = midi.start()
         restoreControllerProtocol()
-        restoreControllerTarget()
+        refreshControllerTargetForProtocol()
         startLibraryAcceptanceIfRequested()
         startAcceptancePlaybackIfRequested()
         startControllerAcceptanceIfRequested()
@@ -106,7 +107,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     /// Physical-device acceptance uses the same accessibility activation path
     /// as VoiceOver and Switch Control. That path resolves the GPU-owned pad
     /// rectangles, feeds their down/up events through the shared Zig core, and
-    /// finally drains the resulting OSC packets through `sendController`.
+    /// finally drains the resulting controller packets through `sendController`.
     /// Nothing runs during a normal launch.
     private func startControllerAcceptanceIfRequested() {
         guard ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_ACCEPTANCE"] == "1" else { return }
@@ -141,14 +142,42 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             score_ios_accessibility_activate(customBank)
         }
         for (index, pad) in pattern.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + leadIn + 0.6 + Double(index) * 0.28) {
-                score_ios_accessibility_activate(pad)
+            let downAt = leadIn + 0.6 + Double(index) * 0.28
+            let pointerID = UInt32(10_000 + index)
+            DispatchQueue.main.asyncAfter(deadline: .now() + downAt) {
+                guard let point = Self.controllerAcceptancePoint(id: pad) else {
+                    NSLog("Score iPad controller acceptance missing pad=%u", pad - firstPad + 1)
+                    return
+                }
+                // Accessibility activation intentionally completes a button
+                // action immediately. A DAW recorder needs a realistic note
+                // duration, so physical acceptance drives the same Zig pointer
+                // path as a 90 ms finger strike instead.
+                score_ios_pointer(1, 2, pointerID, point.x, point.y, 1, 0, 18, 0, 0)
                 NSLog("Score iPad controller acceptance pad=%u", pad - firstPad + 1)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + downAt + 0.09) {
+                guard let point = Self.controllerAcceptancePoint(id: pad) else { return }
+                score_ios_pointer(2, 2, pointerID, point.x, point.y, 0, 0, 0, 0, 0)
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + leadIn + 0.6 + Double(pattern.count) * 0.28) {
             NSLog("Score iPad controller acceptance complete")
         }
+    }
+
+    private static func controllerAcceptancePoint(id: UInt32) -> (x: Float, y: Float)? {
+        let count = Int(score_ios_accessibility_count())
+        guard count > 0, let items = score_ios_accessibility_items() else { return nil }
+        for index in 0..<count where items[index].id == id {
+            var item = items[index]
+            let rect = withUnsafeBytes(of: &item.rect) { raw in
+                Array(raw.bindMemory(to: Float.self).prefix(4))
+            }
+            guard rect.count == 4 else { return nil }
+            return (rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5)
+        }
+        return nil
     }
 
     override var keyCommands: [UIKeyCommand]? {
@@ -234,6 +263,17 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         osc.configure(host: host, port: UInt16(storedPort == 0 ? 8000 : storedPort))
     }
 
+    private func refreshControllerTargetForProtocol() {
+        let protocolValue = score_ios_controller_protocol()
+        guard controllerTargetProtocol != protocolValue else { return }
+        controllerTargetProtocol = protocolValue
+        if protocolValue == 0 {
+            Self.publishControllerTarget(status: 1, label: "MIDI / USB")
+        } else {
+            restoreControllerTarget()
+        }
+    }
+
     private func restoreControllerProtocol() {
         let defaults = UserDefaults.standard
         let configured = ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_PROTOCOL"]?.lowercased()
@@ -242,13 +282,27 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         } else if configured == "osc" {
             defaults.set(1, forKey: "ScoreController.protocol")
         }
-        guard defaults.object(forKey: "ScoreController.protocol") != nil else { return }
+        // A fresh install must take the direct, low-latency path without
+        // requiring the user to discover and toggle the protocol control.
+        if defaults.object(forKey: "ScoreController.protocol") == nil {
+            defaults.set(0, forKey: "ScoreController.protocol")
+        }
         let value = defaults.integer(forKey: "ScoreController.protocol")
         guard value == 0 || value == 1 else { return }
         _ = score_ios_set_controller_protocol(UInt32(value))
     }
 
     private func presentControllerSetup() {
+        if score_ios_controller_protocol() == 0 {
+            let alert = UIAlertController(
+                title: "MIDI Controller Output",
+                message: "USB MIDI is the default low-latency path. Connect this iPad by cable, select it in Audio MIDI Setup, and press Enable. In Bitwig, use iPad – All Channels as the instrument track input.",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
         let defaults = UserDefaults.standard
         let alert = UIAlertController(
             title: "Controller Output",
@@ -294,7 +348,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     }
 
     private func controllerPreferences() -> Data? {
-        var data = Data(count: 256)
+        var data = Data(count: 1024)
         let length = data.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
             return score_ios_serialize_controller(base, raw.count)
@@ -306,6 +360,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
 
     private func saveControllerPreferencesIfChanged() {
         UserDefaults.standard.set(Int(score_ios_controller_protocol()), forKey: "ScoreController.protocol")
+        refreshControllerTargetForProtocol()
         guard let data = controllerPreferences(), data != lastControllerPreferences else { return }
         lastControllerPreferences = data
         UserDefaults.standard.set(data, forKey: "ScoreController.preferences")

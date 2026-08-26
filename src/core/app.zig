@@ -69,20 +69,61 @@ const ScorePanDrag = struct {
 
 const ControllerTouch = struct {
     active: bool = false,
+    pending_note_on: bool = false,
     pointer_id: u32 = 0,
+    pointer_type: platform.PointerType = .mouse,
     /// 0 is a musical/session pad, 1 is a transport/action button.
     kind: u8 = 0,
     index: u8 = 0,
     velocity: u8 = 0,
+    value: u8 = 64,
+    start_x: f32 = 0,
+    start_y: f32 = 0,
+    last_x: f32 = 0,
+    last_y: f32 = 0,
 };
 
-fn controllerVelocity(state: *const model.UiState, pointer_type: platform.PointerType, pressure: f32) u8 {
-    const fallback: u8 = @intCast(std.math.clamp(state.controller_velocity, 1, 127));
-    if (pointer_type != .pen or !std.math.isFinite(pressure) or pressure <= 0) return fallback;
-    // A square-root response gives a Pencil useful dynamic control at light
-    // force without making fortissimo unreachable at the top of its range.
-    const normalized = std.math.clamp(pressure, 0, 1);
-    return @intFromFloat(@round(15 + @sqrt(normalized) * 112));
+fn controllerVelocityResponse(state: *const model.UiState, input: f32) u8 {
+    const normalized = std.math.clamp(if (std.math.isFinite(input)) input else 0, 0, 1);
+    const shaped = switch (state.controller_velocity_curve) {
+        .soft => @sqrt(normalized),
+        .balanced => std.math.pow(f32, normalized, 0.82),
+        .hard => std.math.pow(f32, normalized, 1.45),
+    };
+    const low: f32 = @floatFromInt(@min(state.controller_velocity_min, 127));
+    const high: f32 = @floatFromInt(@min(@as(u8, 127), @max(state.controller_velocity_min, state.controller_velocity_max)));
+    return @intFromFloat(@round(low + shaped * (high - low)));
+}
+
+fn nextControllerVelocityMode(mode: model.ControllerVelocityMode) model.ControllerVelocityMode {
+    return switch (mode) {
+        .fixed => .dynamic,
+        .dynamic => .y_position,
+        .y_position => .diagonal_position,
+        .diagonal_position => .pencil_force,
+        .pencil_force => .fixed,
+    };
+}
+
+fn controllerVelocity(state: *const model.UiState, pointer_type: platform.PointerType, pressure: f32, contact_radius: f32, relative_x: f32, relative_y: f32) u8 {
+    const fixed: u8 = @intCast(std.math.clamp(state.controller_velocity, 1, 127));
+    return switch (state.controller_velocity_mode) {
+        .fixed => fixed,
+        .y_position => controllerVelocityResponse(state, 1 - std.math.clamp(relative_y, 0, 1)),
+        .diagonal_position => controllerVelocityResponse(state, (std.math.clamp(relative_x, 0, 1) + (1 - std.math.clamp(relative_y, 0, 1))) * 0.5),
+        .pencil_force => if (pointer_type == .pen and std.math.isFinite(pressure) and pressure > 0)
+            controllerVelocityResponse(state, pressure)
+        else
+            fixed,
+        .dynamic => blk: {
+            if (pointer_type == .pen and std.math.isFinite(pressure) and pressure > 0) break :blk controllerVelocityResponse(state, pressure);
+            if (!std.math.isFinite(contact_radius) or contact_radius <= 0) break :blk fixed;
+            // UIKit's majorRadius is an approximate contact radius rather than
+            // pressure. Mapping its useful finger range gives deterministic,
+            // calibratable impact dynamics without misrepresenting the sensor.
+            break :blk controllerVelocityResponse(state, (contact_radius - 6) / 22);
+        },
+    };
 }
 
 fn controllerAssignmentValueMax(kind: model.ControllerAssignmentKind) u8 {
@@ -93,9 +134,17 @@ fn controllerAssignmentValueMax(kind: model.ControllerAssignmentKind) u8 {
     };
 }
 
+fn controllerControlIsContinuous(kind: model.ControllerControlKind) bool {
+    return switch (kind) {
+        .fader_vertical, .fader_horizontal, .encoder, .xy => true,
+        else => false,
+    };
+}
+
 const controller_preferences_magic = "SCTRL001";
-const controller_preferences_version: u32 = 1;
-const controller_preferences_size = controller_preferences_magic.len + 8 + 16 * @sizeOf(model.ControllerAssignment);
+const controller_preferences_version: u32 = 2;
+const controller_preferences_header_size: usize = 24;
+const controller_preferences_size = controller_preferences_header_size + model.max_controller_controls * @sizeOf(model.ControllerAssignment);
 
 const EndingSkip = struct {
     source_measure: usize,
@@ -516,7 +565,7 @@ pub const App = struct {
     }
 
     fn controllerPointer(self: *App, state: *model.UiState, event: platform.PointerEvent) void {
-        const layout = ui.ControllerLayout.calculate(state.viewport_width, state.viewport_height);
+        const layout = ui.ControllerLayout.calculateForState(state);
         switch (event.kind) {
             .down => {
                 if (layout.score_view.contains(event.x, event.y)) {
@@ -533,6 +582,30 @@ pub const App = struct {
                     self.releaseAllControllerTouches(state);
                     state.controller_editing = @intFromBool(state.controller_editing == 0);
                     if (state.controller_editing != 0) state.controller_bank = .user;
+                    return;
+                }
+                if (layout.velocity_mode.contains(event.x, event.y)) {
+                    self.releaseAllControllerTouches(state);
+                    state.controller_velocity_mode = nextControllerVelocityMode(state.controller_velocity_mode);
+                    return;
+                }
+                if (layout.velocity_curve.contains(event.x, event.y)) {
+                    self.releaseAllControllerTouches(state);
+                    if (state.controller_velocity_mode == .fixed) {
+                        state.controller_velocity = if (state.controller_velocity < 72)
+                            80
+                        else if (state.controller_velocity < 88)
+                            96
+                        else if (state.controller_velocity < 104)
+                            112
+                        else if (state.controller_velocity < 120)
+                            127
+                        else
+                            64;
+                    } else {
+                        const count = @typeInfo(model.ControllerVelocityCurve).@"enum".fields.len;
+                        state.controller_velocity_curve = @enumFromInt((@intFromEnum(state.controller_velocity_curve) + 1) % count);
+                    }
                     return;
                 }
                 if (layout.setup.contains(event.x, event.y)) {
@@ -555,12 +628,23 @@ pub const App = struct {
                     state.controller_octave = @min(@as(i32, 8), state.controller_octave + 1);
                     return;
                 }
+                if (layout.density_down.contains(event.x, event.y)) {
+                    self.releaseAllControllerTouches(state);
+                    state.controller_density -|= 1;
+                    return;
+                }
+                if (layout.density_up.contains(event.x, event.y)) {
+                    self.releaseAllControllerTouches(state);
+                    state.controller_density = @min(@as(u8, 2), state.controller_density +| 1);
+                    return;
+                }
                 for (layout.pads, 0..) |pad, index| if (pad.contains(event.x, event.y)) {
                     if (state.controller_editing != 0 and state.controller_bank == .user) {
                         state.controller_selected_pad = @intCast(index);
                         return;
                     }
-                    self.beginControllerTouch(state, event, 0, @intCast(index));
+                    if (state.controller_bank == .user and state.controller_assignments[index].control == .label) return;
+                    self.beginControllerTouch(state, event, 0, @intCast(index), pad);
                     return;
                 };
                 for (layout.transport, 0..) |button, index| if (button.contains(event.x, event.y)) {
@@ -568,40 +652,60 @@ pub const App = struct {
                         self.editControllerAssignment(state, @intCast(index));
                         return;
                     }
-                    self.beginControllerTouch(state, event, 1, @intCast(index));
+                    self.beginControllerTouch(state, event, 1, @intCast(index), button);
                     return;
                 };
             },
             .move => {
                 const touch = self.controllerTouch(event.id) orelse return;
                 if (touch.kind != 0) return;
+                const current_pad = if (touch.index < model.max_controller_controls) layout.pads[touch.index] else return;
+                if (state.controller_bank == .user and controllerControlIsContinuous(state.controller_assignments[touch.index].control)) {
+                    self.updateControllerContinuous(state, touch, event, current_pad);
+                    return;
+                }
                 var next_index: ?u8 = null;
                 for (layout.pads, 0..) |pad, index| if (pad.contains(event.x, event.y)) {
                     next_index = @intCast(index);
                     break;
                 };
                 if (next_index == touch.index) {
-                    if (event.pointer_type == .pen and touch.index < 16) {
-                        const next_velocity = controllerVelocity(state, event.pointer_type, event.pressure);
+                    if (touch.pending_note_on) {
+                        const relative_x = (event.x - current_pad.x) / @max(@as(f32, 1), current_pad.width);
+                        const relative_y = (event.y - current_pad.y) / @max(@as(f32, 1), current_pad.height);
+                        touch.velocity = controllerVelocity(state, event.pointer_type, event.pressure, event.contact_radius, relative_x, relative_y);
+                        touch.pending_note_on = false;
+                        self.pressControllerPad(state, touch.index, touch.velocity);
+                    } else if (event.pointer_type == .pen and touch.index < model.max_controller_controls) {
+                        const relative_x = (event.x - current_pad.x) / @max(@as(f32, 1), current_pad.width);
+                        const relative_y = (event.y - current_pad.y) / @max(@as(f32, 1), current_pad.height);
+                        const next_velocity = controllerVelocity(state, event.pointer_type, event.pressure, event.contact_radius, relative_x, relative_y);
                         const difference = @abs(@as(i16, next_velocity) - @as(i16, touch.velocity));
                         if (difference >= 2) {
                             touch.velocity = next_velocity;
+                            state.controller_last_velocity = next_velocity;
                             self.queueControllerAftertouch(state, touch.index, next_velocity);
                         }
                     }
                     return;
                 }
-                if (touch.index < 16) self.releaseControllerPad(state, touch.index);
+                if (touch.index < model.max_controller_controls) self.releaseControllerPad(state, touch.index);
                 touch.index = next_index orelse 255;
-                touch.velocity = controllerVelocity(state, event.pointer_type, event.pressure);
-                if (next_index) |index| self.pressControllerPad(state, index, touch.velocity);
+                if (next_index) |index| {
+                    const next_pad = layout.pads[index];
+                    const relative_x = (event.x - next_pad.x) / @max(@as(f32, 1), next_pad.width);
+                    const relative_y = (event.y - next_pad.y) / @max(@as(f32, 1), next_pad.height);
+                    touch.velocity = controllerVelocity(state, event.pointer_type, event.pressure, event.contact_radius, relative_x, relative_y);
+                    touch.pending_note_on = state.controller_velocity_mode == .pencil_force and event.pointer_type == .pen;
+                    if (!touch.pending_note_on) self.pressControllerPad(state, index, touch.velocity);
+                }
             },
             .up, .cancel => self.endControllerTouch(state, event.id),
             .scroll => {},
         }
     }
 
-    fn beginControllerTouch(self: *App, state: *model.UiState, event: platform.PointerEvent, kind: u8, index: u8) void {
+    fn beginControllerTouch(self: *App, state: *model.UiState, event: platform.PointerEvent, kind: u8, index: u8, bounds: ui.Rect) void {
         if (self.controllerTouch(event.id) != null) return;
         var slot: ?*ControllerTouch = null;
         for (&self.controller_touches) |*touch| if (!touch.active) {
@@ -609,9 +713,29 @@ pub const App = struct {
             break;
         };
         const touch = slot orelse return;
-        touch.* = .{ .active = true, .pointer_id = event.id, .kind = kind, .index = index, .velocity = controllerVelocity(state, event.pointer_type, event.pressure) };
+        const relative_x = (event.x - bounds.x) / @max(@as(f32, 1), bounds.width);
+        const relative_y = (event.y - bounds.y) / @max(@as(f32, 1), bounds.height);
+        const velocity = controllerVelocity(state, event.pointer_type, event.pressure, event.contact_radius, relative_x, relative_y);
+        touch.* = .{
+            .active = true,
+            .pending_note_on = kind == 0 and state.controller_velocity_mode == .pencil_force and event.pointer_type == .pen,
+            .pointer_id = event.id,
+            .pointer_type = event.pointer_type,
+            .kind = kind,
+            .index = index,
+            .velocity = velocity,
+            .value = if (index < state.controller_values.len) state.controller_values[index] else 64,
+            .start_x = event.x,
+            .start_y = event.y,
+            .last_x = event.x,
+            .last_y = event.y,
+        };
         if (kind == 0) {
-            self.pressControllerPad(state, index, touch.velocity);
+            if (state.controller_bank == .user and controllerControlIsContinuous(state.controller_assignments[index].control)) {
+                self.updateControllerContinuous(state, touch, event, bounds);
+            } else if (!touch.pending_note_on) {
+                self.pressControllerPad(state, index, touch.velocity);
+            }
         } else {
             state.controller_pressed_transport |= @as(u32, 1) << @intCast(index);
             self.queueControllerTransport(state, index, true);
@@ -621,7 +745,10 @@ pub const App = struct {
     fn endControllerTouch(self: *App, state: *model.UiState, pointer_id: u32) void {
         const touch = self.controllerTouch(pointer_id) orelse return;
         if (touch.kind == 0) {
-            if (touch.index < 16) self.releaseControllerPad(state, touch.index);
+            if (touch.index < model.max_controller_controls) {
+                if (touch.pending_note_on) self.pressControllerPad(state, touch.index, touch.velocity);
+                self.releaseControllerPad(state, touch.index);
+            }
         } else {
             state.controller_pressed_transport &= ~(@as(u32, 1) << @intCast(touch.index));
             self.queueControllerTransport(state, touch.index, false);
@@ -634,11 +761,53 @@ pub const App = struct {
         return null;
     }
 
+    fn updateControllerContinuous(self: *App, state: *model.UiState, touch: *ControllerTouch, event: platform.PointerEvent, bounds: ui.Rect) void {
+        if (touch.index >= model.max_controller_controls) return;
+        const index: usize = touch.index;
+        const assignment = state.controller_assignments[index];
+        const x = std.math.clamp((event.x - bounds.x) / @max(@as(f32, 1), bounds.width), 0, 1);
+        const y = std.math.clamp((event.y - bounds.y) / @max(@as(f32, 1), bounds.height), 0, 1);
+        var primary = touch.value;
+        var secondary: ?u8 = null;
+        switch (assignment.control) {
+            .fader_vertical => primary = @intFromFloat(@round((1 - y) * 127)),
+            .fader_horizontal => primary = @intFromFloat(@round(x * 127)),
+            .encoder => {
+                const delta = (touch.last_y - event.y) + (event.x - touch.last_x);
+                if (@abs(delta) < 0.75) return;
+                const signed: i16 = @as(i16, touch.value) + @as(i16, @intFromFloat(@round(delta * 0.72)));
+                primary = @intCast(std.math.clamp(signed, 0, 127));
+            },
+            .xy => {
+                primary = @intFromFloat(@round(x * 127));
+                secondary = @intFromFloat(@round((1 - y) * 127));
+            },
+            else => return,
+        }
+        touch.last_x = event.x;
+        touch.last_y = event.y;
+        if (primary != touch.value or event.kind == .down) {
+            touch.value = primary;
+            state.controller_values[index] = primary;
+            self.queueControllerContinuous(state, assignment.channel, assignment.value, primary);
+        }
+        if (secondary) |value| {
+            state.controller_secondary_values[index] = value;
+            self.queueControllerContinuous(state, assignment.channel, assignment.secondary_value, value);
+        }
+        state.controller_pressed_pads |= @as(u32, 1) << @intCast(index);
+    }
+
+    fn queueControllerContinuous(self: *App, state: *const model.UiState, channel: u8, number: u8, value: u8) void {
+        const output = controller_io.cc(@intFromEnum(state.controller_protocol), @min(channel, 15), number, value) catch return;
+        self.pushControllerOutput(output);
+    }
+
     fn releaseAllControllerTouches(self: *App, state: *model.UiState) void {
         for (&self.controller_touches) |*touch| {
             if (!touch.active) continue;
             if (touch.kind == 0) {
-                if (touch.index < 16) self.releaseControllerPad(state, touch.index);
+                if (touch.index < model.max_controller_controls) self.releaseControllerPad(state, touch.index);
             } else {
                 self.queueControllerTransport(state, touch.index, false);
             }
@@ -649,7 +818,9 @@ pub const App = struct {
     }
 
     fn pressControllerPad(self: *App, state: *model.UiState, index: u8, velocity: u8) void {
-        if (state.controller_bank == .user and state.controller_assignments[index].behavior == .toggle) {
+        if (index >= model.max_controller_controls) return;
+        state.controller_last_velocity = @min(velocity, 127);
+        if (state.controller_bank == .user and (state.controller_assignments[index].behavior == .toggle or state.controller_assignments[index].control == .toggle)) {
             const mask = @as(u32, 1) << @intCast(index);
             state.controller_toggled_pads ^= mask;
             self.queueControllerPad(state, index, (state.controller_toggled_pads & mask) != 0, velocity);
@@ -660,8 +831,10 @@ pub const App = struct {
     }
 
     fn releaseControllerPad(self: *App, state: *model.UiState, index: u8) void {
-        if (state.controller_bank == .user and state.controller_assignments[index].behavior == .toggle) return;
+        if (index >= model.max_controller_controls) return;
+        if (state.controller_bank == .user and (state.controller_assignments[index].behavior == .toggle or state.controller_assignments[index].control == .toggle)) return;
         state.controller_pressed_pads &= ~(@as(u32, 1) << @intCast(index));
+        if (state.controller_bank == .user and (controllerControlIsContinuous(state.controller_assignments[index].control) or state.controller_assignments[index].control == .label)) return;
         self.queueControllerPad(state, index, false, 0);
     }
 
@@ -711,32 +884,74 @@ pub const App = struct {
 
     fn editControllerAssignment(self: *App, state: *model.UiState, control: u8) void {
         _ = self;
-        const selected: usize = @intCast(@min(state.controller_selected_pad, 15));
+        const selected: usize = @intCast(@min(state.controller_selected_pad, model.max_controller_controls - 1));
         const assignment = &state.controller_assignments[selected];
-        switch (control) {
-            0, 1 => {
-                const kind_count = @typeInfo(model.ControllerAssignmentKind).@"enum".fields.len;
-                const current: usize = @intFromEnum(assignment.kind);
-                const next = if (control == 0) (current + kind_count - 1) % kind_count else (current + 1) % kind_count;
-                assignment.kind = @enumFromInt(next);
-                switch (assignment.kind) {
-                    .note => assignment.* = .{ .kind = .note, .value = 36, .color = assignment.color },
-                    .drum => assignment.* = .{ .kind = .drum, .channel = 9, .value = 36, .color = assignment.color },
-                    .cc => assignment.* = .{ .kind = .cc, .value = 1, .color = assignment.color },
-                    .clip => assignment.* = .{ .kind = .clip, .value = 0, .color = assignment.color },
-                    .action => assignment.* = .{ .kind = .action, .value = 0, .color = assignment.color },
-                }
+        switch (state.controller_inspector_page % 3) {
+            0 => switch (control) {
+                0, 1 => {
+                    const kind_count = @typeInfo(model.ControllerControlKind).@"enum".fields.len;
+                    const current: usize = @intFromEnum(assignment.control);
+                    const next = if (control == 0) (current + kind_count - 1) % kind_count else (current + 1) % kind_count;
+                    assignment.control = @enumFromInt(next);
+                    switch (assignment.control) {
+                        .toggle => assignment.behavior = .toggle,
+                        .fader_vertical, .fader_horizontal, .encoder, .xy => {
+                            assignment.kind = .cc;
+                            assignment.behavior = .momentary;
+                        },
+                        .label => assignment.behavior = .momentary,
+                        else => {},
+                    }
+                },
+                2 => assignment.width_units = @max(@as(u8, 1), assignment.width_units -| 1),
+                3 => assignment.width_units = @min(@as(u8, 2), assignment.width_units +| 1),
+                4 => assignment.height_units = @max(@as(u8, 1), assignment.height_units -| 1),
+                5 => assignment.height_units = @min(@as(u8, 2), assignment.height_units +| 1),
+                6 => state.controller_inspector_page = 1,
+                7 => {
+                    assignment.control = .pad;
+                    assignment.width_units = 1;
+                    assignment.height_units = 1;
+                },
+                else => return,
             },
-            2 => assignment.value -|= 1,
-            3 => assignment.value = @min(controllerAssignmentValueMax(assignment.kind), assignment.value +| 1),
-            4 => assignment.channel -|= 1,
-            5 => assignment.channel = @min(if (assignment.kind == .clip) @as(u8, 7) else 15, assignment.channel +| 1),
-            6 => assignment.behavior = if (assignment.behavior == .momentary) .toggle else .momentary,
-            7 => assignment.color = (assignment.color + 1) % 4,
-            else => return,
+            1 => switch (control) {
+                0, 1 => {
+                    const kind_count = @typeInfo(model.ControllerAssignmentKind).@"enum".fields.len;
+                    const current: usize = @intFromEnum(assignment.kind);
+                    const next = if (control == 0) (current + kind_count - 1) % kind_count else (current + 1) % kind_count;
+                    assignment.kind = @enumFromInt(next);
+                    switch (assignment.kind) {
+                        .note => assignment.* = .{ .kind = .note, .value = 36, .color = assignment.color, .control = assignment.control, .width_units = assignment.width_units, .height_units = assignment.height_units },
+                        .drum => assignment.* = .{ .kind = .drum, .channel = 9, .value = 36, .color = assignment.color, .control = assignment.control, .width_units = assignment.width_units, .height_units = assignment.height_units },
+                        .cc => assignment.* = .{ .kind = .cc, .value = 1, .color = assignment.color, .control = assignment.control, .width_units = assignment.width_units, .height_units = assignment.height_units },
+                        .clip => assignment.* = .{ .kind = .clip, .value = 0, .color = assignment.color, .control = assignment.control, .width_units = assignment.width_units, .height_units = assignment.height_units },
+                        .action => assignment.* = .{ .kind = .action, .value = 0, .color = assignment.color, .control = assignment.control, .width_units = assignment.width_units, .height_units = assignment.height_units },
+                    }
+                },
+                2 => assignment.value -|= 1,
+                3 => assignment.value = @min(controllerAssignmentValueMax(assignment.kind), assignment.value +| 1),
+                4 => assignment.channel -|= 1,
+                5 => assignment.channel = @min(if (assignment.kind == .clip) @as(u8, 7) else 15, assignment.channel +| 1),
+                6 => state.controller_inspector_page = 2,
+                7 => assignment.secondary_value +|= 1,
+                else => return,
+            },
+            else => switch (control) {
+                0 => assignment.behavior = if (assignment.behavior == .momentary) .toggle else .momentary,
+                1 => assignment.color = (assignment.color + 1) % 4,
+                2 => assignment.secondary_value -|= 1,
+                3 => assignment.secondary_value +|= 1,
+                4 => state.controller_values[selected] -|= 8,
+                5 => state.controller_values[selected] = @min(@as(u8, 127), state.controller_values[selected] +| 8),
+                6 => state.controller_inspector_page = 1,
+                7 => state.controller_inspector_page = 0,
+                else => return,
+            },
         }
         assignment.value = @min(assignment.value, controllerAssignmentValueMax(assignment.kind));
         assignment.channel = @min(assignment.channel, if (assignment.kind == .clip) @as(u8, 7) else 15);
+        if (assignment.control == .toggle) assignment.behavior = .toggle;
         state.controller_toggled_pads &= ~(@as(u32, 1) << @intCast(selected));
         state.controller_mapping_revision +%= 1;
     }
@@ -1310,37 +1525,88 @@ pub const App = struct {
         @memcpy(output[0..controller_preferences_magic.len], controller_preferences_magic);
         std.mem.writeInt(u32, output[8..12], controller_preferences_version, .little);
         std.mem.writeInt(u32, output[12..16], state.controller_assignments.len, .little);
-        var cursor: usize = 16;
+        output[16] = @intFromEnum(state.controller_velocity_mode);
+        output[17] = @intFromEnum(state.controller_velocity_curve);
+        output[18] = @min(state.controller_density, 2);
+        output[19] = 0;
+        output[20] = @intCast(@min(state.controller_velocity, 127));
+        output[21] = @min(state.controller_velocity_min, 127);
+        output[22] = @min(state.controller_velocity_max, 127);
+        output[23] = 0;
+        var cursor: usize = controller_preferences_header_size;
         for (state.controller_assignments) |assignment| {
             output[cursor] = @intFromEnum(assignment.kind);
             output[cursor + 1] = @intFromEnum(assignment.behavior);
             output[cursor + 2] = assignment.channel;
             output[cursor + 3] = assignment.value;
             output[cursor + 4] = assignment.color;
-            @memset(output[cursor + 5 .. cursor + 8], 0);
-            cursor += 8;
+            output[cursor + 5] = @intFromEnum(assignment.control);
+            output[cursor + 6] = std.math.clamp(assignment.width_units, 1, 2);
+            output[cursor + 7] = std.math.clamp(assignment.height_units, 1, 2);
+            output[cursor + 8] = assignment.secondary_value;
+            @memset(output[cursor + 9 .. cursor + @sizeOf(model.ControllerAssignment)], 0);
+            cursor += @sizeOf(model.ControllerAssignment);
         }
         return cursor;
     }
 
     pub fn deserializeControllerPreferences(self: *App, source: []const u8) !void {
-        if (source.len < controller_preferences_size or !std.mem.eql(u8, source[0..8], controller_preferences_magic)) return error.InvalidControllerPreferences;
-        if (std.mem.readInt(u32, source[8..12], .little) != controller_preferences_version or std.mem.readInt(u32, source[12..16], .little) != 16) return error.UnsupportedControllerPreferences;
+        if (source.len < 16 or !std.mem.eql(u8, source[0..8], controller_preferences_magic)) return error.InvalidControllerPreferences;
+        const version = std.mem.readInt(u32, source[8..12], .little);
+        const count = std.mem.readInt(u32, source[12..16], .little);
         const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return error.MissingUiState;
-        var cursor: usize = 16;
+        if (version == 1 and count == 16) {
+            if (source.len < 16 + 16 * 8) return error.InvalidControllerPreferences;
+            state.controller_assignments = model.defaultControllerAssignments();
+            var cursor: usize = 16;
+            for (state.controller_assignments[0..16]) |*assignment| {
+                const kind_value = source[cursor];
+                const behavior_value = source[cursor + 1];
+                if (kind_value >= @typeInfo(model.ControllerAssignmentKind).@"enum".fields.len or behavior_value >= @typeInfo(model.ControllerBehavior).@"enum".fields.len) return error.InvalidControllerPreferences;
+                assignment.* = .{
+                    .kind = @enumFromInt(kind_value),
+                    .behavior = @enumFromInt(behavior_value),
+                    .channel = source[cursor + 2],
+                    .value = source[cursor + 3],
+                    .color = source[cursor + 4],
+                };
+                cursor += 8;
+            }
+        } else if (version == controller_preferences_version and count == model.max_controller_controls) {
+            if (source.len < controller_preferences_size) return error.InvalidControllerPreferences;
+            if (source[16] >= @typeInfo(model.ControllerVelocityMode).@"enum".fields.len or source[17] >= @typeInfo(model.ControllerVelocityCurve).@"enum".fields.len or source[18] > 2) return error.InvalidControllerPreferences;
+            state.controller_velocity_mode = @enumFromInt(source[16]);
+            state.controller_velocity_curve = @enumFromInt(source[17]);
+            state.controller_density = source[18];
+            state.controller_velocity = std.math.clamp(@as(u32, source[20]), 1, 127);
+            state.controller_velocity_min = std.math.clamp(source[21], 1, 127);
+            state.controller_velocity_max = std.math.clamp(source[22], state.controller_velocity_min, 127);
+            var cursor: usize = controller_preferences_header_size;
+            for (&state.controller_assignments) |*assignment| {
+                const kind_value = source[cursor];
+                const behavior_value = source[cursor + 1];
+                const control_value = source[cursor + 5];
+                if (kind_value >= @typeInfo(model.ControllerAssignmentKind).@"enum".fields.len or behavior_value >= @typeInfo(model.ControllerBehavior).@"enum".fields.len or control_value >= @typeInfo(model.ControllerControlKind).@"enum".fields.len) return error.InvalidControllerPreferences;
+                assignment.* = .{
+                    .kind = @enumFromInt(kind_value),
+                    .behavior = @enumFromInt(behavior_value),
+                    .channel = source[cursor + 2],
+                    .value = source[cursor + 3],
+                    .color = source[cursor + 4],
+                    .control = @enumFromInt(control_value),
+                    .width_units = source[cursor + 6],
+                    .height_units = source[cursor + 7],
+                    .secondary_value = source[cursor + 8],
+                };
+                cursor += @sizeOf(model.ControllerAssignment);
+            }
+        } else return error.UnsupportedControllerPreferences;
         for (&state.controller_assignments) |*assignment| {
-            const kind_value = source[cursor];
-            const behavior_value = source[cursor + 1];
-            if (kind_value >= @typeInfo(model.ControllerAssignmentKind).@"enum".fields.len or behavior_value >= @typeInfo(model.ControllerBehavior).@"enum".fields.len) return error.InvalidControllerPreferences;
-            assignment.* = .{
-                .kind = @enumFromInt(kind_value),
-                .behavior = @enumFromInt(behavior_value),
-                .channel = source[cursor + 2],
-                .value = source[cursor + 3],
-                .color = source[cursor + 4],
-            };
-            if (assignment.channel > (if (assignment.kind == .clip) @as(u8, 7) else 15) or assignment.value > controllerAssignmentValueMax(assignment.kind) or assignment.color > 3) return error.InvalidControllerPreferences;
-            cursor += 8;
+            if (assignment.channel > (if (assignment.kind == .clip) @as(u8, 7) else 15)) return error.InvalidControllerChannel;
+            if (assignment.value > controllerAssignmentValueMax(assignment.kind)) return error.InvalidControllerValue;
+            if (assignment.color > 3) return error.InvalidControllerColor;
+            if (assignment.width_units < 1 or assignment.width_units > 2) return error.InvalidControllerWidth;
+            if (assignment.height_units < 1 or assignment.height_units > 2) return error.InvalidControllerHeight;
         }
         state.controller_toggled_pads = 0;
         state.controller_mapping_revision +%= 1;
@@ -1509,7 +1775,7 @@ pub const App = struct {
             });
         } else if (commandArgument(input, "controller")) |argument| {
             if (std.mem.eql(u8, argument, "state")) {
-                result_len = devResponse(response, "ok view={s} protocol={s} bank={s} editing={d} selected={d} octave={d} channel={d} velocity={d} target={s} status={d} queued={d}", .{
+                result_len = devResponse(response, "ok view={s} protocol={s} bank={s} editing={d} selected={d} octave={d} channel={d} velocity={s}/{s}/{d} density={d} target={s} status={d} queued={d}", .{
                     @tagName(ui_state.app_view),
                     @tagName(ui_state.controller_protocol),
                     @tagName(ui_state.controller_bank),
@@ -1517,7 +1783,10 @@ pub const App = struct {
                     ui_state.controller_selected_pad + 1,
                     ui_state.controller_octave,
                     ui_state.controller_channel + 1,
+                    @tagName(ui_state.controller_velocity_mode),
+                    @tagName(ui_state.controller_velocity_curve),
                     ui_state.controller_velocity,
+                    ui_state.controller_density,
                     ui_state.controllerTarget(),
                     ui_state.controller_status,
                     self.controller_output_count,
@@ -1554,6 +1823,45 @@ pub const App = struct {
                     return devResponse(response, "error controller bank expects pads, clips, actions, or user", .{});
                 if (ui_state.controller_bank != .user) ui_state.controller_editing = 0;
                 result_len = devResponse(response, "ok controller bank={s}", .{@tagName(ui_state.controller_bank)});
+            } else if (std.mem.startsWith(u8, argument, "sensitivity ")) {
+                const value = std.mem.trim(u8, argument["sensitivity ".len..], " \t");
+                self.releaseAllControllerTouches(ui_state);
+                ui_state.controller_velocity_mode = if (std.mem.eql(u8, value, "fixed"))
+                    .fixed
+                else if (std.mem.eql(u8, value, "dynamic"))
+                    .dynamic
+                else if (std.mem.eql(u8, value, "y") or std.mem.eql(u8, value, "y-position"))
+                    .y_position
+                else if (std.mem.eql(u8, value, "diagonal") or std.mem.eql(u8, value, "diagonal-position"))
+                    .diagonal_position
+                else if (std.mem.eql(u8, value, "pencil") or std.mem.eql(u8, value, "pencil-force"))
+                    .pencil_force
+                else
+                    return devResponse(response, "error controller sensitivity expects fixed, dynamic, y, diagonal, or pencil", .{});
+                result_len = devResponse(response, "ok controller sensitivity={s}", .{@tagName(ui_state.controller_velocity_mode)});
+            } else if (std.mem.startsWith(u8, argument, "curve ")) {
+                const value = std.mem.trim(u8, argument["curve ".len..], " \t");
+                ui_state.controller_velocity_curve = if (std.mem.eql(u8, value, "soft"))
+                    .soft
+                else if (std.mem.eql(u8, value, "balanced"))
+                    .balanced
+                else if (std.mem.eql(u8, value, "hard"))
+                    .hard
+                else
+                    return devResponse(response, "error controller curve expects soft, balanced, or hard", .{});
+                result_len = devResponse(response, "ok controller curve={s}", .{@tagName(ui_state.controller_velocity_curve)});
+            } else if (std.mem.startsWith(u8, argument, "density ")) {
+                const value = std.mem.trim(u8, argument["density ".len..], " \t");
+                self.releaseAllControllerTouches(ui_state);
+                ui_state.controller_density = if (std.mem.eql(u8, value, "large"))
+                    0
+                else if (std.mem.eql(u8, value, "medium"))
+                    1
+                else if (std.mem.eql(u8, value, "compact"))
+                    2
+                else
+                    return devResponse(response, "error controller density expects large, medium, or compact", .{});
+                result_len = devResponse(response, "ok controller density={d}", .{ui_state.controller_density});
             } else if (std.mem.startsWith(u8, argument, "edit ")) {
                 const value = std.mem.trim(u8, argument["edit ".len..], " \t");
                 self.releaseAllControllerTouches(ui_state);
@@ -1574,8 +1882,8 @@ pub const App = struct {
                 ui_state.controller_octave = value;
                 result_len = devResponse(response, "ok controller octave={d}", .{value});
             } else if (std.mem.startsWith(u8, argument, "tap ")) {
-                const ordinal = std.fmt.parseUnsigned(u8, std.mem.trim(u8, argument["tap ".len..], " \t"), 10) catch return devResponse(response, "error controller tap expects 1..16", .{});
-                if (ordinal < 1 or ordinal > 16) return devResponse(response, "error controller tap expects 1..16", .{});
+                const ordinal = std.fmt.parseUnsigned(u8, std.mem.trim(u8, argument["tap ".len..], " \t"), 10) catch return devResponse(response, "error controller tap expects 1..{d}", .{model.max_controller_controls});
+                if (ordinal < 1 or ordinal > model.max_controller_controls) return devResponse(response, "error controller tap expects 1..{d}", .{model.max_controller_controls});
                 self.pressControllerPad(ui_state, ordinal - 1, @intCast(@min(ui_state.controller_velocity, 127)));
                 self.releaseControllerPad(ui_state, ordinal - 1);
                 result_len = devResponse(response, "ok controller tap={d} queued={d}", .{ ordinal, self.controller_output_count });
@@ -1586,7 +1894,7 @@ pub const App = struct {
                 self.queueControllerTransport(ui_state, ordinal - 1, false);
                 result_len = devResponse(response, "ok controller transport={d} queued={d}", .{ ordinal, self.controller_output_count });
             } else {
-                return devResponse(response, "error controller expects state, open, score, protocol, bank, edit, octave, tap, or transport", .{});
+                return devResponse(response, "error controller expects state, open, score, protocol, bank, sensitivity, curve, density, edit, octave, tap, or transport", .{});
             }
         } else if (commandArgument(input, "part")) |argument| {
             if (std.mem.eql(u8, argument, "state")) {
@@ -3796,6 +4104,7 @@ test "GPU controller is multitouch, hot controllable, and emits OSC or MIDI" {
     try std.testing.expectEqualStrings("ok controller=open", response[0..len]);
     const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
     try std.testing.expectEqual(model.AppView.controller, state.app_view);
+    state.controller_protocol = .osc;
     app.setControllerTarget(1, "192.168.1.20:8000");
 
     const layout = ui.ControllerLayout.calculate(state.viewport_width, state.viewport_height);
@@ -3831,9 +4140,9 @@ test "GPU controller is multitouch, hot controllable, and emits OSC or MIDI" {
     app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 20, .buttons = 0, .x = second_x, .y = second_y, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     count = app.drainControllerOutputs(&output);
     try std.testing.expectEqual(@as(usize, 3), count);
-    try std.testing.expectEqual(@as(i32, 71), std.mem.readInt(i32, output[0].payload()[output[0].payload().len - 4 ..][0..4], .big));
+    try std.testing.expectEqual(@as(i32, 51), std.mem.readInt(i32, output[0].payload()[output[0].payload().len - 4 ..][0..4], .big));
     try std.testing.expect(std.mem.startsWith(u8, output[1].payload(), "/vkb_midi/1/aftertouch/49"));
-    try std.testing.expectEqual(@as(i32, 116), std.mem.readInt(i32, output[1].payload()[output[1].payload().len - 4 ..][0..4], .big));
+    try std.testing.expectEqual(@as(i32, 109), std.mem.readInt(i32, output[1].payload()[output[1].payload().len - 4 ..][0..4], .big));
 
     _ = app.runDevCommand("controller protocol midi", &response);
     len = app.runDevCommand("controller tap 3", &response);
@@ -3859,6 +4168,10 @@ test "GPU controller is multitouch, hot controllable, and emits OSC or MIDI" {
     try std.testing.expectEqual(@as(usize, 0), app.drainControllerOutputs(&output));
     const type_next = layout.transport[1];
     app.pointer(.{ .kind = .down, .pointer_type = .touch, .id = 32, .buttons = 1, .x = type_next.x + 2, .y = type_next.y + 2, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(model.ControllerControlKind.button, state.controller_assignments[1].control);
+    const routing_next = layout.transport[6];
+    app.pointer(.{ .kind = .down, .pointer_type = .touch, .id = 33, .buttons = 1, .x = routing_next.x + 2, .y = routing_next.y + 2, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .down, .pointer_type = .touch, .id = 34, .buttons = 1, .x = type_next.x + 2, .y = type_next.y + 2, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
     try std.testing.expectEqual(model.ControllerAssignmentKind.drum, state.controller_assignments[1].kind);
     try std.testing.expectEqual(@as(u8, 9), state.controller_assignments[1].channel);
     try std.testing.expectEqual(@as(usize, 0), app.drainControllerOutputs(&output));
@@ -3881,8 +4194,11 @@ test "custom controller mappings persist independently from score documents" {
     const source = try App.create(std.heap.c_allocator, 900, 700, 1);
     defer source.destroy(std.heap.c_allocator);
     const source_state = source.getMut(model.UiState, source.session, source.ids.ui_state) orelse return error.MissingUiState;
-    source_state.controller_assignments[3] = .{ .kind = .clip, .behavior = .toggle, .channel = 4, .value = 6, .color = 2 };
-    var bytes: [256]u8 = undefined;
+    source_state.controller_velocity_mode = .diagonal_position;
+    source_state.controller_velocity_curve = .hard;
+    source_state.controller_density = 2;
+    source_state.controller_assignments[3] = .{ .kind = .cc, .behavior = .momentary, .channel = 4, .value = 6, .color = 2, .control = .xy, .width_units = 2, .height_units = 2, .secondary_value = 71 };
+    var bytes: [1024]u8 = undefined;
     const length = try source.serializeControllerPreferences(&bytes);
     try std.testing.expectEqual(@as(usize, controller_preferences_size), length);
 
@@ -3890,21 +4206,152 @@ test "custom controller mappings persist independently from score documents" {
     defer restored.destroy(std.heap.c_allocator);
     try restored.deserializeControllerPreferences(bytes[0..length]);
     const restored_state = restored.getConst(model.UiState, restored.session, restored.ids.ui_state) orelse return error.MissingUiState;
-    try std.testing.expectEqual(model.ControllerAssignmentKind.clip, restored_state.controller_assignments[3].kind);
-    try std.testing.expectEqual(model.ControllerBehavior.toggle, restored_state.controller_assignments[3].behavior);
+    try std.testing.expectEqual(model.ControllerVelocityMode.diagonal_position, restored_state.controller_velocity_mode);
+    try std.testing.expectEqual(model.ControllerVelocityCurve.hard, restored_state.controller_velocity_curve);
+    try std.testing.expectEqual(@as(u8, 2), restored_state.controller_density);
+    try std.testing.expectEqual(model.ControllerAssignmentKind.cc, restored_state.controller_assignments[3].kind);
+    try std.testing.expectEqual(model.ControllerBehavior.momentary, restored_state.controller_assignments[3].behavior);
     try std.testing.expectEqual(@as(u8, 4), restored_state.controller_assignments[3].channel);
     try std.testing.expectEqual(@as(u8, 6), restored_state.controller_assignments[3].value);
     try std.testing.expectEqual(@as(u8, 2), restored_state.controller_assignments[3].color);
+    try std.testing.expectEqual(model.ControllerControlKind.xy, restored_state.controller_assignments[3].control);
+    try std.testing.expectEqual(@as(u8, 2), restored_state.controller_assignments[3].width_units);
+    try std.testing.expectEqual(@as(u8, 2), restored_state.controller_assignments[3].height_units);
+    try std.testing.expectEqual(@as(u8, 71), restored_state.controller_assignments[3].secondary_value);
+}
+
+test "version-one 16-pad controller preferences migrate" {
+    var legacy = [_]u8{0} ** (16 + 16 * 8);
+    @memcpy(legacy[0..8], controller_preferences_magic);
+    std.mem.writeInt(u32, legacy[8..12], 1, .little);
+    std.mem.writeInt(u32, legacy[12..16], 16, .little);
+    for (0..16) |index| {
+        const cursor = 16 + index * 8;
+        legacy[cursor] = @intFromEnum(model.ControllerAssignmentKind.drum);
+        legacy[cursor + 1] = @intFromEnum(model.ControllerBehavior.momentary);
+        legacy[cursor + 2] = 9;
+        legacy[cursor + 3] = @intCast(36 + index);
+        legacy[cursor + 4] = @intCast((index / 4) % 4);
+    }
+    const app = try App.create(std.heap.c_allocator, 900, 700, 1);
+    defer app.destroy(std.heap.c_allocator);
+    try app.deserializeControllerPreferences(&legacy);
+    const state = app.getConst(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    try std.testing.expectEqual(model.ControllerAssignmentKind.drum, state.controller_assignments[15].kind);
+    try std.testing.expectEqual(@as(u8, 51), state.controller_assignments[15].value);
+    try std.testing.expectEqual(model.ControllerControlKind.pad, state.controller_assignments[15].control);
+    try std.testing.expectEqual(@as(u8, 52), state.controller_assignments[16].value);
+}
+
+test "controller sensitivity modes produce distinct calibrated velocities" {
+    var state: model.UiState = .{};
+    state.controller_velocity_min = 15;
+    state.controller_velocity_max = 127;
+    state.controller_velocity_curve = .balanced;
+
+    state.controller_velocity_mode = .fixed;
+    try std.testing.expectEqual(@as(u8, 104), controllerVelocity(&state, .touch, 0, 28, 0.5, 0));
+    state.controller_velocity_mode = .dynamic;
+    const light_finger = controllerVelocity(&state, .touch, 0, 8, 0.5, 0.5);
+    const firm_finger = controllerVelocity(&state, .touch, 0, 26, 0.5, 0.5);
+    try std.testing.expect(light_finger < firm_finger);
+    state.controller_velocity_mode = .y_position;
+    try std.testing.expect(controllerVelocity(&state, .touch, 0, 0, 0.5, 0.05) > controllerVelocity(&state, .touch, 0, 0, 0.5, 0.95));
+    state.controller_velocity_mode = .diagonal_position;
+    const bottom_left = controllerVelocity(&state, .touch, 0, 0, 0, 1);
+    const center = controllerVelocity(&state, .touch, 0, 0, 0.5, 0.5);
+    const top_right = controllerVelocity(&state, .touch, 0, 0, 1, 0);
+    try std.testing.expect(bottom_left < center);
+    try std.testing.expect(center < top_right);
+    try std.testing.expectEqual(bottom_left, controllerVelocity(&state, .touch, 0, 0, -1, 2));
+    try std.testing.expectEqual(top_right, controllerVelocity(&state, .touch, 0, 0, 2, -1));
+    state.controller_velocity_mode = .pencil_force;
+    try std.testing.expect(controllerVelocity(&state, .pen, 0.9, 0, 0.5, 0.5) > controllerVelocity(&state, .pen, 0.15, 0, 0.5, 0.5));
+    try std.testing.expectEqual(@as(u8, 104), controllerVelocity(&state, .touch, 0, 26, 0.5, 0.5));
+
+    try std.testing.expectEqual(model.ControllerVelocityMode.dynamic, nextControllerVelocityMode(.fixed));
+    try std.testing.expectEqual(model.ControllerVelocityMode.y_position, nextControllerVelocityMode(.dynamic));
+    try std.testing.expectEqual(model.ControllerVelocityMode.diagonal_position, nextControllerVelocityMode(.y_position));
+    try std.testing.expectEqual(model.ControllerVelocityMode.pencil_force, nextControllerVelocityMode(.diagonal_position));
+    try std.testing.expectEqual(model.ControllerVelocityMode.fixed, nextControllerVelocityMode(.pencil_force));
+}
+
+test "Pencil Force waits for refined force before drum note-on" {
+    const app = try App.create(std.heap.c_allocator, 1024, 768, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    state.app_view = .controller;
+    state.controller_protocol = .midi;
+    state.controller_velocity_mode = .pencil_force;
+    const layout = ui.ControllerLayout.calculateForState(state);
+    const pad = layout.pads[0];
+    const x = pad.x + pad.width * 0.5;
+    const y = pad.y + pad.height * 0.5;
+    var outputs: [4]controller_io.Output = undefined;
+    app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 99, .buttons = 1, .x = x, .y = y, .pressure = 0.08, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 0), app.drainControllerOutputs(&outputs));
+    app.pointer(.{ .kind = .move, .pointer_type = .pen, .id = 99, .buttons = 1, .x = x, .y = y, .pressure = 0.82, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.drainControllerOutputs(&outputs));
+    try std.testing.expect(outputs[0].payload()[2] > 100);
+    const midi_velocity = outputs[0].payload()[2];
+    try std.testing.expectEqual(midi_velocity, state.controller_last_velocity);
+    app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 99, .buttons = 0, .x = x, .y = y, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.drainControllerOutputs(&outputs));
+
+    // Velocity is a core semantic value; switching only the transport must
+    // preserve it exactly while changing the wire representation.
+    state.controller_protocol = .osc;
+    app.pointer(.{ .kind = .down, .pointer_type = .pen, .id = 100, .buttons = 1, .x = x, .y = y, .pressure = 0.08, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 0), app.drainControllerOutputs(&outputs));
+    app.pointer(.{ .kind = .move, .pointer_type = .pen, .id = 100, .buttons = 1, .x = x, .y = y, .pressure = 0.82, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.drainControllerOutputs(&outputs));
+    try std.testing.expectEqual(controller_io.OutputKind.osc, outputs[0].kind);
+    const osc_velocity = std.mem.readInt(i32, outputs[0].payload()[outputs[0].payload().len - 4 ..][0..4], .big);
+    try std.testing.expectEqual(@as(i32, midi_velocity), osc_velocity);
+    try std.testing.expectEqual(midi_velocity, state.controller_last_velocity);
+    app.pointer(.{ .kind = .up, .pointer_type = .pen, .id = 100, .buttons = 0, .x = x, .y = y, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), app.drainControllerOutputs(&outputs));
+}
+
+test "custom fader emits continuous CC values without a note-off" {
+    const app = try App.create(std.heap.c_allocator, 1024, 768, 2);
+    defer app.destroy(std.heap.c_allocator);
+    const state = app.getMut(model.UiState, app.session, app.ids.ui_state) orelse return error.MissingUiState;
+    state.app_view = .controller;
+    state.controller_protocol = .midi;
+    state.controller_bank = .user;
+    state.controller_assignments[0] = .{ .kind = .cc, .channel = 2, .value = 74, .control = .fader_vertical, .height_units = 2 };
+    const layout = ui.ControllerLayout.calculateForState(state);
+    const fader = layout.pads[0];
+    const x = fader.x + fader.width * 0.5;
+    var outputs: [8]controller_io.Output = undefined;
+    app.pointer(.{ .kind = .down, .pointer_type = .touch, .id = 88, .buttons = 1, .x = x, .y = fader.y + fader.height - 2, .pressure = 0, .contact_radius = 12, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .move, .pointer_type = .touch, .id = 88, .buttons = 1, .x = x, .y = fader.y + 2, .pressure = 0, .contact_radius = 12, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .up, .pointer_type = .touch, .id = 88, .buttons = 0, .x = x, .y = fader.y + 2, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    const count = app.drainControllerOutputs(&outputs);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualSlices(u8, &.{ 0xb2, 74, 1 }, outputs[0].payload());
+    try std.testing.expectEqualSlices(u8, &.{ 0xb2, 74, 126 }, outputs[1].payload());
+
+    state.controller_protocol = .osc;
+    app.pointer(.{ .kind = .down, .pointer_type = .touch, .id = 89, .buttons = 1, .x = x, .y = fader.y + fader.height - 2, .pressure = 0, .contact_radius = 12, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .move, .pointer_type = .touch, .id = 89, .buttons = 1, .x = x, .y = fader.y + 2, .pressure = 0, .contact_radius = 12, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    app.pointer(.{ .kind = .up, .pointer_type = .touch, .id = 89, .buttons = 0, .x = x, .y = fader.y + 2, .pressure = 0, .tilt_x = 0, .tilt_y = 0, .scroll_x = 0, .scroll_y = 0 });
+    const osc_count = app.drainControllerOutputs(&outputs);
+    try std.testing.expectEqual(@as(usize, 2), osc_count);
+    try std.testing.expect(std.mem.startsWith(u8, outputs[0].payload(), "/vkb_midi/3/cc/74"));
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, outputs[0].payload()[outputs[0].payload().len - 4 ..][0..4], .big));
+    try std.testing.expectEqual(@as(i32, 126), std.mem.readInt(i32, outputs[1].payload()[outputs[1].payload().len - 4 ..][0..4], .big));
 }
 
 test "platform host restores controller protocol deterministically" {
     const app = try App.create(std.heap.c_allocator, 900, 700, 1);
     defer app.destroy(std.heap.c_allocator);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.midi)), app.controllerProtocol());
+    try std.testing.expect(app.setControllerProtocol(@intFromEnum(model.ControllerProtocol.osc)));
     try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.osc)), app.controllerProtocol());
-    try std.testing.expect(app.setControllerProtocol(@intFromEnum(model.ControllerProtocol.midi)));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.midi)), app.controllerProtocol());
     try std.testing.expect(!app.setControllerProtocol(99));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.midi)), app.controllerProtocol());
+    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.osc)), app.controllerProtocol());
 }
 
 test "development ink command creates removable score-space QA marks" {

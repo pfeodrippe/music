@@ -41,6 +41,10 @@ pub const PointerEvent = extern struct {
     x: f32,
     y: f32,
     pressure: f32,
+    /// Approximate contact radius in logical screen points. Zero means the
+    /// platform cannot provide it. iPad uses this only for opt-in Dynamic
+    /// velocity estimation; it is never presented as physical pressure.
+    contact_radius: f32 = 0,
     tilt_x: f32,
     tilt_y: f32,
     scroll_x: f32,

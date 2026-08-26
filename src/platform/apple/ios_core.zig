@@ -136,7 +136,7 @@ pub export fn score_ios_resize(width: f32, height: f32, pixel_ratio: f32) void {
     if (app) |instance| instance.resize(width, height, pixel_ratio);
 }
 
-pub export fn score_ios_pointer(kind: u32, pointer_type: u32, pointer_id: u32, x: f32, y: f32, buttons: u32, pressure: f32, tilt_x: f32, tilt_y: f32) void {
+pub export fn score_ios_pointer(kind: u32, pointer_type: u32, pointer_id: u32, x: f32, y: f32, buttons: u32, pressure: f32, contact_radius: f32, tilt_x: f32, tilt_y: f32) void {
     if (app) |instance| instance.pointer(.{
         .kind = @enumFromInt(kind),
         .pointer_type = @enumFromInt(pointer_type),
@@ -145,6 +145,7 @@ pub export fn score_ios_pointer(kind: u32, pointer_type: u32, pointer_id: u32, x
         .x = x,
         .y = y,
         .pressure = pressure,
+        .contact_radius = contact_radius,
         .tilt_x = tilt_x,
         .tilt_y = tilt_y,
         .scroll_x = 0,

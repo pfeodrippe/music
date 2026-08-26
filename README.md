@@ -38,6 +38,10 @@ loaded absolute SFZ path is retained under Application Support, so launching
 `Score.app` from Finder keeps the selected piano without depending on a shell
 working directory.
 
+For controller layout, sensitivity, Bitwig mapping, finger-drumming practice,
+and instrument-specific workflows, see
+[`CONTROLLER_LEARNING_GUIDE.md`](CONTROLLER_LEARNING_GUIDE.md).
+
 `zig build -Doptimize=ReleaseSafe` builds the native executable and statically links the same system descriptors used in development. `zig build dev` launches a Debug build and watches reloadable systems: a valid dylib is installed at a frame boundary while the Flecs world remains alive; a failed build leaves the previous system running.
 
 The development host uses its own atomic `autosave-dev.score` journal. That
@@ -330,24 +334,32 @@ or execute 16 mapped actions. Eight additional squares provide stop, play,
 record, loop, click, undo, redo, and save. Score, sampler, and practice state
 remain untouched when entering or leaving this view.
 
-The `USER` bank is a persistent custom surface. Press `EDIT`, tap a pad, then
-use the eight on-screen inspector cells to choose Note, Drum, CC, Clip, or
-Action; set its message number, MIDI channel/clip track, momentary or toggle
-behavior, and color. `DONE` returns the pads to performance input. Edit mode
+The `USER` bank is a persistent custom surface. Press `EDIT`, tap a control,
+then use the three inspector pages to choose Pad, Button, Toggle, vertical or
+horizontal Fader, Encoder, XY surface, or Label; choose a 1x1, 2x1, 1x2, or
+2x2 span; and configure Note, Drum, CC, Clip, or Action routing, message
+numbers, MIDI channel/clip track, behavior, starting value, and color. `DONE`
+returns the surface to performance input. `GRID -/+` changes density from 4x4
+through 6x6: zooming out reveals up to 24 controls and leaves packing room for
+expanded cells instead of merely magnifying the same layout. Edit mode
 never emits a musical/control message, so selecting a mapping cannot trigger a
 DAW action. Native preferences are stored independently at
 `~/Library/Application Support/Score/controller-preferences.bin`; iPadOS keeps
-the same 144-byte versioned mapping blob in application preferences. These
+the same versioned mapping blob in application preferences. Version-1 16-pad
+preferences migrate automatically. These
 mappings never modify a score, MusicXML document, or captured performance.
 
 Pads can control any instrument hosted by the receiving DAW—drum rack, piano,
 guitar sampler, synth, or another plug-in—because the selected/armed DAW track
-owns the sound. MIDI mode publishes a device-qualified virtual CoreMIDI source
+owns the sound. **MIDI is the default controller protocol.** MIDI mode publishes a device-qualified virtual CoreMIDI source
 (`Score Controller — Mac` or `Score Controller — <device> [<id>]`) and also
 sends to connected MIDI destinations. A second native process receives a
 numeric suffix rather than colliding with the first endpoint. On iPadOS it
-enables the system Network MIDI session, so a Mac can connect through Audio
-MIDI Setup.
+prefers the direct USB IDAM destination exposed by Audio MIDI Setup. Network
+MIDI remains available only when no direct destination is present, preventing
+the same strike from arriving twice when both transports are connected. See
+[`IPAD_USB_MIDI_SETUP.md`](IPAD_USB_MIDI_SETUP.md) for the verified physical
+device and Bitwig setup.
 OSC mode sends directly to a configured UDP host and defaults to port 8000.
 For the native host, override `127.0.0.1:8000` with `SCORE_OSC_HOST` and
 `SCORE_OSC_PORT`.
@@ -372,12 +384,21 @@ endpoint used only to keep those Bitwig note inputs recordable. It has no app
 window and carries no controller data, so opening or quitting any Score app
 instance cannot disable the other controllers.
 
-Apple Pencil force sets note-on velocity and continues as polyphonic
-aftertouch per held pad in both OSC and MIDI modes. Ordinary iPad finger
-touches do not expose real pressure, so they use the fixed velocity instead of
-fabricated force; an external velocity-sensitive MIDI device keeps its
-hardware velocity. Octave controls move the note grid while retaining the same
-DAW routing.
+The velocity button cycles five explicit modes: Fixed, Dynamic finger impact,
+Y Position, Diagonal Position, and Pencil Force. The adjacent button cycles
+Soft/Balanced/Hard response curves, or fixed-velocity presets while Fixed is
+selected. Dynamic uses UIKit's approximate finger contact radius as a
+calibrated impact signal; it is never labelled physical pressure. Y Position
+maps vertical pad position to the configured 15...127 range. Diagonal Position
+projects the touch from bottom-left (soft) to top-right (loud), making
+horizontal placement useful without losing the predictable spatial control of
+Y Position. Pencil Force waits up to the first 6 ms high-rate force refresh
+before note-on, so a drum sampler receives the refined velocity layer rather
+than relying on aftertouch, then streams subsequent force as polyphonic
+aftertouch. Finger input in Pencil mode uses the explicit fixed fallback. After
+the first strike, the response button includes the latest emitted `VEL 1..127`,
+making light/firm Pencil calibration visible as well as audible. Octave
+controls retain the same DAW routing.
 
 In a hot-reload Debug session, the surface can be exercised without restarting:
 
@@ -386,6 +407,10 @@ zig-out/bin/score-devctl controller open
 zig-out/bin/score-devctl controller protocol osc
 zig-out/bin/score-devctl controller bank pads
 zig-out/bin/score-devctl controller bank user
+zig-out/bin/score-devctl controller sensitivity dynamic
+zig-out/bin/score-devctl controller sensitivity diagonal
+zig-out/bin/score-devctl controller curve balanced
+zig-out/bin/score-devctl controller density medium
 zig-out/bin/score-devctl controller edit on
 zig-out/bin/score-devctl controller tap 1
 zig-out/bin/score-devctl controller state

@@ -50,7 +50,7 @@ bool score_ios_create(float width, float height, float pixel_ratio);
 void score_ios_destroy(void);
 void score_ios_frame(float delta_seconds);
 void score_ios_resize(float width, float height, float pixel_ratio);
-void score_ios_pointer(uint32_t kind, uint32_t pointer_type, uint32_t pointer_id, float x, float y, uint32_t buttons, float pressure, float tilt_x, float tilt_y);
+void score_ios_pointer(uint32_t kind, uint32_t pointer_type, uint32_t pointer_id, float x, float y, uint32_t buttons, float pressure, float contact_radius, float tilt_x, float tilt_y);
 void score_ios_key(uint32_t key, uint32_t modifiers, uint32_t pressed, uint32_t repeat);
 void score_ios_midi(uint64_t time_ns, uint8_t status, uint8_t data1, uint8_t data2);
 void score_ios_microphone_pitch(uint8_t pitch, float confidence);
