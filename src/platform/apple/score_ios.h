@@ -69,6 +69,8 @@ void score_ios_set_host_status(uint32_t status);
 size_t score_ios_drain_playback(ScorePlaybackEvent *events, size_t capacity);
 size_t score_ios_drain_controller(ScoreControllerOutput *outputs, size_t capacity);
 void score_ios_set_controller_target(uint32_t status, const uint8_t *bytes, size_t length);
+uint32_t score_ios_controller_protocol(void);
+bool score_ios_set_controller_protocol(uint32_t value);
 size_t score_ios_serialize_controller(uint8_t *bytes, size_t capacity);
 uint32_t score_ios_restore_controller(const uint8_t *bytes, size_t length);
 uint32_t score_ios_import(const uint8_t *bytes, size_t length, uint32_t kind);

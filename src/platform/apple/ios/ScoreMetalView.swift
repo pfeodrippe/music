@@ -317,6 +317,7 @@ final class ScoreMetalView: UIView {
         accessibilitySignature = signature
         accessibilityElements = entries.map { item, rect, label in
             let element = ScoreSemanticElement(container: self, scoreID: item.id) { [weak self] in
+                self?.drainController()
                 self?.onControllerPreferencesChanged?()
             }
             element.accessibilityLabel = label
@@ -349,6 +350,10 @@ final class ScoreMetalView: UIView {
                 : 0
             score_ios_pointer(kind, pointerType, UInt32(truncatingIfNeeded: ObjectIdentifier(touch).hashValue), Float(point.x), Float(point.y), kind == 2 ? 0 : 1, Float(pressure), 0, 0)
         }
+        // Controller gestures must not wait for the next 60 Hz render tick.
+        // Draining here removes up to one full frame of tap-to-MIDI latency;
+        // the display-link drain remains as a fallback for non-touch sources.
+        drainController()
         if kind == 2 || kind == 3 { onControllerPreferencesChanged?() }
     }
 

@@ -240,6 +240,16 @@ pub export fn score_ios_set_controller_target(status: u32, bytes: [*]const u8, l
     if (app) |instance| instance.setControllerTarget(status, bytes[0..length]);
 }
 
+pub export fn score_ios_controller_protocol() u32 {
+    const instance = app orelse return @intFromEnum(score.model.ControllerProtocol.osc);
+    return instance.controllerProtocol();
+}
+
+pub export fn score_ios_set_controller_protocol(value: u32) bool {
+    const instance = app orelse return false;
+    return instance.setControllerProtocol(value);
+}
+
 pub export fn score_ios_serialize_controller(bytes: [*]u8, capacity: usize) usize {
     const instance = app orelse return 0;
     return instance.serializeControllerPreferences(bytes[0..capacity]) catch 0;

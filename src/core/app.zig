@@ -953,6 +953,25 @@ pub const App = struct {
         self.buildFrame();
     }
 
+    pub fn controllerProtocol(self: *const App) u32 {
+        const state = self.getConst(model.UiState, self.session, self.ids.ui_state) orelse return @intFromEnum(model.ControllerProtocol.osc);
+        return @intFromEnum(state.controller_protocol);
+    }
+
+    /// Platform hosts restore this preference before the first controller
+    /// gesture. A setter is deliberately used instead of replaying a toggle,
+    /// so repeated physical-device launches are deterministic.
+    pub fn setControllerProtocol(self: *App, value: u32) bool {
+        const protocol = std.enums.fromInt(model.ControllerProtocol, value) orelse return false;
+        const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return false;
+        if (state.controller_protocol == protocol) return true;
+        self.releaseAllControllerTouches(state);
+        state.controller_protocol = protocol;
+        c.ecs_modified_id(self.world, self.session, self.ids.ui_state);
+        self.buildFrame();
+        return true;
+    }
+
     pub fn setHostStatus(self: *App, status: u32) void {
         const state = self.getMut(model.UiState, self.session, self.ids.ui_state) orelse return;
         state.notice = status;
@@ -3876,6 +3895,16 @@ test "custom controller mappings persist independently from score documents" {
     try std.testing.expectEqual(@as(u8, 4), restored_state.controller_assignments[3].channel);
     try std.testing.expectEqual(@as(u8, 6), restored_state.controller_assignments[3].value);
     try std.testing.expectEqual(@as(u8, 2), restored_state.controller_assignments[3].color);
+}
+
+test "platform host restores controller protocol deterministically" {
+    const app = try App.create(std.heap.c_allocator, 900, 700, 1);
+    defer app.destroy(std.heap.c_allocator);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.osc)), app.controllerProtocol());
+    try std.testing.expect(app.setControllerProtocol(@intFromEnum(model.ControllerProtocol.midi)));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.midi)), app.controllerProtocol());
+    try std.testing.expect(!app.setControllerProtocol(99));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(model.ControllerProtocol.midi)), app.controllerProtocol());
 }
 
 test "development ink command creates removable score-space QA marks" {

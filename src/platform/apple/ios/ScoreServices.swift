@@ -258,6 +258,17 @@ final class ScoreMIDIService {
         return "Score Controller — \(device.isEmpty ? "iPad" : device) [\(stableID)]"
     }
 
+    private static func objectName(_ object: MIDIObjectRef) -> String {
+        var value: Unmanaged<CFString>?
+        guard MIDIObjectGetStringProperty(object, kMIDIPropertyDisplayName, &value) == noErr,
+              let value else { return "unnamed" }
+        return value.takeRetainedValue() as String
+    }
+
+    private static var acceptanceDiagnosticsEnabled: Bool {
+        ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_ACCEPTANCE"] == "1"
+    }
+
     deinit {
         if inputPort != 0 { MIDIPortDispose(inputPort) }
         if outputPort != 0 { MIDIPortDispose(outputPort) }
@@ -269,16 +280,53 @@ final class ScoreMIDIService {
     func start() -> Bool {
         if started { return true }
         let endpointName = Self.endpointName()
-        guard MIDIClientCreate("Score \(endpointName)" as CFString, nil, nil, &client) == noErr,
-              MIDISourceCreate(client, endpointName as CFString, &virtualSource) == noErr,
-              MIDIInputPortCreate(client, "Score Input" as CFString, scoreMIDIRead, Unmanaged.passUnretained(self).toOpaque(), &inputPort) == noErr,
-              MIDIOutputPortCreate(client, "Score Output" as CFString, &outputPort) == noErr else { return false }
+        let clientStatus = MIDIClientCreate("Score \(endpointName)" as CFString, nil, nil, &client)
+        let sourceStatus = clientStatus == noErr
+            ? MIDISourceCreate(client, endpointName as CFString, &virtualSource)
+            : OSStatus(-1)
+        // iPadOS may reject app-created virtual sources with
+        // kMIDINotPermitted.  That source is only a convenience for hosts
+        // which expose virtual endpoints; the real USB and Network MIDI paths
+        // are destinations reached through the output port below.
+        let inputStatus = clientStatus == noErr
+            ? MIDIInputPortCreate(client, "Score Input" as CFString, scoreMIDIRead, Unmanaged.passUnretained(self).toOpaque(), &inputPort)
+            : OSStatus(-1)
+        let outputStatus = inputStatus == noErr
+            ? MIDIOutputPortCreate(client, "Score Output" as CFString, &outputPort)
+            : OSStatus(-1)
+        guard clientStatus == noErr,
+              inputStatus == noErr,
+              outputStatus == noErr else {
+            if Self.acceptanceDiagnosticsEnabled {
+                NSLog(
+                    "Score iPad MIDI start failed client=%d source=%d input=%d output=%d",
+                    clientStatus,
+                    sourceStatus,
+                    inputStatus,
+                    outputStatus
+                )
+            }
+            return false
+        }
         let network = MIDINetworkSession.default()
         network.connectionPolicy = .anyone
         network.isEnabled = true
         for index in 0..<MIDIGetNumberOfSources() {
             let source = MIDIGetSource(index)
             if source != 0 && source != virtualSource { MIDIPortConnectSource(inputPort, source, nil) }
+        }
+        if Self.acceptanceDiagnosticsEnabled {
+            NSLog(
+                "Score iPad MIDI start source=%@ virtual_status=%d sources=%u destinations=%u",
+                endpointName,
+                sourceStatus,
+                MIDIGetNumberOfSources(),
+                MIDIGetNumberOfDestinations()
+            )
+            for index in 0..<MIDIGetNumberOfDestinations() {
+                let destination = MIDIGetDestination(index)
+                NSLog("Score iPad MIDI destination[%u]=%@", index, Self.objectName(destination))
+            }
         }
         started = true
         return true
@@ -292,10 +340,30 @@ final class ScoreMIDIService {
         bytes.withUnsafeBufferPointer { buffer in
             _ = MIDIPacketListAdd(&packetList, MemoryLayout<MIDIPacketList>.size, packet, 0, buffer.count, buffer.baseAddress!)
         }
-        if virtualSource != 0 { MIDIReceived(virtualSource, &packetList) }
+        let receivedStatus = virtualSource == 0 ? OSStatus(-1) : MIDIReceived(virtualSource, &packetList)
+        if Self.acceptanceDiagnosticsEnabled {
+            NSLog(
+                "Score iPad MIDI send status=%02X data1=%u data2=%u virtual=%d destinations=%u",
+                status,
+                data1,
+                data2,
+                receivedStatus,
+                MIDIGetNumberOfDestinations()
+            )
+        }
         for index in 0..<MIDIGetNumberOfDestinations() {
             let destination = MIDIGetDestination(index)
-            if destination != 0 { MIDISend(outputPort, destination, &packetList) }
+            if destination != 0 {
+                let sendStatus = MIDISend(outputPort, destination, &packetList)
+                if Self.acceptanceDiagnosticsEnabled {
+                    NSLog(
+                        "Score iPad MIDI sent destination[%u]=%@ status=%d",
+                        index,
+                        Self.objectName(destination),
+                        sendStatus
+                    )
+                }
+            }
         }
     }
 }

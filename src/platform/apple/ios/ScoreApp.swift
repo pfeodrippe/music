@@ -64,6 +64,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             score_ios_midi(DispatchTime.now().uptimeNanoseconds, status, data1, data2)
         }
         _ = midi.start()
+        restoreControllerProtocol()
         restoreControllerTarget()
         startLibraryAcceptanceIfRequested()
         startAcceptancePlaybackIfRequested()
@@ -110,6 +111,15 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     private func startControllerAcceptanceIfRequested() {
         guard ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_ACCEPTANCE"] == "1" else { return }
 
+        // Physical USB MIDI endpoints can be recreated while devicectl replaces
+        // the running app.  Let acceptance runs opt into a longer lead-in so a
+        // host-side listener can reconnect to the new CoreMIDI endpoint before
+        // the first deterministic pad event.  Normal launches never use this.
+        let configuredDelay = Double(
+            ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_ACCEPTANCE_DELAY"] ?? ""
+        )
+        let leadIn = max(configuredDelay ?? 0.75, 0.25)
+
         let controllerView: UInt32 = 33
         let customBank: UInt32 = 67
         let firstPad: UInt32 = 70
@@ -124,19 +134,19 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
             firstPad + 10, // open hi-hat, MIDI 46
         ]
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + leadIn) {
             score_ios_accessibility_activate(controllerView)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + leadIn + 0.25) {
             score_ios_accessibility_activate(customBank)
         }
         for (index, pad) in pattern.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.35 + Double(index) * 0.28) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + leadIn + 0.6 + Double(index) * 0.28) {
                 score_ios_accessibility_activate(pad)
                 NSLog("Score iPad controller acceptance pad=%u", pad - firstPad + 1)
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.35 + Double(pattern.count) * 0.28) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + leadIn + 0.6 + Double(pattern.count) * 0.28) {
             NSLog("Score iPad controller acceptance complete")
         }
     }
@@ -224,6 +234,20 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
         osc.configure(host: host, port: UInt16(storedPort == 0 ? 8000 : storedPort))
     }
 
+    private func restoreControllerProtocol() {
+        let defaults = UserDefaults.standard
+        let configured = ProcessInfo.processInfo.environment["SCORE_IOS_CONTROLLER_PROTOCOL"]?.lowercased()
+        if configured == "midi" {
+            defaults.set(0, forKey: "ScoreController.protocol")
+        } else if configured == "osc" {
+            defaults.set(1, forKey: "ScoreController.protocol")
+        }
+        guard defaults.object(forKey: "ScoreController.protocol") != nil else { return }
+        let value = defaults.integer(forKey: "ScoreController.protocol")
+        guard value == 0 || value == 1 else { return }
+        _ = score_ios_set_controller_protocol(UInt32(value))
+    }
+
     private func presentControllerSetup() {
         let defaults = UserDefaults.standard
         let alert = UIAlertController(
@@ -281,6 +305,7 @@ final class ScoreViewController: UIViewController, UIDocumentPickerDelegate {
     }
 
     private func saveControllerPreferencesIfChanged() {
+        UserDefaults.standard.set(Int(score_ios_controller_protocol()), forKey: "ScoreController.protocol")
         guard let data = controllerPreferences(), data != lastControllerPreferences else { return }
         lastControllerPreferences = data
         UserDefaults.standard.set(data, forKey: "ScoreController.preferences")
